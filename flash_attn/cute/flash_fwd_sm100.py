@@ -363,7 +363,6 @@ class FlashAttentionForwardSm100:
             self.mma_tiler_pv[:2],
             p_source,
         )
-
         self.cluster_shape_mnk = (*self.cluster_shape_mn, 1)
         self.cluster_layout_vmnk = cute.tiled_divide(
             cute.make_layout(self.cluster_shape_mnk),
