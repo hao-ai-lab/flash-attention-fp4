@@ -44,9 +44,9 @@ import sys
 from pathlib import Path
 
 # Add workspace root to path for importing fmha module
-# File is at: examples/python/CuTeDSL/blackwell/fa4/benchmarks/benchmark_attn.py
-# Need to go up 7 levels to reach workspace root
-_workspace_root = Path(__file__).resolve().parent.parent.parent.parent.parent.parent.parent
+# File is at: examples/python/CuTeDSL/blackwell/flash-attention/flash_attn/cute/benchmarks/benchmark_attn.py
+# Need to go up 9 levels to reach workspace root
+_workspace_root = Path(__file__).resolve().parent.parent.parent.parent.parent.parent.parent.parent.parent
 if str(_workspace_root) not in sys.path:
     sys.path.insert(0, str(_workspace_root))
 

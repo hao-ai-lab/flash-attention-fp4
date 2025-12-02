@@ -635,7 +635,8 @@ class FlashAttentionForwardSm100:
             ]
 
         self.shared_storage = SharedStorage
-
+        total_smem_bytes = self.shared_storage.size_in_bytes()
+        print(f"Total shared memory used: {total_smem_bytes} bytes ({total_smem_bytes / 1024:.2f} KB)")
         LOG2_E = math.log2(math.e)
         if const_expr(self.score_mod is None):
             softmax_scale_log2 = softmax_scale * LOG2_E

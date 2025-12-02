@@ -35,6 +35,7 @@ from cutlass.cute.runtime import from_dlpack
 from flash_attn.cute import utils
 from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80, FlashAttentionForwardSm90
 from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
+from flash_attn.cute.flash_fwd_sm100_fp4 import FlashAttentionForwardSm100 as FlashAttentionForwardSm100FP4
 from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
 from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
 from flash_attn.cute.flash_bwd_sm90 import FlashAttentionBackwardSm90
@@ -57,6 +58,13 @@ torch2cute_dtype_map = {
     torch.bfloat16: cutlass.BFloat16,
     torch.float32: cutlass.Float32,
 }
+
+# Check if dtype is nvfp4
+def is_nvfp4_dtype(dtype):
+    """Check if a torch dtype is nvfp4 (FP4)"""
+    # Check by dtype name or string representation
+    dtype_str = str(dtype)
+    return 'nvfp4' in dtype_str.lower() or 'fp4' in dtype_str.lower() or hasattr(dtype, 'nvfp4')
 
 
 def num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, max_splits):
@@ -100,6 +108,9 @@ def _flash_attn_fwd(
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
     aux_tensors: Optional[list[torch.Tensor]] = None,
+    mSFQ: Optional[torch.Tensor] = None,  # Scale factor for Q
+    mSFK: Optional[torch.Tensor] = None,  # Scale factor for K
+    mSFV: Optional[torch.Tensor] = None,  # Scale factor for V
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Forward pass for FlashAttention.
 
@@ -159,7 +170,10 @@ def _flash_attn_fwd(
     assert seqused_k is None or seqused_k.shape == (batch_size,), (
         "seqused_k must have shape (batch_size,)"
     )
-    assert q.dtype in [torch.float16, torch.bfloat16], "inputs must be float16 or bfloat16"
+    # Check if using FP4 (nvfp4)
+    use_fp4 = is_nvfp4_dtype(q.dtype)
+    if not use_fp4:
+        assert q.dtype in [torch.float16, torch.bfloat16], "inputs must be float16 or bfloat16"
     assert q.dtype == k.dtype == v.dtype, "inputs must have the same dtype"
     for t in [cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k]:
         if t is not None:
@@ -241,7 +255,7 @@ def _flash_attn_fwd(
         )
         assert lse.is_cuda, "lse tensor must be on CUDA device"
 
-    dtype = torch2cute_dtype_map[q.dtype]
+    dtype = torch2cute_dtype_map.get(q.dtype, cutlass.Float16) if not use_fp4 else cutlass.Float16
     (
         cu_seqlens_q_tensor,
         cu_seqlens_k_tensor,
@@ -254,6 +268,27 @@ def _flash_attn_fwd(
         else None
         for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, learnable_sink)
     ]
+    
+    # Convert scale factor tensors if using FP4
+    mSFQ_tensor = None
+    mSFK_tensor = None
+    mSFV_tensor = None
+    if use_fp4:
+        mSFQ_tensor = (
+            from_dlpack(mSFQ.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=mSFQ.ndim - 1)
+            if mSFQ is not None
+            else None
+        )
+        mSFK_tensor = (
+            from_dlpack(mSFK.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=mSFK.ndim - 1)
+            if mSFK is not None
+            else None
+        )
+        mSFV_tensor = (
+            from_dlpack(mSFV.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=mSFV.ndim - 1)
+            if mSFV is not None
+            else None
+        )
     page_table_tensor = (
         from_dlpack(page_table.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=1)
         if page_table is not None
@@ -426,6 +461,10 @@ def _flash_attn_fwd(
         pack_gqa,
         compute_capability,
         page_size not in [None, 128],  # paged KV non-TMA
+        use_fp4,  # Include FP4 flag in compile key
+        mSFQ is not None,  # Include scale factor flags
+        mSFK is not None,
+        mSFV is not None,
     )
     if compile_key not in _flash_attn_fwd.compile_cache:
         if compute_capability == 9:
@@ -453,34 +492,64 @@ def _flash_attn_fwd(
                 has_aux_tensors=aux_tensors is not None,
             )
         elif compute_capability == 10:
-            fa_fwd = FlashAttentionForwardSm100(
-                head_dim,
-                head_dim_v,
-                qhead_per_kvhead=qhead_per_kvhead,
-                is_causal=causal,
-                is_local=local,
-                is_split_kv=is_split_kv,
-                pack_gqa=pack_gqa,
-                m_block_size=m_block_size,
-                n_block_size=n_block_size,
-                is_persistent=not causal
-                    and not local
-                    and cu_seqlens_q is None
-                    and seqused_q is None
-                    and not is_split_kv,
-                score_mod=score_mod,
-                mask_mod=mask_mod,
-                has_aux_tensors=aux_tensors is not None,
-                paged_kv_non_tma=page_size not in [None, 128],
-                is_varlen_q=cu_seqlens_q is not None
-                    or seqused_q is not None,
-            )
+            if use_fp4:
+                # Use FP4 kernel with scale factors
+                # Default scale factor dtype and vec size for FP4
+                sf_dtype = cutlass.Uint8  # Scale factors are typically Uint8 (UE4M3 format)
+                sf_vec_size = 16  # 1 scale factor per 16 elements (default)
+                fa_fwd = FlashAttentionForwardSm100FP4(
+                    head_dim,
+                    head_dim_v,
+                    qhead_per_kvhead=qhead_per_kvhead,
+                    is_causal=causal,
+                    is_local=local,
+                    is_split_kv=is_split_kv,
+                    pack_gqa=pack_gqa,
+                    m_block_size=m_block_size,
+                    n_block_size=n_block_size,
+                    is_persistent=not causal
+                        and not local
+                        and cu_seqlens_q is None
+                        and seqused_q is None
+                        and not is_split_kv,
+                    score_mod=score_mod,
+                    mask_mod=mask_mod,
+                    has_aux_tensors=aux_tensors is not None,
+                    paged_kv_non_tma=page_size not in [None, 128],
+                    is_varlen_q=cu_seqlens_q is not None
+                        or seqused_q is not None,
+                    sf_dtype=sf_dtype,
+                    sf_vec_size=sf_vec_size,
+                )
+            else:
+                fa_fwd = FlashAttentionForwardSm100(
+                    head_dim,
+                    head_dim_v,
+                    qhead_per_kvhead=qhead_per_kvhead,
+                    is_causal=causal,
+                    is_local=local,
+                    is_split_kv=is_split_kv,
+                    pack_gqa=pack_gqa,
+                    m_block_size=m_block_size,
+                    n_block_size=n_block_size,
+                    is_persistent=not causal
+                        and not local
+                        and cu_seqlens_q is None
+                        and seqused_q is None
+                        and not is_split_kv,
+                    score_mod=score_mod,
+                    mask_mod=mask_mod,
+                    has_aux_tensors=aux_tensors is not None,
+                    paged_kv_non_tma=page_size not in [None, 128],
+                    is_varlen_q=cu_seqlens_q is not None
+                        or seqused_q is not None,
+                )
         else:
             raise ValueError(
                 f"Unsupported compute capability: {compute_capability}. Supported: 9.x, 10.x"
             )
         # TODO: check @can_implement
-        _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
+        compile_args = [
             fa_fwd,
             q_tensor,
             k_tensor,
@@ -499,8 +568,12 @@ def _flash_attn_fwd(
             learnable_sink_tensor,
             sparse_tensors,
             cute_aux_tensors,
-        )
-    _flash_attn_fwd.compile_cache[compile_key](
+        ]
+        # Add scale factor tensors if using FP4
+        if use_fp4:
+            compile_args.extend([mSFQ_tensor, mSFK_tensor, mSFV_tensor])
+        _flash_attn_fwd.compile_cache[compile_key] = cute.compile(*compile_args)
+    call_args = [
         q_tensor,
         k_tensor,
         v_tensor,
@@ -518,7 +591,11 @@ def _flash_attn_fwd(
         learnable_sink_tensor,
         sparse_tensors,
         cute_aux_tensors,
-    )
+    ]
+    # Add scale factor tensors if using FP4
+    if use_fp4:
+        call_args.extend([mSFQ_tensor, mSFK_tensor, mSFV_tensor])
+    _flash_attn_fwd.compile_cache[compile_key](*call_args)
     if is_split_kv:
         _flash_attn_fwd_combine(
             out_partial,

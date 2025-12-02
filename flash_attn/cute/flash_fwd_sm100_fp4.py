@@ -138,10 +138,11 @@ class FlashAttentionForwardSm100:
         # Does S1 need to wait for S0 to finish
         # self.s0_s1_barrier = self.head_dim_padded in [64, 96] and (not self.is_causal and not self.is_local)
         self.s0_s1_barrier = False
-        self.overlap_sO_sQ = (
-            (self.head_dim_padded == 192 and self.head_dim_v_padded >= 64) or
-            (self.head_dim_v_padded >= 128 and self.is_split_kv)
-        )
+        # self.overlap_sO_sQ = (
+        #     (self.head_dim_padded == 192 and self.head_dim_v_padded >= 64) or
+        #     (self.head_dim_v_padded >= 128 and self.is_split_kv)
+        # )
+        self.overlap_sO_sQ = True #  NOTE (Wenxuan): smem overflow if we are to add scale factors.
         if self.overlap_sO_sQ:
             self.is_persistent = False
 
@@ -220,9 +221,6 @@ class FlashAttentionForwardSm100:
         # Scale factor parameters for block-scaled quantization (FP4)
         self.sf_dtype = sf_dtype
         self.sf_vec_size = sf_vec_size
-        # TMEM offsets for scale factors (used in FP4 quantization)
-        self.tmem_sf0_offset = 64
-        self.tmem_sf1_offset = 192
 
     def _setup_attributes(self):
         """Set up configurations and parameters for the FMHA kernel operation.
@@ -345,8 +343,8 @@ class FlashAttentionForwardSm100:
         # check type consistency
         if const_expr(self.q_dtype != self.k_dtype):
             raise TypeError(f"Type mismatch: {self.q_dtype} != {self.k_dtype}")
-        if const_expr(self.q_dtype != self.v_dtype):
-            raise TypeError(f"Type mismatch: {self.q_dtype} != {self.v_dtype}")
+        if const_expr(mSFV is not None and self.q_dtype != self.v_dtype):
+            raise TypeError(f"Type mismatch: {self.q_dtype} != {self.v_dtype} (V quantization requires matching dtype)")
         self._setup_attributes()
         self.use_tma_O = self.arch >= 90 and mCuSeqlensQ is None and mSeqUsedQ is None
         # This can be tuned
@@ -361,7 +359,8 @@ class FlashAttentionForwardSm100:
         p_source = tcgen05.OperandSource.TMEM
         p_major_mode = tcgen05.OperandMajorMode.K
         
-        # Use block-scaled MMA if scale factors are provided, otherwise use regular MMA
+        # Use block-scaled MMA for QK if scale factors are provided
+        # Use block-scaled MMA for PV only if V is being quantized (mSFV is provided)
         if const_expr(self.sf_dtype is not None and self.sf_vec_size is not None):
             tiled_mma_qk = sm100_utils_basic.make_blockscaled_trivial_tiled_mma(
                 self.q_dtype,
@@ -372,16 +371,27 @@ class FlashAttentionForwardSm100:
                 cta_group,
                 self.mma_tiler_qk[:2],
             )
-            tiled_mma_pv = sm100_utils_basic.make_blockscaled_trivial_tiled_mma(
-                self.v_dtype,
-                p_major_mode,
-                self.v_major_mode,
-                self.sf_dtype,
-                self.sf_vec_size,
-                cta_group,
-                self.mma_tiler_pv[:2],
-                p_source,
-            )
+            if const_expr(mSFV is not None):
+                tiled_mma_pv = sm100_utils_basic.make_blockscaled_trivial_tiled_mma(
+                    self.v_dtype,
+                    p_major_mode,
+                    self.v_major_mode,
+                    self.sf_dtype,
+                    self.sf_vec_size,
+                    cta_group,
+                    self.mma_tiler_pv[:2],
+                    p_source,
+                )
+            else:
+                tiled_mma_pv = sm100_utils_basic.make_trivial_tiled_mma(
+                    self.v_dtype,
+                    p_major_mode,
+                    self.v_major_mode,
+                    self.pv_acc_dtype,
+                    cta_group,
+                    self.mma_tiler_pv[:2],
+                    p_source,
+                )
         else:
             tiled_mma_qk = sm100_utils_basic.make_trivial_tiled_mma(
                 self.q_dtype,
@@ -457,12 +467,14 @@ class FlashAttentionForwardSm100:
                 self.sf_vec_size,
                 self.kv_stage,
             )
-            sfv_smem_layout_staged = blockscaled_utils.make_smem_layout_sfb(
-                tiled_mma_pv,
-                self.mma_tiler_pv,
-                self.sf_vec_size,
-                self.kv_stage,
-            )
+            # Only create V scale factor layout if V is being quantized
+            if const_expr(mSFV is not None):
+                sfv_smem_layout_staged = blockscaled_utils.make_smem_layout_sfb(
+                    tiled_mma_pv,
+                    self.mma_tiler_pv,
+                    self.sf_vec_size,
+                    self.kv_stage,
+                )
         
         if const_expr(not self.same_hdim_kv_padded):
             # sK and sV are using the same physical smem so we need to adjust the stride so that they line up
@@ -849,6 +861,10 @@ class FlashAttentionForwardSm100:
             ]
 
         self.shared_storage = SharedStorage
+        
+        # Print total shared memory size
+        total_smem_bytes = self.shared_storage.size_in_bytes()
+        print(f"Total shared memory used: {total_smem_bytes} bytes ({total_smem_bytes / 1024:.2f} KB)")
 
         LOG2_E = math.log2(math.e)
         if const_expr(self.score_mod is None):
@@ -1092,6 +1108,15 @@ class FlashAttentionForwardSm100:
 
         sScale = storage.sScale.get_tensor(cute.make_layout(self.q_stage * self.m_block_size * 2))
 
+        # Get scale factor shared memory tensors if they exist
+        sSFQ = None
+        sSFK = None
+        if const_expr(self.sf_dtype is not None and self.sf_vec_size is not None):
+            if const_expr(sfq_smem_layout_staged is not None):
+                sSFQ = storage.sSFQ.get_tensor(sfq_smem_layout_staged.outer, swizzle=sfq_smem_layout_staged.inner)
+            if const_expr(sfk_smem_layout_staged is not None):
+                sSFK = storage.sSFK.get_tensor(sfk_smem_layout_staged.outer, swizzle=sfk_smem_layout_staged.inner)
+
         thr_mma_qk = tiled_mma_qk.get_slice(0)  # default 1SM
         thr_mma_pv = tiled_mma_pv.get_slice(0)  # default 1SM
 
@@ -1125,6 +1150,43 @@ class FlashAttentionForwardSm100:
             )
             for stage in range(2)
         ]
+
+        # Setup scale factor TMEM tensors and S2T copy operations
+        # Use the TMEM region immediately following the accumulator (Scores tensor)
+        sfq_tmem_ptr = cute.recast_ptr(
+            tStS.iterator + tcgen05.find_tmem_tensor_col_offset(tStS),
+            dtype=self.sf_dtype,
+        )
+        # (MMA, MMA_M, MMA_K)
+        tCtSFQ_layout = blockscaled_utils.make_tmem_layout_sfa(
+            tiled_mma_qk,
+            self.mma_tiler_qk,
+            self.sf_vec_size,
+            cute.slice_(sfq_smem_layout_staged, (None, None, None, 0)),
+        )
+        tCtSFQ = cute.make_tensor(sfq_tmem_ptr, tCtSFQ_layout)
+
+        # Make SFK tmem tensor (SFB for K)
+        sfk_tmem_ptr = cute.recast_ptr(
+            tCtSFQ.iterator + tcgen05.find_tmem_tensor_col_offset(tCtSFQ),
+            dtype=self.sf_dtype,
+        )
+        # (MMA, MMA_N, MMA_K)
+        tCtSFK_layout = blockscaled_utils.make_tmem_layout_sfb(
+            tiled_mma_qk,
+            self.mma_tiler_qk,
+            self.sf_vec_size,
+            cute.slice_(sfk_smem_layout_staged, (None, None, None, 0)),
+        )
+        tCtSFK = cute.make_tensor(sfk_tmem_ptr, tCtSFK_layout)
+
+        # Partition for S2T copy of SFQ/SFK
+        tiled_copy_s2t_sfq, tCsSFQ_compact_s2t, tCtSFQ_compact_s2t = (
+            self.mainloop_s2t_copy_and_partition(sSFQ, tCtSFQ)
+        )
+        tiled_copy_s2t_sfk, tCsSFK_compact_s2t, tCtSFK_compact_s2t = (
+            self.mainloop_s2t_copy_and_partition(sSFK, tCtSFK)
+        )
 
         block_info = BlockInfo(
             # This is cta_tiler, not mma_tiler_qk, since we move by block by (2 * mma_tiler[0], mma_tiler[1])
@@ -1226,6 +1288,10 @@ class FlashAttentionForwardSm100:
                 SeqlenInfoCls,
                 TileSchedulerCls,
                 blocksparse_tensors,
+                sSFQ,
+                sSFK,
+                sfq_smem_layout_staged,
+                sfk_smem_layout_staged,
             )
 
             # if warp_idx == self.mma_warp_id:
@@ -1544,6 +1610,10 @@ class FlashAttentionForwardSm100:
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
         blocksparse_tensors: Optional[BlockSparseTensors],
+        sSFQ: Optional[cute.Tensor] = None,
+        sSFK: Optional[cute.Tensor] = None,
+        sfq_smem_layout_staged: Optional[cute.ComposedLayout] = None,
+        sfk_smem_layout_staged: Optional[cute.ComposedLayout] = None,
     ):
         tSrQ = tiled_mma_qk.make_fragment_A(sQ)
         tSrK = tiled_mma_qk.make_fragment_B(sK)
@@ -1618,7 +1688,51 @@ class FlashAttentionForwardSm100:
                     # For the first iteration, we don't need to wait as we're guaranteed S0 / S1
                     # are empty. For subsequent iterations, the wait happened at the end
                     # of the while loop.
+                    
+                    # Copy scale factors from shared memory to tensor memory
+                    # Copy SFQ (scale factor for Q, like SFA) - per Q stage
+                    s2t_stage_coord_sfq = (
+                        None,
+                        None,
+                        None,
+                        stage,
+                    )
+                    tCsSFQ_compact_s2t_staged = tCsSFQ_compact_s2t[s2t_stage_coord_sfq]
+                    cute.copy(
+                        tiled_copy_s2t_sfq,
+                        tCsSFQ_compact_s2t_staged,
+                        tCtSFQ_compact_s2t,
+                    )
+                    
+                    # Copy SFK (scale factor for K, like SFB) - per K stage
+                    s2t_stage_coord_sfk = (
+                        None,
+                        None,
+                        None,
+                        mma_kv_consumer_state.index,
+                    )
+                    tCsSFK_compact_s2t_staged = tCsSFK_compact_s2t[s2t_stage_coord_sfk]
+                    cute.copy(
+                        tiled_copy_s2t_sfk,
+                        tCsSFK_compact_s2t_staged,
+                        tCtSFK_compact_s2t,
+                    )
+                    
                     # 3. gemm
+                    # Set scale factors on tiled_mma_qk
+                    # Scale factors are set per kblock (similar to dense GEMM)
+                    # Set SFA (scale factor for Q) - coordinate matches kblock iteration
+                    sf_kblock_coord = (None, None, None)
+                    tiled_mma_qk.set(
+                        tcgen05.Field.SFA,
+                        tCtSFQ[sf_kblock_coord].iterator,
+                    )
+                    # Set SFB (scale factor for K) - coordinate matches kblock iteration
+                    tiled_mma_qk.set(
+                        tcgen05.Field.SFB,
+                        tCtSFK[sf_kblock_coord].iterator,
+                    )
+                    
                     # tiled_mma_qk = sm100_utils.gemm(tiled_mma_qk, tStSs[stage], tSrQs[stage], tSrKi, zero_init=True)
                     sK_cur = sK[None, None, None, mma_kv_consumer_state.index]
                     if const_expr(self.uneven_kv_smem):
@@ -2917,6 +3031,49 @@ class FlashAttentionForwardSm100:
             assert paged_kv_manager is not None
             paged_kv_manager.load_KV(block, sX[None, None, None, stage], K_or_V)
             cute.arch.cp_async_commit_group()
+
+    def mainloop_s2t_copy_and_partition(
+        self,
+        sSF: cute.Tensor,
+        tSF: cute.Tensor,
+    ) -> Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]:
+        """
+        Make tiledCopy for smem to tmem load for scale factor tensor, then use it to partition smem memory (source) and tensor memory (destination).
+
+        :param sSF: The scale factor tensor in smem
+        :type sSF: cute.Tensor
+        :param tSF: The scale factor tensor in tmem
+        :type tSF: cute.Tensor
+
+        :return: A tuple containing (tiled_copy_s2t, tCsSF_compact_s2t, tCtSF_compact_s2t) where:
+            - tiled_copy_s2t: The tiled copy operation for smem to tmem load for scale factor tensor(s2t)
+            - tCsSF_compact_s2t: The partitioned scale factor tensor in smem
+            - tCtSF_compact_s2t: The partitioned scale factor tensor in tmem
+        :rtype: Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]
+        """
+        # (MMA, MMA_MN, MMA_K, STAGE)
+        tCsSF_compact = cute.filter_zeros(sSF)
+        # (MMA, MMA_MN, MMA_K)
+        tCtSF_compact = cute.filter_zeros(tSF)
+
+        # Make S2T CopyAtom and tiledCopy
+        copy_atom_s2t = cute.make_copy_atom(
+            tcgen05.Cp4x32x128bOp(self.cta_group),
+            self.sf_dtype,
+        )
+        tiled_copy_s2t = tcgen05.make_s2t_copy(copy_atom_s2t, tCtSF_compact)
+        thr_copy_s2t = tiled_copy_s2t.get_slice(0)
+
+        # ((ATOM_V, REST_V), Rest_Tiler, MMA_MN, MMA_K, STAGE)
+        tCsSF_compact_s2t_ = thr_copy_s2t.partition_S(tCsSF_compact)
+        # ((ATOM_V, REST_V), Rest_Tiler, MMA_MN, MMA_K, STAGE)
+        tCsSF_compact_s2t = tcgen05.get_s2t_smem_desc_tensor(
+            tiled_copy_s2t, tCsSF_compact_s2t_
+        )
+        # ((ATOM_V, REST_V), Rest_Tiler, MMA_MN, MMA_K)
+        tCtSF_compact_s2t = thr_copy_s2t.partition_D(tCtSF_compact)
+
+        return tiled_copy_s2t, tCsSF_compact_s2t, tCtSF_compact_s2t
             cute.arch.cp_async_mbarrier_arrive_noinc(mbar_full_ptr + stage)
 
     @cute.jit
