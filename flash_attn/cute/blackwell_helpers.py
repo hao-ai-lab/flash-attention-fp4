@@ -3,7 +3,7 @@ from typing import Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32, Boolean, const_expr
+from cutlass import Int32, Boolean, const_expr, Float32
 from cutlass.cute.nvgpu import tcgen05
 from cutlass._mlir.dialects import llvm
 
@@ -751,3 +751,55 @@ def gemm_ptx_partial1(
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
         )
+
+
+# FP4 Quantization helper functions
+@cute.jit
+def packed_float_to_ue4m3(f0: Float32, f1: Float32, f2: Float32, f3: Float32, *, loc=None, ip=None) -> Int32:
+    """Convert 4 FP32 values to UE4M3 format packed in uint32_t"""
+    out_uint32 = llvm.inline_asm(
+        T.i32(),
+        [Float32(f0).ir_value(loc=loc, ip=ip), Float32(f1).ir_value(loc=loc, ip=ip), 
+         Float32(f2).ir_value(loc=loc, ip=ip), Float32(f3).ir_value(loc=loc, ip=ip)],
+        "{\n\t"
+        ".reg .b16 lo;\n\t"
+        ".reg .b16 hi;\n\t"
+        "cvt.rn.satfinite.e4m3x2.f32   lo, $2, $1;\n\t"
+        "cvt.rn.satfinite.e4m3x2.f32   hi, $4, $3;\n\t"
+        "mov.b32 $0, {lo, hi};\n\t"
+        "}\n",
+        "=r,f,f,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return Int32(out_uint32)
+
+@cute.jit
+def packed_float_to_e2m1(f0: Float32, f1: Float32, f2: Float32, f3: Float32, 
+                         f4: Float32, f5: Float32, f6: Float32, f7: Float32, 
+                         *, loc=None, ip=None) -> Int32:
+    """Convert 8 FP32 values to E2M1 format packed in uint32_t"""
+    out_uint32 = llvm.inline_asm(
+        T.i32(),
+        [Float32(f0).ir_value(loc=loc, ip=ip), Float32(f1).ir_value(loc=loc, ip=ip),
+         Float32(f2).ir_value(loc=loc, ip=ip), Float32(f3).ir_value(loc=loc, ip=ip),
+         Float32(f4).ir_value(loc=loc, ip=ip), Float32(f5).ir_value(loc=loc, ip=ip),
+         Float32(f6).ir_value(loc=loc, ip=ip), Float32(f7).ir_value(loc=loc, ip=ip)],
+        "{\n\t"
+        ".reg .b8 byte0;\n\t"
+        ".reg .b8 byte1;\n\t"
+        ".reg .b8 byte2;\n\t"
+        ".reg .b8 byte3;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32   byte0, $2, $1;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32   byte1, $4, $3;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32   byte2, $6, $5;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32   byte3, $8, $7;\n\t"
+        "mov.b32 $0, {byte0, byte1, byte2, byte3};\n\t"
+        "}\n",
+        "=r,f,f,f,f,f,f,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return Int32(out_uint32)
