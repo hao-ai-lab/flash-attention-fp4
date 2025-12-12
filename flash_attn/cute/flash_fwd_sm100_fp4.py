@@ -369,6 +369,7 @@ class FlashAttentionForwardSm100:
             cta_group,
             self.mma_tiler_qk[:2],
         )
+        breakpoint()
         if const_expr(mSFV is not None):
             tiled_mma_pv = sm100_utils_basic.make_blockscaled_trivial_tiled_mma(
                 self.v_dtype,
@@ -1524,7 +1525,7 @@ class FlashAttentionForwardSm100:
             tSgSFK = thr_mma_qk.partition_B(gSFK)
             tKsSFK, tKgSFK = cpasync.tma_partition(
                 tma_atom_sfk,
-                0,  # no multicast
+                0, 
                 cute.make_layout(1),
                 cute.group_modes(sSFK, 0, 3),
                 cute.group_modes(tSgSFK, 0, 3),
@@ -1537,7 +1538,7 @@ class FlashAttentionForwardSm100:
                 tOgSFV = thr_mma_pv.partition_B(gSFV)
                 tVsSFV, tVgSFV = cpasync.tma_partition(
                     tma_atom_sfv,
-                    0,  # no multicast
+                    0,  
                     cute.make_layout(1),
                     cute.group_modes(sSFV, 0, 3),
                     cute.group_modes(tOgSFV, 0, 3),

@@ -22,7 +22,7 @@
 # - bwd pass optimized for Hopper/Blackwell
 
 import math
-from typing import Optional, Tuple, Callable
+from typing import Optional, Tuple, Callable, Union
 
 import torch
 
@@ -64,7 +64,8 @@ def is_nvfp4_dtype(dtype):
     """Check if a torch dtype is nvfp4 (FP4)"""
     # Check by dtype name or string representation
     dtype_str = str(dtype)
-    return 'nvfp4' in dtype_str.lower() or 'fp4' in dtype_str.lower() or hasattr(dtype, 'nvfp4')
+    # NOTE: cutlass uses int8 for nvfp4 for now, change later.
+    return 'nvfp4' in dtype_str.lower() or 'fp4' in dtype_str.lower() or hasattr(dtype, 'nvfp4') or dtype == torch.int8 
 
 
 def num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, max_splits):
@@ -78,9 +79,9 @@ def num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, max_splits):
 
 
 def _flash_attn_fwd(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
+    q: Union[torch.Tensor, cute.Tensor],
+    k: Union[torch.Tensor, cute.Tensor],
+    v: Union[torch.Tensor, cute.Tensor],
     cu_seqlens_q: Optional[torch.Tensor] = None,
     cu_seqlens_k: Optional[torch.Tensor] = None,
     seqused_q: Optional[torch.Tensor] = None,
@@ -108,9 +109,9 @@ def _flash_attn_fwd(
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
     aux_tensors: Optional[list[torch.Tensor]] = None,
-    mSFQ: Optional[torch.Tensor] = None,  # Scale factor for Q
-    mSFK: Optional[torch.Tensor] = None,  # Scale factor for K
-    mSFV: Optional[torch.Tensor] = None,  # Scale factor for V
+    mSFQ: Optional[Union[torch.Tensor, cute.Tensor]] = None,  # Scale factor for Q
+    mSFK: Optional[Union[torch.Tensor, cute.Tensor]] = None,  # Scale factor for K
+    mSFV: Optional[Union[torch.Tensor, cute.Tensor]] = None,  # Scale factor for V
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Forward pass for FlashAttention.
 
@@ -124,7 +125,10 @@ def _flash_attn_fwd(
         lse: Optional pre-allocated log-sum-exp tensor. If None, will be allocated when needed.
         aux_tensors: Some score_mods will want to read from global aux_tensors. This is how we thread them through to the inner kernel.
     """
-    q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
+    # Handle CUTE tensors - use them directly, no conversion needed
+    # Only make contiguous if they are torch tensors
+    if not isinstance(q, cute.Tensor):
+        q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
     num_head, head_dim = q.shape[-2:]
     if cu_seqlens_q is None:
         batch_size, seqlen_q = q.shape[:2]
@@ -171,10 +175,23 @@ def _flash_attn_fwd(
         "seqused_k must have shape (batch_size,)"
     )
     # Check if using FP4 (nvfp4)
-    use_fp4 = is_nvfp4_dtype(q.dtype)
-    if not use_fp4:
-        assert q.dtype in [torch.float16, torch.bfloat16], "inputs must be float16 or bfloat16"
-    assert q.dtype == k.dtype == v.dtype, "inputs must have the same dtype"
+    # Handle both torch and CUTE tensors
+    is_cute_q = isinstance(q, cute.Tensor)
+    if is_cute_q:
+        q_dtype = q.element_type
+        use_fp4 = q.element_type == cutlass.Float4E2M1FN
+        if not use_fp4:
+            k_dtype = k.element_type if isinstance(k, cute.Tensor) else k.dtype
+            v_dtype = v.element_type if isinstance(v, cute.Tensor) else v.dtype
+            assert q_dtype in [cutlass.Float16, cutlass.BFloat16], "inputs must be float16 or bfloat16"
+            assert q_dtype == k_dtype == v_dtype, "inputs must have the same dtype"
+    else:
+        use_fp4 = is_nvfp4_dtype(q.dtype)
+        if not use_fp4:
+            assert q.dtype in [torch.float16, torch.bfloat16], "inputs must be float16 or bfloat16"
+            assert q.dtype == k.dtype == v.dtype, "inputs must have the same dtype"
+    
+    # Store is_cute_q for later use
     for t in [cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k]:
         if t is not None:
             assert t.dtype == torch.int32, (
@@ -187,8 +204,9 @@ def _flash_attn_fwd(
         assert learnable_sink.shape == (num_head,)
         assert learnable_sink.dtype == torch.bfloat16, "learnable_sink must be bfloat16"
 
+    # Check CUDA device - CUTE tensors are always on device, torch tensors need .is_cuda check
     assert all(
-        t is None or t.is_cuda
+        t is None or (isinstance(t, cute.Tensor) or t.is_cuda)
         for t in (
             q,
             k,
@@ -203,7 +221,17 @@ def _flash_attn_fwd(
     ), "inputs must be on CUDA device"
     assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
     assert head_dim <= 256, "head_dim must be less than or equal to 256"
-    alignment = 16 // q.element_size()
+    # Handle both torch and CUTE tensors for element_size
+    if is_cute_q:
+        # For CUTE tensors, FP4 is 4 bits but packed as 1 byte (2 values per byte)
+        # For alignment purposes, use 1 byte for FP4
+        if q.element_type == cutlass.Float4E2M1FN:
+            q_element_size = 1
+        else:
+            q_element_size = q.element_type.width // 8
+    else:
+        q_element_size = q.element_size()
+    alignment = 16 // q_element_size
     assert head_dim % alignment == 0, f"head_dim must be divisible by {alignment}"
     assert head_dim_v % alignment == 0, f"head_dim_v must be divisible by {alignment}"
     if softmax_scale is None:
@@ -214,8 +242,18 @@ def _flash_attn_fwd(
     if pack_gqa is None:
         pack_gqa = qhead_per_kvhead > 1
 
-    out_torch_dtype = q.dtype
-    device = q.device
+    # Handle both torch and CUTE tensors for dtype and device
+    if is_cute_q:
+        # For CUTE tensors, we need to get the torch dtype for output allocation
+        # Map CUTE dtype to torch dtype
+        if q_dtype == cutlass.Float4E2M1FN:
+            out_torch_dtype = cutlass.BFloat16
+        else:
+            out_torch_dtype = q_dtype
+        device = torch.device('cuda')  # CUTE tensors are always on CUDA
+    else:
+        out_torch_dtype = q.dtype
+        device = q.device
     q_batch_seqlen_shape = (batch_size, seqlen_q) if cu_seqlens_q is None else (total_q,)
     lse_shape = (batch_size, num_head, seqlen_q) if cu_seqlens_q is None else (num_head, total_q)
     requires_grad = q.requires_grad or k.requires_grad or v.requires_grad
@@ -255,7 +293,11 @@ def _flash_attn_fwd(
         )
         assert lse.is_cuda, "lse tensor must be on CUDA device"
 
-    dtype = torch2cute_dtype_map.get(q.dtype, cutlass.Float16) if not use_fp4 else cutlass.Float16
+    # Get CUTE dtype - use directly if CUTE tensor, otherwise convert from torch dtype
+    if is_cute_q:
+        dtype = q.element_type
+    else:
+        dtype = torch2cute_dtype_map.get(q.dtype, cutlass.Float16) if not use_fp4 else cutlass.Float16
     (
         cu_seqlens_q_tensor,
         cu_seqlens_k_tensor,
@@ -273,19 +315,19 @@ def _flash_attn_fwd(
     mSFQ_tensor = None
     mSFK_tensor = None
     mSFV_tensor = None
-    if use_fp4:
+    if use_fp4 and isinstance(mSFQ, torch.Tensor):
         mSFQ_tensor = (
-            from_dlpack(mSFQ.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=mSFQ.ndim - 1)
+            from_dlpack(mSFQ.detach(), assumed_align=16).mark_layout_dynamic()
             if mSFQ is not None
             else None
         )
         mSFK_tensor = (
-            from_dlpack(mSFK.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=mSFK.ndim - 1)
+            from_dlpack(mSFK.detach(), assumed_align=16).mark_layout_dynamic()
             if mSFK is not None
             else None
         )
         mSFV_tensor = (
-            from_dlpack(mSFV.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=mSFV.ndim - 1)
+            from_dlpack(mSFV.detach(), assumed_align=16).mark_layout_dynamic()
             if mSFV is not None
             else None
         )
@@ -372,10 +414,11 @@ def _flash_attn_fwd(
         out_partial = torch.empty(num_splits, *q_batch_seqlen_shape, num_head, head_dim_v, dtype=torch.float32, device=device)
         lse_partial = torch.empty(num_splits, *lse_shape, dtype=torch.float32, device=device)
 
-    q_tensor, k_tensor, v_tensor, o_tensor = [
-        from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=t.ndim - 1)
-        for t in (q, k, v, out if not is_split_kv else out_partial)
-    ]
+    # Use CUTE tensors directly if provided, otherwise convert from torch
+    q_tensor = q if is_cute_q else from_dlpack(q.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=q.ndim - 1)
+    k_tensor = k if isinstance(k, cute.Tensor) else from_dlpack(k.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=k.ndim - 1)
+    v_tensor = v if isinstance(v, cute.Tensor) else from_dlpack(v.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=v.ndim - 1)
+    o_tensor = from_dlpack((out if not is_split_kv else out_partial).detach(), assumed_align=16).mark_layout_dynamic(leading_dim=(out if not is_split_kv else out_partial).ndim - 1)
     if is_split_kv:
         lse_tensor = from_dlpack(lse_partial.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=lse_partial.ndim - 1)
     elif lse is not None:
@@ -1110,6 +1153,9 @@ class FlashAttnFunc(torch.autograd.Function):
         full_block_idx: Optional[torch.Tensor] = None,
         mask_block_cnt: Optional[torch.Tensor] = None,
         mask_block_idx: Optional[torch.Tensor] = None,
+        mSFQ: Optional[torch.Tensor] = None,
+        mSFK: Optional[torch.Tensor] = None,
+        mSFV: Optional[torch.Tensor] = None,
     ):
         # Only create block sparse tensors if at least one block sparse parameter is provided
         block_sparse_tensors = None
@@ -1133,7 +1179,10 @@ class FlashAttnFunc(torch.autograd.Function):
             num_splits=num_splits,
             pack_gqa=pack_gqa,
             mask_mod=mask_mod,
-            block_sparse_tensors=block_sparse_tensors
+            block_sparse_tensors=block_sparse_tensors,
+            mSFQ=mSFQ,
+            mSFK=mSFK,
+            mSFV=mSFV,
         )
         ctx.save_for_backward(q, k, v, out, lse)
         ctx.softmax_scale = softmax_scale
@@ -1244,6 +1293,9 @@ def flash_attn_func(
     full_block_idx: Optional[torch.Tensor] = None,
     mask_block_cnt: Optional[torch.Tensor] = None,
     mask_block_idx: Optional[torch.Tensor] = None,
+    mSFQ: Optional[torch.Tensor] = None,
+    mSFK: Optional[torch.Tensor] = None,
+    mSFV: Optional[torch.Tensor] = None,
 ):
     return FlashAttnFunc.apply(
         q,
@@ -1261,6 +1313,9 @@ def flash_attn_func(
         full_block_idx,
         mask_block_cnt,
         mask_block_idx,
+        mSFQ,
+        mSFK,
+        mSFV,
     )
 
 

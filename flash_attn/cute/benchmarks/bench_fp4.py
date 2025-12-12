@@ -186,23 +186,28 @@ def create_fp4_attention_tensors(batch, seqlen_q, seqlen_k, nheads, nheads_kv, h
     
     # Create FP4 tensors for Q and K (V quantization is optional)
     # First create CUTE tensors for Q and K
-    q_tensor, q_torch_cute = cutlass_torch.cute_tensor_like(
+    q_tensor, q_torch_underlying = cutlass_torch.cute_tensor_like(
         q_ref, ab_dtype, is_dynamic_layout=True, assumed_align=16
     )
-    k_tensor, k_torch_cute = cutlass_torch.cute_tensor_like(
+    k_tensor, k_torch_underlying = cutlass_torch.cute_tensor_like(
         k_ref, ab_dtype, is_dynamic_layout=True, assumed_align=16
     )
-    
+    # Get the correct stride_order from the reference tensors
+    # stride_order should match the layout of the original tensor
+    q_stride_order = tuple(q_ref.dim_order())
+    k_stride_order = tuple(k_ref.dim_order())
     # Mark tensors to be byte aligned (FP4 needs divisibility of 2)
+    # For flash attention, headdim is the last dimension (index 3), which should be mode 1
+    # Mode 0 is for batch/seqlen/nheads, mode 1 is for headdim
     q_tensor.mark_compact_shape_dynamic(
-        mode=0,
-        stride_order=(3, 2, 1, 0),
-        divisibility=2,
+        mode=1,  # headdim dimension needs divisibility for FP4
+        stride_order=q_stride_order,
+        divisibility=2 if ab_dtype == cutlass.Float4E2M1FN else 1,
     )
     k_tensor.mark_compact_shape_dynamic(
-        mode=0,
-        stride_order=(3, 2, 1, 0),
-        divisibility=2,
+        mode=1,  # headdim dimension needs divisibility for FP4
+        stride_order=k_stride_order,
+        divisibility=2 if ab_dtype == cutlass.Float4E2M1FN else 1,
     )
     
     # Convert FP32 tensors to FP4 format for Q and K
@@ -215,47 +220,67 @@ def create_fp4_attention_tensors(batch, seqlen_q, seqlen_k, nheads, nheads_kv, h
     
     # Handle V: quantize to FP4 if quant_v=True, otherwise use regular dtype
     if quant_v:
-        v_tensor, v_torch_cute = cutlass_torch.cute_tensor_like(
+        v_tensor, v_torch_underlying = cutlass_torch.cute_tensor_like(
             v_ref, ab_dtype, is_dynamic_layout=True, assumed_align=16
         )
+        # Get the correct stride_order from the reference tensor
+        v_stride_order = tuple(v_ref.dim_order())
         v_tensor.mark_compact_shape_dynamic(
-            mode=0,
-            stride_order=(3, 2, 1, 0),
-            divisibility=2,
+            mode=1,  # headdim_v dimension needs divisibility for FP4
+            stride_order=v_stride_order,
+            divisibility=2 if ab_dtype == cutlass.Float4E2M1FN else 1,
         )
         v_tensor = cutlass_torch.convert_cute_tensor(
             v_ref, v_tensor, ab_dtype, is_dynamic_layout=True
         )
-        v_torch = v_torch_cute
     else:
-        # V stays as regular dtype (not FP4 quantized)
-        v_torch = v_ref.to(dtype_gen)
-    
-    # For the interface, we need torch tensors
-    q_torch = q_torch_cute
-    k_torch = k_torch_cute
+        # V stays as regular dtype (not FP4 quantized) - create CUTE tensor
+        # Convert torch dtype to CUTE dtype
+        assert dtype_gen in [torch.bfloat16, torch.float16]
+        if dtype_gen == torch.bfloat16:
+            v_cute_dtype = cutlass.BFloat16
+        elif dtype_gen == torch.float16:
+            v_cute_dtype = cutlass.Float16
+
+        v_tensor, v_torch_underlying = cutlass_torch.cute_tensor_like(
+            v_ref, v_cute_dtype, is_dynamic_layout=True, assumed_align=16
+        )
+        # Get the correct stride_order from the reference tensor
+        v_stride_order = tuple(v_ref.dim_order())
+        v_tensor.mark_compact_shape_dynamic(
+            mode=1,  # headdim_v dimension
+            stride_order=v_stride_order,
+            divisibility=1,  # Not FP4, so no divisibility requirement
+        )
+        v_tensor = cutlass_torch.convert_cute_tensor(
+            v_ref, v_tensor, v_cute_dtype, is_dynamic_layout=True
+        )
     
     # Create scale factor tensors for Q and K (V scale factors are optional)
     # For Q: (batch, nheads, seqlen_q, headdim) -> scale factors for headdim dimension
     # Scale factors are per (batch * nheads, seqlen_q, ceil_div(headdim, sf_vec_size))
-    q_sf_ref, q_sf_tensor, q_sf_torch = create_scale_factor_tensor(
+    q_sf_ref, q_sf_tensor, q_sf_torch_underlying = create_scale_factor_tensor(
         batch, seqlen_q, nheads, headdim, sf_vec_size, sf_dtype, device
     )
     
     # For K: (batch, nheads_kv, seqlen_k, headdim) -> scale factors for headdim dimension
-    k_sf_ref, k_sf_tensor, k_sf_torch = create_scale_factor_tensor(
+    k_sf_ref, k_sf_tensor, k_sf_torch_underlying = create_scale_factor_tensor(
         batch, seqlen_k, nheads_kv, headdim, sf_vec_size, sf_dtype, device
     )
     
     # Create V scale factors only if V is being quantized
     if quant_v:
-        v_sf_ref, v_sf_tensor, v_sf_torch = create_scale_factor_tensor(
+        v_sf_ref, v_sf_tensor, v_sf_torch_underlying = create_scale_factor_tensor(
             batch, seqlen_k, nheads_kv, headdim_v, sf_vec_size, sf_dtype, device
         )
     else:
-        v_sf_torch = None
+        v_sf_tensor = None
+        v_sf_torch_underlying = None
     
-    return (q_torch, k_torch, v_torch, q_sf_torch, k_sf_torch, v_sf_torch, 
+    # Return CUTE tensors (not torch tensors)
+    # Note: The underlying torch tensors are accessible via the CUTE tensor's DLPack interface
+    # when needed for the interface
+    return (q_tensor, k_tensor, v_tensor, q_sf_tensor, k_sf_tensor, v_sf_tensor, 
             q_ref, k_ref, v_ref)
 
 
@@ -317,9 +342,7 @@ def main(quant_v=False):
                       causal=causal, window_size=window_size)
         
         # Benchmark FP4 attention
-        # Note: The interface expects torch tensors, not CUTE tensors
-        # We need to check if the interface can handle FP4 dtypes directly
-        # For now, we'll try to use the FP4 tensors as torch tensors
+        # Pass CUTE tensors directly (like dense GEMM example)
         m_fp4 = None
         try:
             time.sleep(1)
