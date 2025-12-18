@@ -21,7 +21,7 @@
 
 import math
 from functools import lru_cache
-from typing import Optional, Tuple, Callable
+from typing import Optional, Tuple, Callable, Union, Type
 
 import torch
 
@@ -83,6 +83,13 @@ torch2cute_dtype_map = {
     torch.float32: cutlass.Float32,
 }
 
+cute2torch_dtype_map = {
+    cutlass.Float16: torch.float16,
+    cutlass.BFloat16: torch.bfloat16,
+    cutlass.Float32: torch.float32,
+    cutlass.Float4E2M1FN: torch.bfloat16,  # FP4 outputs as bfloat16
+}
+
 # Check if dtype is nvfp4
 def is_nvfp4_dtype(dtype):
     """Check if a torch dtype is nvfp4 (FP4)"""
@@ -90,6 +97,51 @@ def is_nvfp4_dtype(dtype):
     dtype_str = str(dtype)
     # NOTE: cutlass uses int8 for nvfp4 for now, change later.
     return 'nvfp4' in dtype_str.lower() or 'fp4' in dtype_str.lower() or hasattr(dtype, 'nvfp4') or dtype == torch.int8 
+
+
+def is_valid_dtypes_and_scale_factor_vec_size(
+    ab_dtype: Type[cutlass.Numeric],
+    sf_dtype: Type[cutlass.Numeric],
+    sf_vec_size: int,
+) -> bool:
+    """
+    Check if the dtypes and sf_vec_size are valid combinations for block-scaled quantization.
+
+    :param ab_dtype: The data type of the Q/K/V operands (typically Float4E2M1FN for FP4)
+    :type ab_dtype: Type[cutlass.Numeric]
+    :param sf_dtype: The data type of the scale factor
+    :type sf_dtype: Type[cutlass.Numeric]
+    :param sf_vec_size: The vector size of the scale factor
+    :type sf_vec_size: int
+
+    :return: True if the dtypes and sf_vec_size are valid, False otherwise
+    :rtype: bool
+    """
+    is_valid = True
+
+    # Check valid ab_dtype (for FP4 flash attention, this should be Float4E2M1FN)
+    if ab_dtype not in {
+        cutlass.Float4E2M1FN,
+        cutlass.Float8E5M2,
+        cutlass.Float8E4M3FN,
+    }:
+        is_valid = False
+
+    # Check valid sf_vec_size
+    if sf_vec_size not in {16, 32}:
+        is_valid = False
+
+    # Check valid sf_dtype
+    if sf_dtype not in {cutlass.Float8E8M0FNU, cutlass.Float8E4M3FN}:
+        is_valid = False
+
+    # Check valid sf_dtype and sf_vec_size combinations
+    if sf_dtype == cutlass.Float8E4M3FN and sf_vec_size == 32:
+        is_valid = False
+    if ab_dtype in {cutlass.Float8E5M2, cutlass.Float8E4M3FN} and sf_vec_size == 16:
+        is_valid = False
+
+    return is_valid
 
 
 def num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, max_splits):
@@ -269,11 +321,10 @@ def _flash_attn_fwd(
     # Handle both torch and CUTE tensors for dtype and device
     if is_cute_q:
         # For CUTE tensors, we need to get the torch dtype for output allocation
-        # Map CUTE dtype to torch dtype
         if q_dtype == cutlass.Float4E2M1FN:
-            out_torch_dtype = cutlass.BFloat16
+            out_torch_dtype = torch.bfloat16
         else:
-            out_torch_dtype = q_dtype
+            out_torch_dtype = cute2torch_dtype_map[q_dtype]
         device = torch.device('cuda')  # CUTE tensors are always on CUDA
     else:
         out_torch_dtype = q.dtype
@@ -483,6 +534,23 @@ def _flash_attn_fwd(
             if page_table is not None
             else None
         )
+        # Extract scale factor dtype and vec_size before converting tensors
+        sf_dtype = None
+        sf_vec_size = 16  # Default for FP4
+        if use_fp4 and mSFQ is not None:
+            if isinstance(mSFQ, cute.Tensor):
+                sf_dtype = mSFQ.element_type
+            else:
+                # Convert torch dtype to CUTLASS dtype
+                sf_dtype = torch2cute_dtype_map.get(mSFQ.dtype, cutlass.Float8E4M3FN)
+            # Set default sf_vec_size based on sf_dtype
+            if sf_dtype == cutlass.Float8E4M3FN:
+                sf_vec_size = 16
+            elif sf_dtype == cutlass.Float8E8M0FNU:
+                sf_vec_size = 32
+            else:
+                raise ValueError(f"Invalid scale factor dtype: {sf_dtype}")
+        
         q_tensor, k_tensor, v_tensor, o_tensor = [
             to_cute_tensor(t) for t in (q, k, v, out if not is_split_kv else out_partial)
         ]
@@ -544,9 +612,16 @@ def _flash_attn_fwd(
         elif compute_capability == 10:
             if use_fp4:
                 # Use FP4 kernel with scale factors
-                # Default scale factor dtype and vec size for FP4
-                sf_dtype = cutlass.Uint8  # Scale factors are typically Uint8 (UE4M3 format)
-                sf_vec_size = 16  # 1 scale factor per 16 elements (default)
+                # Use extracted sf_dtype if available, otherwise default
+                if sf_dtype is None:
+                    sf_dtype = cutlass.Float8E4M3FN  # Default scale factor dtype for FP4
+                # Validate dtype and scale factor combinations
+                ab_dtype = cutlass.Float4E2M1FN  # MXFP4 and NVFP4 use Float4E2M1FN for Q/K/V
+                if not is_valid_dtypes_and_scale_factor_vec_size(ab_dtype, sf_dtype, sf_vec_size):
+                    raise ValueError(
+                        f"Invalid dtype combination: ab_dtype={ab_dtype}, "
+                        f"sf_dtype={sf_dtype}, sf_vec_size={sf_vec_size}"
+                    )
                 fa_fwd = FlashAttentionForwardSm100FP4(
                     head_dim,
                     head_dim_v,
