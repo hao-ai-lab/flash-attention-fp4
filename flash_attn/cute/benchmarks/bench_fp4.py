@@ -60,8 +60,8 @@ def create_scale_factor_tensor(batch, seqlen, nheads, headdim, sf_vec_size, sf_d
         seqlen: Sequence length
         nheads: Number of heads
         headdim: Head dimension
-        sf_vec_size: Scale factor vector size (typically 16 for FP4)
-        sf_dtype: Scale factor dtype (typically Uint8 for UE4M3)
+        sf_vec_size: Scale factor vector size (typically 16 for NVFP4)
+        sf_dtype: Scale factor dtype (typically Float8E4M3FN for NVFP4)
         device: Device to create tensor on
     
     Returns:
@@ -153,7 +153,8 @@ def create_scale_factor_tensor(batch, seqlen, nheads, headdim, sf_vec_size, sf_d
 
 
 def create_fp4_attention_tensors(batch, seqlen_q, seqlen_k, nheads, nheads_kv, headdim, headdim_v, 
-                                  device='cuda', dtype_gen=torch.bfloat16, quant_v=False):
+                                  device='cuda', dtype_gen=torch.bfloat16, quant_v=False, return_torch=True,
+                                  ab_dtype=None, sf_dtype=None, sf_vec_size=None):
     """Create FP4 attention tensors (Q, K, V) with scale factors.
     
     Args:
@@ -167,7 +168,10 @@ def create_fp4_attention_tensors(batch, seqlen_q, seqlen_k, nheads, nheads_kv, h
         device: Device to create tensors on
         dtype_gen: Dtype to generate random data in (before conversion to FP4)
         quant_v: Whether to quantize V to FP4 (default: False, only QK are quantized)
-    
+        return_torch: Whether to return torch tensors (default: True)
+        ab_dtype: Data type for A/B matrices (default: Float4E2M1FN)
+        sf_dtype: Scale factor dtype (default: Float8E4M3FN)
+        sf_vec_size: Scale factor vector size (default: 16)
     Returns:
         Tuple of (q_fp4, k_fp4, v_tensor, q_sf, k_sf, v_sf, q_ref, k_ref, v_ref)
         where q_fp4, k_fp4 are FP4 tensors, v_tensor is FP4 if quant_v=True else regular dtype,
@@ -175,9 +179,12 @@ def create_fp4_attention_tensors(batch, seqlen_q, seqlen_k, nheads, nheads_kv, h
         and *_ref are reference FP32 tensors
     """
     # Default FP4 parameters
-    ab_dtype = cutlass.Float4E2M1FN  # FP4 data type
-    sf_dtype = cutlass.Uint8  # Scale factor dtype (UE4M3 format)
-    sf_vec_size = 16  # 1 scale factor per 16 elements
+    if ab_dtype is None:
+        ab_dtype = cutlass.Float4E2M1FN  # FP4 data type
+    if sf_dtype is None:
+        sf_dtype = cutlass.Float8E4M3FN  # Scale factor dtype
+    if sf_vec_size is None:
+        sf_vec_size = 16  # 1 scale factor per 16 elements
     
     # Create reference FP32 tensors
     q_ref = torch.randn(batch, seqlen_q, nheads, headdim, device=device, dtype=torch.float32)
@@ -276,9 +283,12 @@ def create_fp4_attention_tensors(batch, seqlen_q, seqlen_k, nheads, nheads_kv, h
     else:
         v_sf_tensor = None
         v_sf_torch_underlying = None
-    
-    return (q_tensor, k_tensor, v_tensor, q_sf_tensor, k_sf_tensor, v_sf_tensor, 
-            q_ref, k_ref, v_ref)
+    if return_torch:
+        return (q_torch_underlying, k_torch_underlying, v_torch_underlying, q_sf_torch_underlying, k_sf_torch_underlying, v_sf_torch_underlying, 
+                q_ref, k_ref, v_ref)
+    else:
+        return (q_tensor, k_tensor, v_tensor, q_sf_tensor, k_sf_tensor, v_sf_tensor, 
+                q_ref, k_ref, v_ref)
 
 
 def time_fwd(func, *args, repeats=30, verbose=True, desc="", **kwargs):
@@ -286,10 +296,13 @@ def time_fwd(func, *args, repeats=30, verbose=True, desc="", **kwargs):
     return Timing(do_bench(lambda: func(*args, **kwargs), warmup=5, rep=repeats) * 1e-3)
 
 
-def main(quant_v=False):
+def main(ab_dtype, sf_dtype, sf_vec_size, quant_v=False):
     """Main benchmark function.
     
     Args:
+        ab_dtype: Data type for A/B matrices
+        sf_dtype: Scale factor dtype
+        sf_vec_size: Scale factor vector size
         quant_v: Whether to quantize V to FP4 (default: False, only QK are quantized)
     """
     torch.manual_seed(0)
@@ -326,7 +339,8 @@ def main(quant_v=False):
             (q_fp4, k_fp4, v_tensor, q_sf, k_sf, v_sf, 
              q_ref, k_ref, v_ref) = create_fp4_attention_tensors(
                 batch_size, seqlen_q, seqlen, nheads, nheads_kv, 
-                headdim, headdim_v, device, dtype_gen, quant_v=quant_v
+                headdim, headdim_v, device, dtype_gen, quant_v=quant_v, return_torch=False,
+                ab_dtype=ab_dtype, sf_dtype=sf_dtype, sf_vec_size=sf_vec_size
             )
         except Exception as e:
             print(f"Failed to create FP4 tensors: {e}")
@@ -402,6 +416,9 @@ if __name__ == "__main__":
         action="store_true",
         help="Quantize V to FP4 (default: False, only QK are quantized)"
     )
+    parser.add_argument("--ab_dtype", type=cutlass.dtype, default=cutlass.Float4E2M1FN)
+    parser.add_argument("--sf_dtype", type=cutlass.dtype, default=cutlass.Float8E4M3FN)
+    parser.add_argument("--sf_vec_size", type=int, default=16)
     args = parser.parse_args()
-    main(quant_v=args.quant_v)
+    main(args.ab_dtype, args.sf_dtype, args.sf_vec_size, args.quant_v)
 

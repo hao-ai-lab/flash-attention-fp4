@@ -495,7 +495,7 @@ class FlashAttentionForwardSm100:
             tiled_mma_qk,
             self.cluster_layout_vmnk.shape,
         )
-
+        # breakpoint()
         if const_expr(self.use_tma_KV):
             # TMA load for K
             tma_atom_K, mK = cute.nvgpu.make_tiled_tma_atom_B(

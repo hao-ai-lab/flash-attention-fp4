@@ -590,6 +590,7 @@ class FlashAttentionForwardSm100:
         sfq_smem_layout = cute.slice_(sfq_smem_layout_staged, (None, None, None, 0))
         # Setup scale factor tensor gmem layout 
         # ((Atom_M, Rest_M),(Atom_K, Rest_K),RestL)
+        # breakpoint()
         sfq_layout = blockscaled_utils.tile_atom_to_shape_SF(mQ.shape, self.sf_vec_size)
         mSFQ = cute.make_tensor(mSFQ.iterator, sfq_layout)
         tma_atom_sfq, tma_tensor_sfq = cute.nvgpu.make_tiled_tma_atom_A(
