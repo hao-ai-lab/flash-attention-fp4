@@ -67,6 +67,8 @@ def _validate_tensor(t, name, expected_shape, expected_dtype, expected_device):
 
 def to_cute_tensor(t, assumed_align=16, leading_dim=-1, fully_dynamic=False):
     """Convert torch tensor to cute tensor for TVM FFI. leading_dim=-1 defaults to t.ndim-1."""
+    if isinstance(t, cute.Tensor):
+        return t
     tensor = from_dlpack(t.detach(), assumed_align=assumed_align, enable_tvm_ffi=True)
     if fully_dynamic:
         return tensor.mark_layout_dynamic()
@@ -278,7 +280,10 @@ def _flash_attn_fwd(
         device = q.device
     q_batch_seqlen_shape = (batch_size, seqlen_q) if cu_seqlens_q is None else (total_q,)
     lse_shape = (batch_size, num_head, seqlen_q) if cu_seqlens_q is None else (num_head, total_q)
-    requires_grad = q.requires_grad or k.requires_grad or v.requires_grad
+    if isinstance(q, torch.Tensor):
+        requires_grad = q.requires_grad or k.requires_grad or v.requires_grad
+    else:
+        requires_grad = False # NOTE(Wenxuan): cute tensor has no grad attr, currently hardcode for inference
 
     if out is None:
         out = torch.empty(
@@ -320,33 +325,8 @@ def _flash_attn_fwd(
         dtype = q.element_type
     else:
         dtype = torch2cute_dtype_map.get(q.dtype, cutlass.Float16) if not use_fp4 else cutlass.Float16
-    
-    # Convert scale factor tensors if using FP4
-    mSFQ_tensor = None
-    mSFK_tensor = None
-    mSFV_tensor = None
-    if use_fp4 and isinstance(mSFQ, torch.Tensor):
-        mSFQ_tensor = (
-            from_dlpack(mSFQ.detach(), assumed_align=16).mark_layout_dynamic()
-            if mSFQ is not None
-            else None
-        )
-        mSFK_tensor = (
-            from_dlpack(mSFK.detach(), assumed_align=16).mark_layout_dynamic()
-            if mSFK is not None
-            else None
-        )
-        mSFV_tensor = (
-            from_dlpack(mSFV.detach(), assumed_align=16).mark_layout_dynamic()
-            if mSFV is not None
-            else None
-        )
-    page_table_tensor = (
-        from_dlpack(page_table.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=1)
-        if page_table is not None
-        else None
-    )
-    dtype = torch2cute_dtype_map[q.dtype]
+
+
     compute_capability = (
         _get_device_capability()
         if _compute_capability is None
@@ -506,6 +486,11 @@ def _flash_attn_fwd(
         q_tensor, k_tensor, v_tensor, o_tensor = [
             to_cute_tensor(t) for t in (q, k, v, out if not is_split_kv else out_partial)
         ]
+        # Pass through scale factor tensors if using FP4 (tvm-ffi handles conversion)
+        if use_fp4:
+            mSFQ_tensor = to_cute_tensor(mSFQ, leading_dim=3, assumed_align=16) if mSFQ is not None else None
+            mSFK_tensor = to_cute_tensor(mSFK, leading_dim=3, assumed_align=16) if mSFK is not None else None
+            mSFV_tensor = to_cute_tensor(mSFV, leading_dim=3, assumed_align=16) if mSFV is not None else None
         if is_split_kv:
             lse_tensor = to_cute_tensor(lse_partial, assumed_align=4)
         elif lse is not None:
@@ -614,6 +599,7 @@ def _flash_attn_fwd(
                 f"Unsupported compute capability: {compute_capability}. Supported: 9.x, 10.x"
             )
         # TODO: check @can_implement
+        fake_stream = cute.runtime.make_fake_stream()
         compile_args = [
             fa_fwd,
             q_tensor,
@@ -622,7 +608,8 @@ def _flash_attn_fwd(
             o_tensor,
             lse_tensor,
             softmax_scale,
-            current_stream,
+            # current_stream,
+            fake_stream,
             cu_seqlens_q_tensor,
             cu_seqlens_k_tensor,
             seqused_q_tensor,
@@ -667,14 +654,14 @@ def _flash_attn_fwd(
         page_table,
         window_size_left,
         window_size_right,
-        learnable_sink_tensor,
-        sparse_tensors,
-        cute_aux_tensors,
+        learnable_sink,
+        normalized_block_sparse_tensors,
+        aux_tensors,
     ]
 
     # Add scale factor tensors if using FP4
     if use_fp4:
-        call_args.extend([mSFQ_tensor, mSFK_tensor, mSFV_tensor])
+        call_args.extend([mSFQ, mSFK, mSFV])
     _flash_attn_fwd.compile_cache[compile_key](*call_args)
     if is_split_kv:
         _flash_attn_fwd_combine(

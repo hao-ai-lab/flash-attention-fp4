@@ -369,7 +369,7 @@ class FlashAttentionForwardSm100:
             cta_group,
             self.mma_tiler_qk[:2],
         )
-        breakpoint()
+
         if const_expr(mSFV is not None):
             tiled_mma_pv = sm100_utils_basic.make_blockscaled_trivial_tiled_mma(
                 self.v_dtype,

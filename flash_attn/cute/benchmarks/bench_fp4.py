@@ -277,9 +277,6 @@ def create_fp4_attention_tensors(batch, seqlen_q, seqlen_k, nheads, nheads_kv, h
         v_sf_tensor = None
         v_sf_torch_underlying = None
     
-    # Return CUTE tensors (not torch tensors)
-    # Note: The underlying torch tensors are accessible via the CUTE tensor's DLPack interface
-    # when needed for the interface
     return (q_tensor, k_tensor, v_tensor, q_sf_tensor, k_sf_tensor, v_sf_tensor, 
             q_ref, k_ref, v_ref)
 
