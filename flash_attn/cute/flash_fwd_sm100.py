@@ -100,7 +100,7 @@ class FlashAttentionForwardSm100:
         self.check_hdim_v_oob = head_dim_v != self.head_dim_v_padded
         self.m_block_size = m_block_size
         self.n_block_size = n_block_size
-        self.q_stage = 1 if not is_split_kv else 1
+        self.q_stage = 2
         assert self.q_stage in [1, 2]
 
         # 2 Q tile per CTA
@@ -495,7 +495,7 @@ class FlashAttentionForwardSm100:
             tiled_mma_qk,
             self.cluster_layout_vmnk.shape,
         )
-        # breakpoint()
+
         if const_expr(self.use_tma_KV):
             # TMA load for K
             tma_atom_K, mK = cute.nvgpu.make_tiled_tma_atom_B(
@@ -635,7 +635,15 @@ class FlashAttentionForwardSm100:
 
         self.shared_storage = SharedStorage
         total_smem_bytes = self.shared_storage.size_in_bytes()
-        print(f"Total shared memory used: {total_smem_bytes} bytes ({total_smem_bytes / 1024:.2f} KB)")
+        sO_bytes = cute.size_in_bytes(self.o_dtype, sO_layout) if const_expr(not self.overlap_sO_sQ) else 0
+        sQ_bytes = cute.size_in_bytes(self.q_dtype, sQ_layout)
+        sK_bytes = cute.size_in_bytes(self.k_dtype, sK_layout)
+        sScale_bytes = (self.q_stage * self.m_block_size * 2) * Float32.width // 8
+        print(f"FA4 total shared mem used: {total_smem_bytes / 1024:.2f} KB")
+        print(f"sO_size: {sO_bytes / 1024:.2f} KB")
+        print(f"sQ_size: {sQ_bytes / 1024:.2f} KB")
+        print(f"sK_size: {sK_bytes / 1024:.2f} KB")
+        print(f"sScale_size: {sScale_bytes / 1024:.2f} KB")
         LOG2_E = math.log2(math.e)
         if const_expr(self.score_mod is None):
             softmax_scale_log2 = softmax_scale * LOG2_E
