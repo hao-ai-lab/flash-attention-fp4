@@ -138,11 +138,10 @@ class FlashAttentionForwardSm100:
         # Does S1 need to wait for S0 to finish
         # self.s0_s1_barrier = self.head_dim_padded in [64, 96] and (not self.is_causal and not self.is_local)
         self.s0_s1_barrier = False
-        # self.overlap_sO_sQ = (
-        #     (self.head_dim_padded == 192 and self.head_dim_v_padded >= 64) or
-        #     (self.head_dim_v_padded >= 128 and self.is_split_kv)
-        # )
-        self.overlap_sO_sQ = True #  NOTE (Wenxuan): smem overflow if we are to add scale factors.
+        self.overlap_sO_sQ = (
+            (self.head_dim_padded == 192 and self.head_dim_v_padded >= 64) or
+            (self.head_dim_v_padded >= 128 and self.is_split_kv)
+        )
         if self.overlap_sO_sQ:
             self.is_persistent = False
 
@@ -587,16 +586,14 @@ class FlashAttentionForwardSm100:
         sfq_op = sm100_utils_basic.cluster_shape_to_tma_atom_A(
             self.cluster_shape_mn, tiled_mma_qk.thr_id
         )
-        sfq_smem_layout = cute.slice_(sfq_smem_layout_staged, (None, None, None, 0))
         # Setup scale factor tensor gmem layout 
         # ((Atom_M, Rest_M),(Atom_K, Rest_K),RestL)
-        # breakpoint()
-        sfq_layout = blockscaled_utils.tile_atom_to_shape_SF(mQ.shape, self.sf_vec_size)
+        sfq_layout = blockscaled_utils.tile_atom_to_shape_SF(mQ.shape[:3], self.sf_vec_size)
         mSFQ = cute.make_tensor(mSFQ.iterator, sfq_layout)
         tma_atom_sfq, tma_tensor_sfq = cute.nvgpu.make_tiled_tma_atom_A(
             sfq_op,
             mSFQ,
-            sfq_smem_layout,
+            cute.select(sfq_smem_layout, mode=[0, 1, 2]),
             self.mma_tiler_qk,
             tiled_mma_qk,
             self.cluster_layout_vmnk.shape,
@@ -609,7 +606,7 @@ class FlashAttentionForwardSm100:
         )
         sfk_smem_layout = cute.slice_(sfk_smem_layout_staged, (None, None, None, 0))
         # Setup scale factor tensor layout
-        sfk_layout = blockscaled_utils.tile_atom_to_shape_SF(mK.shape, self.sf_vec_size)
+        sfk_layout = blockscaled_utils.tile_atom_to_shape_SF(mK.shape[:3], self.sf_vec_size)
         mSFK = cute.make_tensor(mSFK.iterator, sfk_layout)
         # For SFB, compute mma_inst_shape_mnk_sfb: (M // (2 if use_2cta_instrs else 1), round_up(N, 128), K)
         mma_inst_bits_k = 256
@@ -843,7 +840,20 @@ class FlashAttentionForwardSm100:
         
         # Print total shared memory size
         total_smem_bytes = self.shared_storage.size_in_bytes()
-        print(f"Total shared memory used: {total_smem_bytes} bytes ({total_smem_bytes / 1024:.2f} KB)")
+        print(f"Total shared memory used: {total_smem_bytes / 1024:.2f} KB")
+        sO_bytes = cute.size_in_bytes(self.o_dtype, sO_layout) if const_expr(not self.overlap_sO_sQ) else 0
+        sQ_bytes = cute.size_in_bytes(self.q_dtype, sQ_layout)
+        sK_bytes = cute.size_in_bytes(self.k_dtype, sK_layout)
+        sfq_bytes = cute.size_in_bytes(cutlass.Uint8, sfq_smem_layout_staged)
+        sfk_bytes = cute.size_in_bytes(cutlass.Uint8, sfk_smem_layout_staged)
+        sfv_bytes = cute.size_in_bytes(cutlass.Uint8, sfv_smem_layout_staged) if const_expr(sfv_smem_layout_staged is not None) else 0
+        print(f"sO_size: {sO_bytes / 1024:.2f} KB")
+        print(f"sQ_size: {sQ_bytes / 1024:.2f} KB")
+        print(f"sK_size: {sK_bytes / 1024:.2f} KB")
+        print(f"sfq_smem_size: {sfq_bytes / 1024:.2f} KB")
+        print(f"sfk_smem_size: {sfk_bytes / 1024:.2f} KB")
+        print(f"sfv_smem_size: {sfv_bytes / 1024:.2f} KB")
+        
 
         LOG2_E = math.log2(math.e)
         if const_expr(self.score_mod is None):
