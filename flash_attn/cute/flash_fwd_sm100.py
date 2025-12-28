@@ -100,7 +100,7 @@ class FlashAttentionForwardSm100:
         self.check_hdim_v_oob = head_dim_v != self.head_dim_v_padded
         self.m_block_size = m_block_size
         self.n_block_size = n_block_size
-        self.q_stage = 2
+        self.q_stage = 2 if not is_split_kv else 1
         assert self.q_stage in [1, 2]
 
         # 2 Q tile per CTA
@@ -486,7 +486,6 @@ class FlashAttentionForwardSm100:
         # TMA load for Q
         tma_load_op = cpasync.CopyBulkTensorTileG2SOp(cta_group)
         tma_store_op = cpasync.CopyBulkTensorTileS2GOp()
-
         tma_atom_Q, mQ = cute.nvgpu.make_tiled_tma_atom_A(
             tma_load_op,
             mQ,
