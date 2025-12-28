@@ -26,6 +26,7 @@ from cutlass import Float32, Int32, const_expr
 from cutlass.cute.nvgpu import cpasync
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
+from flash_attn.cute.block_scaled_layout_test import make_smem_layout_sfa
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 
 from flash_attn.cute.paged_kv import PagedKVManager
@@ -104,7 +105,7 @@ class FlashAttentionForwardSm100:
         self.check_hdim_v_oob = head_dim_v != self.head_dim_v_padded
         self.m_block_size = m_block_size
         self.n_block_size = n_block_size
-        self.q_stage = 2
+        self.q_stage = 2 if not is_split_kv else 1
         assert self.q_stage in [1, 2]
 
         # 2 Q tile per CTA
@@ -431,7 +432,7 @@ class FlashAttentionForwardSm100:
         )
         
         sfv_smem_layout_staged = None
-        sfq_smem_layout_staged = blockscaled_utils.make_smem_layout_sfa(
+        sfq_smem_layout_staged = make_smem_layout_sfa(
             tiled_mma_qk,
             self.mma_tiler_qk,
             self.sf_vec_size,
@@ -593,7 +594,7 @@ class FlashAttentionForwardSm100:
         tma_atom_sfq, tma_tensor_sfq = cute.nvgpu.make_tiled_tma_atom_A(
             sfq_op,
             mSFQ,
-            cute.select(sfq_smem_layout, mode=[0, 1, 2]),
+            sfq_smem_layout,
             self.mma_tiler_qk,
             tiled_mma_qk,
             self.cluster_layout_vmnk.shape,
