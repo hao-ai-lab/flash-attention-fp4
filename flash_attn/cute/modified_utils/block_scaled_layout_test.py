@@ -131,11 +131,11 @@ def make_smem_layout_sfa(
     # (CTA_Tile_Shape_M, MMA_Inst_Shape_K)
     sfa_tile_shape = cute.shape_div(sfa_tile_shape, (1, mma_tile_inst_k))
     # ((Atom_Inst_M, Atom_Inst_K), MMA_M, MMA_K))
+    breakpoint()
     smem_layout = cute.tiled_divide(smem_layout, sfa_tile_shape)
 
     atom_m = 128
     tiler_inst = ((atom_m, sf_vec_size),)
-    breakpoint()
     # (((Atom_Inst_M, Rest_M),(Atom_Inst_K, Rest_K)), MMA_M, MMA_K)
     smem_layout = cute.logical_divide(smem_layout, tiler_inst)
     
