@@ -26,7 +26,8 @@ from cutlass import Float32, Int32, const_expr
 from cutlass.cute.nvgpu import cpasync
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
-from flash_attn.cute.modified_utils.block_scaled_layout_test import make_smem_layout_sfa
+from flash_attn.cute.modified_utils.block_scaled_layout_test import make_smem_layout_sfa, make_smem_layout_sfb
+from flash_attn.cute.modified_utils.helpers import make_tiled_tma_atom_A
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 
 from flash_attn.cute.paged_kv import PagedKVManager
@@ -432,17 +433,20 @@ class FlashAttentionForwardSm100:
         )
         
         sfv_smem_layout_staged = None
+        mma_inst_tile_k = 2
         sfq_smem_layout_staged = make_smem_layout_sfa(
             tiled_mma_qk,
             self.mma_tiler_qk,
             self.sf_vec_size,
             self.q_stage,
+            mma_tile_inst_k=mma_inst_tile_k,
         )
-        sfk_smem_layout_staged = blockscaled_utils.make_smem_layout_sfb(
+        sfk_smem_layout_staged = make_smem_layout_sfb(
             tiled_mma_qk,
             self.mma_tiler_qk,
             self.sf_vec_size,
             self.kv_stage,
+            mma_tile_inst_k=mma_inst_tile_k,
         )
         # Only create V scale factor layout if V is being quantized
         if const_expr(mSFV is not None):
@@ -591,7 +595,8 @@ class FlashAttentionForwardSm100:
         # ((Atom_M, Rest_M),(Atom_K, Rest_K),RestL)
         sfq_layout = blockscaled_utils.tile_atom_to_shape_SF(mQ.shape[:3], self.sf_vec_size)
         mSFQ = cute.make_tensor(mSFQ.iterator, sfq_layout)
-        tma_atom_sfq, tma_tensor_sfq = cute.nvgpu.make_tiled_tma_atom_A(
+
+        tma_atom_sfq, tma_tensor_sfq = make_tiled_tma_atom_A(
             sfq_op,
             mSFQ,
             sfq_smem_layout,
@@ -622,7 +627,7 @@ class FlashAttentionForwardSm100:
             cute.round_up(mma_inst_shape_mnk_qk[1], 128),
             mma_inst_shape_mnk_qk[2],
         )
-        mma_inst_tile_k = 4
+    
         mma_tiler_sfb_qk = (
             mma_inst_shape_mnk_sfb_qk[0],
             mma_inst_shape_mnk_sfb_qk[1],

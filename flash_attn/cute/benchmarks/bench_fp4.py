@@ -313,7 +313,8 @@ def main(ab_dtype, sf_dtype, sf_vec_size, quant_v=False):
     dtype_gen = torch.bfloat16
     
     # Benchmark configurations
-    bs_seqlen_vals = [(32, 1024), (16, 2048), (8, 4096), (4, 8192), (2, 16384), (1, 32768)]
+    # bs_seqlen_vals = [(32, 1024), (16, 2048), (8, 4096), (4, 8192), (2, 16384), (1, 32768)]
+    bs_seqlen_vals = [(32, 1024)]
     headdim = 128
     nheads = 16
     nheads_kv = nheads

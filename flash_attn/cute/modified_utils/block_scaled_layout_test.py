@@ -93,6 +93,7 @@ def make_smem_layout_sfa(
     *,
     loc=None,
     ip=None,
+    mma_tile_inst_k=4,
 ) -> cute.Layout:
     """
     Make smem layout for SFA based on:
@@ -127,11 +128,9 @@ def make_smem_layout_sfa(
         (2, 1),
     )
 
-    mma_tile_inst_k = 4
     # (CTA_Tile_Shape_M, MMA_Inst_Shape_K)
     sfa_tile_shape = cute.shape_div(sfa_tile_shape, (1, mma_tile_inst_k))
     # ((Atom_Inst_M, Atom_Inst_K), MMA_M, MMA_K))
-    breakpoint()
     smem_layout = cute.tiled_divide(smem_layout, sfa_tile_shape)
 
     atom_m = 128
@@ -159,6 +158,8 @@ def make_smem_layout_sfb(
     *,
     loc=None,
     ip=None,
+    mma_tile_inst_k=4,
+    atom_n=128,
 ) -> cute.Layout:
     """
     Make smem layout for SFB based on:
@@ -193,7 +194,6 @@ def make_smem_layout_sfb(
         (2, 1),
     )
 
-    mma_tile_inst_k = 4
     # (CTA_Tile_Shape_N, MMA_Inst_Shape_K)
     sfb_tile_shape = cute.shape_div(sfb_tile_shape, (1, mma_tile_inst_k))
     # ((Atom_Inst_N, Atom_Inst_K), MMA_N, MMA_K)
