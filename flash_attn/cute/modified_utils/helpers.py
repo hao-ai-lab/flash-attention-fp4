@@ -106,7 +106,6 @@ def make_tiled_tma_atom_A(
     ident = core.make_identity_layout(gmem_tensor.shape, loc=loc, ip=ip)
     mma_tiler_mk = (mma_tiler_mnk[0], *mma_tiler_mnk[2:])
     g_tile = core.composition(ident, mma_tiler_mk, loc=loc, ip=ip)
-    breakpoint()
     cta_v_map = tiled_mma._thrfrg_A(g_tile) #((ThrV,(ThrM,ThrK)),(FrgV,(RestM,RestK,...)))
     cta_v_map = core.get(cta_v_map, mode=[1]) # values local to this mma
     cta_v_map = core.dice(cta_v_map, (1, (1,) * core.rank(g_tile)))
