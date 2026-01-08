@@ -108,7 +108,7 @@ class FlashAttentionForwardSm100:
         self.n_block_size = n_block_size
         self.q_stage = 2 if not is_split_kv else 1
         assert self.q_stage in [1, 2]
-
+    
         # 2 Q tile per CTA
         self.cta_tiler = (self.q_stage * m_block_size, n_block_size, self.head_dim_padded)
         self.mma_tiler_qk = (m_block_size, n_block_size, self.head_dim_padded)
@@ -222,6 +222,8 @@ class FlashAttentionForwardSm100:
         # Scale factor parameters for block-scaled quantization (FP4)
         self.sf_dtype = sf_dtype
         self.sf_vec_size = sf_vec_size
+        if self.sf_vec_size == 16:
+            self.mma_inst_tile_k == 2 # each k tile is 256 bits -> K = 2
 
     def _setup_attributes(self):
         """Set up configurations and parameters for the FMHA kernel operation.
@@ -433,7 +435,6 @@ class FlashAttentionForwardSm100:
         )
         
         sfv_smem_layout_staged = None
-        mma_inst_tile_k = 2
         sfq_smem_layout_staged = make_smem_layout_sfa(
             tiled_mma_qk,
             self.mma_tiler_qk,
@@ -679,7 +680,6 @@ class FlashAttentionForwardSm100:
                 cute.round_up(mma_inst_shape_mnk_pv[1], 128),
                 mma_inst_shape_mnk_pv[2],
             )
-            mma_inst_tile_k = 4
             mma_tiler_sfb_pv = (
                 mma_inst_shape_mnk_sfb_pv[0],
                 mma_inst_shape_mnk_sfb_pv[1],
@@ -1254,8 +1254,6 @@ class FlashAttentionForwardSm100:
                 tma_tensor_sfq,
                 tma_atom_sfk,
                 tma_tensor_sfk,
-                sfq_smem_layout_staged,
-                sfk_smem_layout_staged,
                 sSFQ,
                 sSFK,
                 pipeline_kv,
@@ -1301,8 +1299,6 @@ class FlashAttentionForwardSm100:
                 blocksparse_tensors,
                 sSFQ,
                 sSFK,
-                sfq_smem_layout_staged,
-                sfk_smem_layout_staged,
             )
 
             # if warp_idx == self.mma_warp_id:
@@ -1431,8 +1427,6 @@ class FlashAttentionForwardSm100:
         tma_tensor_sfq: Optional[cute.Tensor],
         tma_atom_sfk: Optional[cute.CopyAtom],
         tma_tensor_sfk: Optional[cute.Tensor],
-        sfq_smem_layout_staged: Optional[cute.ComposedLayout],
-        sfk_smem_layout_staged: Optional[cute.ComposedLayout],
         sSFQ: Optional[cute.Tensor],
         sSFK: Optional[cute.Tensor],
         pipeline_kv: cutlass.pipeline.PipelineAsync,
@@ -1680,8 +1674,6 @@ class FlashAttentionForwardSm100:
         blocksparse_tensors: Optional[BlockSparseTensors],
         sSFQ: Optional[cute.Tensor] = None,
         sSFK: Optional[cute.Tensor] = None,
-        sfq_smem_layout_staged: Optional[cute.ComposedLayout] = None,
-        sfk_smem_layout_staged: Optional[cute.ComposedLayout] = None,
     ):
         tSrQ = tiled_mma_qk.make_fragment_A(sQ)
         tSrK = tiled_mma_qk.make_fragment_B(sK)
