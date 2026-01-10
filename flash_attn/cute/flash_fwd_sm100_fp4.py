@@ -361,7 +361,11 @@ class FlashAttentionForwardSm100:
         ):
             self.e2e_freq = 32 if mCuSeqlensQ is not None or mSeqUsedQ is not None else 10
 
-        cta_group = tcgen05.CtaGroup.ONE
+        use_2cta_instrs = self.mma_tiler_qk[0] == 256
+        assert use_2cta_instrs == False, "Two-CTA instructions not supported yet"
+        self.cta_group = (
+            tcgen05.CtaGroup.TWO if use_2cta_instrs else tcgen05.CtaGroup.ONE
+        )
         # the intermediate tensor p is from tmem & mK-major
         p_source = tcgen05.OperandSource.TMEM
         p_major_mode = tcgen05.OperandMajorMode.K
@@ -373,7 +377,7 @@ class FlashAttentionForwardSm100:
             self.k_major_mode,
             self.sf_dtype,
             self.sf_vec_size,
-            cta_group,
+            self.cta_group,
             self.mma_tiler_qk[:2],
         )
 
@@ -384,7 +388,7 @@ class FlashAttentionForwardSm100:
                 self.v_major_mode,
                 self.sf_dtype,
                 self.sf_vec_size,
-                cta_group,
+                self.cta_group,
                 self.mma_tiler_pv[:2],
                 p_source,
             )
@@ -394,7 +398,7 @@ class FlashAttentionForwardSm100:
                 p_major_mode,
                 self.v_major_mode,
                 self.pv_acc_dtype,
-                cta_group,
+                self.cta_group,
                 self.mma_tiler_pv[:2],
                 p_source,
             )
@@ -554,7 +558,7 @@ class FlashAttentionForwardSm100:
             self.tma_copy_bytes["V"] += cute.size_in_bytes(mSFV.element_type, cute.select(sfv_smem_layout, mode=[0, 1, 2]))
 
         # TMA load for Q
-        tma_load_op = cpasync.CopyBulkTensorTileG2SOp(cta_group)
+        tma_load_op = cpasync.CopyBulkTensorTileG2SOp(self.cta_group)
         tma_store_op = cpasync.CopyBulkTensorTileS2GOp()
 
         tma_atom_Q, mQ = cute.nvgpu.make_tiled_tma_atom_A(
@@ -625,7 +629,7 @@ class FlashAttentionForwardSm100:
             self.mma_tiler_qk[1],
             self.mma_inst_bits_k // self.k_dtype.width,
         )
-        use_2cta_instrs = self.mma_tiler_qk[0] == 256
+
         mma_inst_shape_mnk_sfb_qk = (
             mma_inst_shape_mnk_qk[0] // (2 if use_2cta_instrs else 1),
             cute.round_up(mma_inst_shape_mnk_qk[1], 128),
@@ -644,7 +648,7 @@ class FlashAttentionForwardSm100:
             self.k_major_mode,
             self.sf_dtype,
             self.sf_vec_size,
-            tcgen05.CtaGroup.ONE,
+            self.cta_group,
             mma_inst_shape_mnk_sfb_qk[:2],
         )
         cluster_layout_sfb_vmnk = cute.tiled_divide(
@@ -694,7 +698,7 @@ class FlashAttentionForwardSm100:
                 self.v_major_mode,
                 self.sf_dtype,
                 self.sf_vec_size,
-                tcgen05.CtaGroup.ONE,
+                self.cta_group,
                 mma_inst_shape_mnk_sfb_pv[:2],
                 p_source,
             )
@@ -1523,7 +1527,7 @@ class FlashAttentionForwardSm100:
 
             # Partition TMA atoms for scale factors
             # Partition SFQ similar to Q
-            gSFQ = cute.local_tile(tma_tensor_sfq, cute.select(self.mma_tiler_qk, mode=[0, 2]), (None, 0))
+            gSFQ = cute.local_tile(tma_tensor_sfq, cute.slice_(self.mma_tiler_qk, (None, 0, None)), (None, None, None))
             tSgSFQ = thr_mma_qk.partition_A(gSFQ)
             tQsSFQ, tQgSFQ = cpasync.tma_partition(
                 tma_atom_sfq,
@@ -1534,7 +1538,7 @@ class FlashAttentionForwardSm100:
             )
             
             # Partition SFK similar to K
-            gSFK = cute.local_tile(tma_tensor_sfk, cute.select(self.mma_tiler_qk, mode=[1, 2]), (None, 0))
+            gSFK = cute.local_tile(tma_tensor_sfk, cute.slice_(self.mma_tiler_qk, (0, None, None)), (None, None, None))
             tSgSFK = thr_mma_qk.partition_B(gSFK)
             tKsSFK, tKgSFK = cpasync.tma_partition(
                 tma_atom_sfk,
@@ -1547,7 +1551,7 @@ class FlashAttentionForwardSm100:
             # Partition SFV similar to V
             tVsSFV, tVgSFV = None, None
             if const_expr(tma_atom_sfv is not None and tma_tensor_sfv is not None and sSFV is not None):
-                gSFV = cute.local_tile(tma_tensor_sfv, cute.select(self.mma_tiler_pv, mode=[1, 2]), (0, None))
+                gSFV = cute.local_tile(tma_tensor_sfv, cute.slice_(self.mma_tiler_qk, (0, None, None)), (None, None, None))
                 tOgSFV = thr_mma_pv.partition_B(gSFV)
                 tVsSFV, tVgSFV = cpasync.tma_partition(
                     tma_atom_sfv,
