@@ -1170,6 +1170,8 @@ class FlashAttentionForwardSm100:
                 )
             tSgQ = thr_mma_qk.partition_A(gQ)
             tSgK = thr_mma_qk.partition_B(gK)
+            # cute.printf("gK.shape = [{}]", gK.shape)
+            # cute.printf("tSgK.shape = [{}]", tSgK.shape)
             tOgV = thr_mma_pv.partition_B(gV)
             load_Q_fn, _, _ = copy_utils.tma_get_copy_fn(
                 tma_atom_Q, 0, cute.make_layout(1), tSgQ, sQ

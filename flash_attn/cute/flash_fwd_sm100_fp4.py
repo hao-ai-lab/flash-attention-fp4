@@ -1459,7 +1459,7 @@ class FlashAttentionForwardSm100:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
             mQ_cur = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[None, None, head_idx]
-            gQ = cute.local_tile(mQ_cur, cute.select(self.mma_tiler_qk, mode=[0, 2]), (None, 0))
+            gQ = cute.local_tile(mQ_cur, cute.select(self.mma_tiler_qk, mode=[0, 2]), (None, 0)) # (bM, hdim/bK, RestM)
 
             head_idx_kv = (
                 head_idx // self.qhead_per_kvhead if const_expr(not self.pack_gqa) else head_idx
@@ -1484,6 +1484,7 @@ class FlashAttentionForwardSm100:
             tSgQ = thr_mma_qk.partition_A(gQ)
             tSgK = thr_mma_qk.partition_B(gK)
             tOgV = thr_mma_pv.partition_B(gV)
+
             load_Q_fn, _, _ = copy_utils.tma_get_copy_fn(
                 tma_atom_Q, 0, cute.make_layout(1), tSgQ, sQ
             )
@@ -1526,20 +1527,17 @@ class FlashAttentionForwardSm100:
                 tVsV, tVgV = None, None
 
             # Partition TMA atoms for scale factors
-            # Partition SFQ similar to Q
+            # Partition SFQ similar to Q using tma_get_copy_fn
             gSFQ = cute.local_tile(tma_tensor_sfq, cute.slice_(self.mma_tiler_qk, (None, 0, None)), (None, None, None))
             tSgSFQ = thr_mma_qk.partition_A(gSFQ)
-            tQsSFQ, tQgSFQ = cpasync.tma_partition(
-                tma_atom_sfq,
-                0,  # no multicast
-                cute.make_layout(1),
-                cute.group_modes(sSFQ, 0, 3),
-                cute.group_modes(tSgSFQ, 0, 3),
+            load_SFQ_fn, _, _ = copy_utils.tma_get_copy_fn(
+                tma_atom_sfq, 0, cute.make_layout(1), tSgSFQ, sSFQ
             )
             
             # Partition SFK similar to K
             gSFK = cute.local_tile(tma_tensor_sfk, cute.slice_(self.mma_tiler_qk, (0, None, None)), (None, None, None))
             tSgSFK = thr_mma_qk.partition_B(gSFK)
+            # Group only the first 3 modes (static MMA modes) to avoid grouping dynamic Rest modes
             tKsSFK, tKgSFK = cpasync.tma_partition(
                 tma_atom_sfk,
                 0, 
@@ -1553,6 +1551,7 @@ class FlashAttentionForwardSm100:
             if const_expr(tma_atom_sfv is not None and tma_tensor_sfv is not None and sSFV is not None):
                 gSFV = cute.local_tile(tma_tensor_sfv, cute.slice_(self.mma_tiler_qk, (0, None, None)), (None, None, None))
                 tOgSFV = thr_mma_pv.partition_B(gSFV)
+                # Group only the first 3 modes (static MMA modes) to avoid grouping dynamic Rest modes
                 tVsSFV, tVgSFV = cpasync.tma_partition(
                     tma_atom_sfv,
                     0,  
@@ -1567,9 +1566,7 @@ class FlashAttentionForwardSm100:
                 mbar_ptr + self.mbar_load_q_full_offset,
                 mbar_ptr + self.mbar_load_q_empty_offset,
                 phase=q_producer_phase,
-                tma_atom_sfq=tma_atom_sfq,
-                tQgSFQ=tQgSFQ,
-                tQsSFQ=tQsSFQ,
+                load_SFQ_fn=load_SFQ_fn if const_expr(tma_atom_sfq is not None) else None,
             )
             # We have to use mbarrier directly in the load for KV instead of replying on
             # pipeline_kv, because we could have different number of TMA bytes for K and V
@@ -3046,9 +3043,7 @@ class FlashAttentionForwardSm100:
         block: Int32,
         stage: int,
         phase: Int32,
-        tma_atom_sfq: Optional[cute.CopyAtom] = None,
-        tQgSFQ: Optional[cute.Tensor] = None,
-        tQsSFQ: Optional[cute.Tensor] = None,
+        load_SFQ_fn: Optional[Callable] = None,
     ):
         cute.arch.mbarrier_wait(mbar_empty_ptr + stage, phase)
         with cute.arch.elect_one():
@@ -3056,10 +3051,8 @@ class FlashAttentionForwardSm100:
         load_Q_fn(src_idx=block, dst_idx=stage, tma_bar_ptr=mbar_full_ptr + stage)
         
         # Load scale factor for Q if provided
-        if const_expr(tma_atom_sfq is not None and tQgSFQ is not None and tQsSFQ is not None):
-            tQsSFQ_cur = tQsSFQ[None, stage]
-            tQgSFQ_cur = tQgSFQ[None, block]
-            cute.copy(tma_atom_sfq, tQgSFQ_cur, tQsSFQ_cur, tma_bar_ptr=mbar_full_ptr + stage)
+        if const_expr(load_SFQ_fn is not None):
+            load_SFQ_fn(src_idx=block, dst_idx=stage, tma_bar_ptr=mbar_full_ptr + stage)
 
     @cute.jit
     def load_KV(
@@ -3114,7 +3107,11 @@ class FlashAttentionForwardSm100:
         # Load scale factor for K or V if provided (uses same barrier as K/V)
         if const_expr(tma_atom_sf is not None and tXgSF is not None and tXsSF is not None):
             tXsSF_cur = tXsSF[None, stage]
-            tXgSF_cur = tXgSF[None, block] if const_expr(page_idx is None) else tXgSF[None, 0, page_idx]
+            # After tma_partition with rank-1 grouping, tXgSF has structure: ((atom_v, rest_v), RestL)
+            if const_expr(page_idx is None):
+                tXgSF_cur = tXgSF[None, block]
+            else:
+                tXgSF_cur = tXgSF[None, page_idx]
             cute.copy(tma_atom_sf, tXgSF_cur, tXsSF_cur, tma_bar_ptr=mbar_full_ptr + stage)
 
     def mainloop_s2t_copy_and_partition(
