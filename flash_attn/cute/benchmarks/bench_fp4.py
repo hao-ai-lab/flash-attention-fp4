@@ -42,14 +42,26 @@ def cvt_sf_MKL_to_M32x4xrm_K4xrk_L(
     sf_ref_tensor: cute.Tensor,
     sf_mma_tensor: cute.Tensor,
 ):
-    """Convert scale factor tensor from MKL layout to mma specification M(32x4xrest_m)xK(4xrest_k)xL layout"""
-    # sf_mma_tensor has flatten shape (32, 4, rest_m, 4, rest_k, l)
-    # group to ((32, 4, rest_m), (4, rest_k), l)
-    sf_mma_tensor = cute.group_modes(sf_mma_tensor, 0, 3)
-    sf_mma_tensor = cute.group_modes(sf_mma_tensor, 1, 3)
+    """Convert scale factor tensor from MKL layout to mma specification M(32x4xrest_m)xK(4xrest_k)x(nheads,batch) layout"""
+    # sf_ref_tensor has shape (mn, sf_k, batch, nheads) after permute
+    # sf_mma_tensor has shape (32, 4, rest_m, 4, rest_k, nheads, batch) 
+    # Convert coordinates: (mn_idx, sf_k_idx, batch_idx, nhead_idx) -> (atom_m_0, atom_m_1, rest_m_idx, atom_k_idx, rest_k_idx, nhead_idx, batch_idx)
+    atom_m = (32, 4)
+    atom_k = 4
     for i in cutlass.range(cute.size(sf_ref_tensor)):
         mkl_coord = sf_ref_tensor.layout.get_hier_coord(i)
-        sf_mma_tensor[mkl_coord] = sf_ref_tensor[mkl_coord]
+        mn_idx, sf_k_idx, batch_idx, nhead_idx = mkl_coord
+        # Convert mn_idx to (rest_m_idx, atom_m_0, atom_m_1)
+        rest_m_idx = mn_idx // (atom_m[0] * atom_m[1])
+        mn_in_tile = mn_idx % (atom_m[0] * atom_m[1])
+        atom_m_0 = mn_in_tile // atom_m[1]
+        atom_m_1 = mn_in_tile % atom_m[1]
+        # Convert sf_k_idx to (rest_k_idx, atom_k)
+        rest_k_idx = sf_k_idx // atom_k
+        atom_k_idx = sf_k_idx % atom_k
+        # Create mma coordinate matching permuted shape (32, 4, rest_m, 4, rest_k, nheads, batch)
+        mma_coord = (atom_m_0, atom_m_1, rest_m_idx, atom_k_idx, rest_k_idx, nhead_idx, batch_idx)
+        sf_mma_tensor[mma_coord] = sf_ref_tensor[mkl_coord]
 
 
 def create_scale_factor_tensor(batch, seqlen, nheads, headdim, sf_vec_size, sf_dtype, device='cuda'):
@@ -72,16 +84,19 @@ def create_scale_factor_tensor(batch, seqlen, nheads, headdim, sf_vec_size, sf_d
     
     # Scale factor shape: (batch, nheads, seqlen, ceil_div(headdim, sf_vec_size))
     # For attention, we need scale factors per head dimension
-    l = batch * nheads
+    # Split batch and nheads so we can index them separately in the kernel
     mn = seqlen
     k = headdim
     sf_k = ceil_div(k, sf_vec_size)
-    ref_shape = (l, mn, sf_k)
+    ref_shape = (batch, nheads, mn, sf_k)
     
-    atom_m = (32, 4)
+    atom_m = (32, 2)
     atom_k = 4
+    # mma_shape keeps batch and nheads separate: (batch, nheads, rest_m, rest_k, 32, 4, 4)
+    # This allows indexing batch and head separately in the kernel like mQ
     mma_shape = (
-        l,
+        batch,
+        nheads,
         ceil_div(mn, atom_m[0] * atom_m[1]),
         ceil_div(sf_k, atom_k),
         atom_m[0],
@@ -89,8 +104,12 @@ def create_scale_factor_tensor(batch, seqlen, nheads, headdim, sf_vec_size, sf_d
         atom_k,
     )
     
-    ref_permute_order = (1, 2, 0)
-    mma_permute_order = (3, 4, 1, 5, 2, 0)
+    # Permute (batch, nheads, mn, sf_k) to (mn, sf_k, batch, nheads) for ref tensor
+    # This allows indexing by batch and nheads in the kernel
+    ref_permute_order = (2, 3, 0, 1)
+    # Permute mma_shape (batch, nheads, rest_m, rest_k, 32, 4, 4) to (32, 4, rest_m, 4, rest_k, nheads, batch)
+    # This groups atoms together: (rest_m, 32, 4) for M and (rest_k, 4) for K, then nheads and batch
+    mma_permute_order = (4, 5, 2, 6, 3, 1, 0)
     
     # Create f32 ref torch tensor (cpu)
     ref_f32_torch_tensor_cpu = cutlass_torch.create_and_permute_torch_tensor(
@@ -124,12 +143,17 @@ def create_scale_factor_tensor(batch, seqlen, nheads, headdim, sf_vec_size, sf_d
     cute_f32_torch_tensor = cute_f32_torch_tensor_cpu.cuda()
     
     # reshape makes memory contiguous
+    # After permute with ref_permute_order, shape is (mn, sf_k, batch, nheads)
+    # Permute to (batch, nheads, mn, sf_k), then expand and reshape
+    l = batch * nheads
     ref_f32_torch_tensor_cpu = (
-        ref_f32_torch_tensor_cpu.permute(2, 0, 1)
+        ref_f32_torch_tensor_cpu.permute(2, 3, 0, 1)  # (mn, sf_k, batch, nheads) -> (batch, nheads, mn, sf_k)
         .unsqueeze(-1)
-        .expand(l, mn, sf_k, sf_vec_size)
-        .reshape(l, mn, sf_k * sf_vec_size)
-        .permute(*ref_permute_order)
+        .expand(batch, nheads, mn, sf_k, sf_vec_size)
+        .reshape(batch, nheads, mn, sf_k * sf_vec_size)
+        .permute(2, 3, 0, 1)  # (batch, nheads, mn, sf_k * sf_vec_size) -> (mn, sf_k * sf_vec_size, batch, nheads)
+        .reshape(l, mn, sf_k * sf_vec_size)  # Flatten batch and nheads for compatibility
+        .permute(1, 2, 0)  # (l, mn, sf_k * sf_vec_size) -> (mn, sf_k * sf_vec_size, l)
     )
     # prune to actual k dimension
     ref_f32_torch_tensor_cpu = ref_f32_torch_tensor_cpu[:, :k, :]
@@ -149,6 +173,7 @@ def create_scale_factor_tensor(batch, seqlen, nheads, headdim, sf_vec_size, sf_d
         sf_dtype,
         is_dynamic_layout=True,
     )
+    breakpoint()
     return ref_f32_torch_tensor_cpu, cute_tensor, cute_torch_tensor
 
 

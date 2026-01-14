@@ -310,7 +310,7 @@ class FlashAttentionForwardSm100:
             for t in (mQ, mK, mV, mO)
         ]
         Q_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
-        mQ = cute.make_tensor(mQ.iterator, cute.select(mQ.layout, mode=Q_layout_transpose))
+        mQ = cute.make_tensor(mQ.iterator, cute.select(mQ.layout, mode=Q_layout_transpose)) # (s_q, d, h, b)
         # (s_k, d, h_k, b_k) or (total_k, d, h_k) if there's cu_seqlens_k or (page_size, d, h_k, num_pages) if there's page_table
         KV_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensK is None) else [0, 2, 1]
         mK, mV = [
@@ -603,8 +603,9 @@ class FlashAttentionForwardSm100:
         # Setup scale factor tensor gmem layout 
         # ((Atom_M, Rest_M),(Atom_K, Rest_K),RestL)
         sfq_layout = blockscaled_utils.tile_atom_to_shape_SF(mQ.shape[:3], self.sf_vec_size)
+        breakpoint()
         mSFQ = cute.make_tensor(mSFQ.iterator, sfq_layout)
-
+        
         tma_atom_sfq, tma_tensor_sfq = make_tiled_tma_atom_A(
             sfq_op,
             mSFQ,
@@ -1185,14 +1186,6 @@ class FlashAttentionForwardSm100:
         )
         tCtSFK = cute.make_tensor(sfk_tmem_ptr, tCtSFK_layout)
 
-        # Partition for S2T copy of SFQ/SFK
-        tiled_copy_s2t_sfq, tCsSFQ_compact_s2t, tCtSFQ_compact_s2t = (
-            self.mainloop_s2t_copy_and_partition(sSFQ, tCtSFQ)
-        )
-        tiled_copy_s2t_sfk, tCsSFK_compact_s2t, tCtSFK_compact_s2t = (
-            self.mainloop_s2t_copy_and_partition(sSFK, tCtSFK)
-        )
-
         block_info = BlockInfo(
             # This is cta_tiler, not mma_tiler_qk, since we move by block by (2 * mma_tiler[0], mma_tiler[1])
             self.cta_tiler[0],
@@ -1305,6 +1298,8 @@ class FlashAttentionForwardSm100:
                 blocksparse_tensors,
                 sSFQ,
                 sSFK,
+                tCtSFQ,
+                tCtSFK,
             )
 
             # if warp_idx == self.mma_warp_id:
@@ -1526,9 +1521,9 @@ class FlashAttentionForwardSm100:
                 tKsK, tKgK = None, None
                 tVsV, tVgV = None, None
 
-            # Partition TMA atoms for scale factors
-            # Partition SFQ similar to Q using tma_get_copy_fn
-            gSFQ = cute.local_tile(tma_tensor_sfq, cute.slice_(self.mma_tiler_qk, (None, 0, None)), (None, None, None))
+            # Partition SFQ similar to Q - index batch and head first, then use select like gQ
+            tma_tensor_sfq_cur = seqlen.offset_batch_Q(tma_tensor_sfq, batch_idx, dim=3)[None, None, head_idx]
+            gSFQ = cute.local_tile(tma_tensor_sfq_cur, cute.select(self.mma_tiler_qk, mode=[0, 2]), (None, 0))
             tSgSFQ = thr_mma_qk.partition_A(gSFQ)
             load_SFQ_fn, _, _ = copy_utils.tma_get_copy_fn(
                 tma_atom_sfq, 0, cute.make_layout(1), tSgSFQ, sSFQ
@@ -1675,8 +1670,12 @@ class FlashAttentionForwardSm100:
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
         blocksparse_tensors: Optional[BlockSparseTensors],
+        # In smem
         sSFQ: Optional[cute.Tensor] = None,
         sSFK: Optional[cute.Tensor] = None,
+        # In tmem
+        tCtSFQ: Optional[cute.Tensor] = None,
+        tCtSFK: Optional[cute.Tensor] = None,
     ):
         tSrQ = tiled_mma_qk.make_fragment_A(sQ)
         tSrK = tiled_mma_qk.make_fragment_B(sK)
@@ -1715,6 +1714,14 @@ class FlashAttentionForwardSm100:
             cutlass.pipeline.PipelineUserType.Consumer, self.kv_stage
         )
         P_full_O_rescaled_phase = Int32(0)
+
+        # Partition for S2T copy of SFQ/SFK
+        tiled_copy_s2t_sfq, tCsSFQ_compact_s2t, tCtSFQ_compact_s2t = (
+            self.mainloop_s2t_copy_and_partition(sSFQ, tCtSFQ)
+        )
+        tiled_copy_s2t_sfk, tCsSFK_compact_s2t, tCtSFK_compact_s2t = (
+            self.mainloop_s2t_copy_and_partition(sSFK, tCtSFK)
+        )
 
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
