@@ -173,7 +173,6 @@ def create_scale_factor_tensor(batch, seqlen, nheads, headdim, sf_vec_size, sf_d
         sf_dtype,
         is_dynamic_layout=True,
     )
-    breakpoint()
     return ref_f32_torch_tensor_cpu, cute_tensor, cute_torch_tensor
 
 
