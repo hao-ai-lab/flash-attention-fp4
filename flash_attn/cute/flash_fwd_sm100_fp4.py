@@ -410,7 +410,8 @@ class FlashAttentionForwardSm100:
         )
 
         self.epi_tile = self.mma_tiler_pv[:2]
-
+        
+        # ((Atom_Inst_M, Atom_Inst_K), MMA_M, MMA_K, STAGE)
         sQ_layout = sm100_utils_basic.make_smem_layout_a(
             tiled_mma_qk,
             self.mma_tiler_qk,
@@ -496,10 +497,10 @@ class FlashAttentionForwardSm100:
 
         if const_expr(self.pack_gqa):
             shape_Q_packed = (
-                (self.qhead_per_kvhead, mQ.shape[0]),
-                mQ.shape[1],
-                mK.shape[2],
-                *mQ.shape[3:],
+                (self.qhead_per_kvhead, mQ.shape[0]), # (qhead_per_kvhead, sq)
+                mQ.shape[1], # d
+                mK.shape[2], # h_k
+                *mQ.shape[3:], # b
             )
             stride_Q_packed = (
                 (mQ.stride[2], mQ.stride[0]),
@@ -549,18 +550,15 @@ class FlashAttentionForwardSm100:
             ]
         }
         # Add scale factor copy bytes to Q/K/V since they use the same barrier
-        sfq_smem_layout = cute.slice_(sfq_smem_layout_staged, (None, None, None, 0))
-        self.tma_copy_bytes["Q"] += cute.size_in_bytes(mSFQ.element_type, cute.select(sfq_smem_layout, mode=[0, 1, 2]))
-        sfk_smem_layout = cute.slice_(sfk_smem_layout_staged, (None, None, None, 0))
-        self.tma_copy_bytes["K"] += cute.size_in_bytes(mSFK.element_type, cute.select(sfk_smem_layout, mode=[0, 1, 2]))
+        self.tma_copy_bytes["Q"] += cute.size_in_bytes(mSFQ.element_type, cute.select(sfq_smem_layout_staged, mode=[0, 1, 2]))
+        self.tma_copy_bytes["K"] += cute.size_in_bytes(mSFK.element_type, cute.select(sfk_smem_layout_staged, mode=[0, 1, 2]))
         if const_expr(mSFV is not None and sfv_smem_layout_staged is not None):
-            sfv_smem_layout = cute.slice_(sfv_smem_layout_staged, (None, None, None, 0))
-            self.tma_copy_bytes["V"] += cute.size_in_bytes(mSFV.element_type, cute.select(sfv_smem_layout, mode=[0, 1, 2]))
+            self.tma_copy_bytes["V"] += cute.size_in_bytes(mSFV.element_type, cute.select(sfv_smem_layout_staged, mode=[0, 1, 2]))
 
         # TMA load for Q
         tma_load_op = cpasync.CopyBulkTensorTileG2SOp(self.cta_group)
         tma_store_op = cpasync.CopyBulkTensorTileS2GOp()
-
+        mQ_shape = mQ.shape
         tma_atom_Q, mQ = cute.nvgpu.make_tiled_tma_atom_A(
             tma_load_op,
             mQ,
@@ -572,6 +570,8 @@ class FlashAttentionForwardSm100:
 
         tma_atom_K = None
         tma_atom_V = None
+        mK_shape = mK.shape
+        mV_shape = mV.shape
         if const_expr(self.use_tma_KV):
             # TMA load for K
             tma_atom_K, mK = cute.nvgpu.make_tiled_tma_atom_B(
@@ -602,14 +602,27 @@ class FlashAttentionForwardSm100:
         )
         # Setup scale factor tensor gmem layout 
         # ((Atom_M, Rest_M),(Atom_K, Rest_K),RestL)
-        sfq_layout = blockscaled_utils.tile_atom_to_shape_SF(mQ.shape[:3], self.sf_vec_size)
-        breakpoint()
+        sfq_layout = blockscaled_utils.tile_atom_to_shape_SF(mQ_shape[:3], self.sf_vec_size)
+        # Extend layout to include batch dimension
+        # Base layout has shape ((Atom_M, Rest_M), (Atom_K, Rest_K), RestL)
+        # We need to add batch dimension: ((Atom_M, Rest_M), (Atom_K, Rest_K), RestL, batch)
+        sfq_shape_extended = (
+            *sfq_layout.shape,
+            mQ_shape[3],  # batch dimension
+        )
+        # Calculate batch stride: total size of first 3 dimensions
+        sfq_size_base = cute.size(sfq_layout)
+        sfq_stride_extended = (
+            *sfq_layout.stride,
+            sfq_size_base,  # batch stride
+        )
+        sfq_layout = cute.make_layout(sfq_shape_extended, stride=sfq_stride_extended)
         mSFQ = cute.make_tensor(mSFQ.iterator, sfq_layout)
         
         tma_atom_sfq, tma_tensor_sfq = make_tiled_tma_atom_A(
             sfq_op,
             mSFQ,
-            sfq_smem_layout,
+            cute.select(sfq_smem_layout_staged, mode=[0, 1, 2]),
             self.mma_tiler_qk,
             tiled_mma_qk,
             self.cluster_layout_vmnk.shape,
@@ -620,9 +633,21 @@ class FlashAttentionForwardSm100:
         sfk_op = sm100_utils_basic.cluster_shape_to_tma_atom_SFB(
             self.cluster_shape_mn, tiled_mma_qk.thr_id
         )
-        sfk_smem_layout = cute.slice_(sfk_smem_layout_staged, (None, None, None, 0))
+
         # Setup scale factor tensor layout
-        sfk_layout = blockscaled_utils.tile_atom_to_shape_SF(mK.shape[:3], self.sf_vec_size)
+        sfk_layout = blockscaled_utils.tile_atom_to_shape_SF(mK_shape[:3], self.sf_vec_size)
+        # Extend layout to include batch dimension if present (like SFQ)
+        if const_expr(cute.rank(mK) == 4):
+            sfk_shape_extended = (
+                *sfk_layout.shape,
+                mK_shape[3],  # batch dimension
+            )
+            sfk_size_base = cute.size(sfk_layout)
+            sfk_stride_extended = (
+                *sfk_layout.stride,
+                sfk_size_base,  # batch stride
+            )
+            sfk_layout = cute.make_layout(sfk_shape_extended, stride=sfk_stride_extended)
         mSFK = cute.make_tensor(mSFK.iterator, sfk_layout)
         # For SFB, compute mma_inst_shape_mnk_sfb: (M // (2 if use_2cta_instrs else 1), round_up(N, 128), K)
         mma_inst_shape_mnk_qk = (
@@ -659,7 +684,7 @@ class FlashAttentionForwardSm100:
         tma_atom_sfk, tma_tensor_sfk = cute.nvgpu.make_tiled_tma_atom_B(
             sfk_op,
             mSFK,
-            sfk_smem_layout,
+            cute.select(sfk_smem_layout_staged, mode=[0, 1, 2]),
             mma_tiler_sfb_qk,
             tiled_mma_sfb_qk,
             cluster_layout_sfb_vmnk.shape,
@@ -671,9 +696,21 @@ class FlashAttentionForwardSm100:
             sfv_op = sm100_utils_basic.cluster_shape_to_tma_atom_SFB(
                 self.cluster_shape_mn, tiled_mma_pv.thr_id
             )
-            sfv_smem_layout = cute.slice_(sfv_smem_layout_staged, (None, None, None, 0))
+            sfv_smem_layout = cute.select(sfv_smem_layout_staged, mode=[0, 1, 2])
             # Setup scale factor tensor layout
-            sfv_layout = blockscaled_utils.tile_atom_to_shape_SF(mV.shape, self.sf_vec_size)
+            sfv_layout = blockscaled_utils.tile_atom_to_shape_SF(mV_shape[:3], self.sf_vec_size)
+            # Extend layout to include batch dimension if present (like SFK)
+            if const_expr(cute.rank(mV) == 4):
+                sfv_shape_extended = (
+                    *sfv_layout.shape,
+                    mV_shape[3],  # batch dimension
+                )
+                sfv_size_base = cute.size(sfv_layout)
+                sfv_stride_extended = (
+                    *sfv_layout.stride,
+                    sfv_size_base,  # batch stride
+                )
+                sfv_layout = cute.make_layout(sfv_shape_extended, stride=sfv_stride_extended)
             mSFV = cute.make_tensor(mSFV.iterator, sfv_layout)
             # For SFB, compute mma_inst_shape_mnk_sfb: (M // (2 if use_2cta_instrs else 1), round_up(N, 128), K)
             mma_inst_shape_mnk_pv = ( # the same processed by one tcgen05.mma instruction
@@ -710,7 +747,7 @@ class FlashAttentionForwardSm100:
             tma_atom_sfv, tma_tensor_sfv = cute.nvgpu.make_tiled_tma_atom_B(
                 sfv_op,
                 mSFV,
-                sfv_smem_layout,
+                cute.select(sfv_smem_layout_staged, mode=[0, 1, 2]),
                 mma_tiler_sfb_pv,
                 tiled_mma_sfb_pv,
                 cluster_layout_sfb_pv_vmnk.shape,
