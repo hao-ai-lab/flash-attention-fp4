@@ -604,7 +604,7 @@ class FlashAttentionForwardSm100:
         # ((Atom_M, Rest_M),(Atom_K, Rest_K),RestL)
         sfq_layout = blockscaled_utils.tile_atom_to_shape_SF(mQ_shape[:3], self.sf_vec_size)
         # Extend layout to include batch dimension
-        # Base layout has shape ((Atom_M, Rest_M), (Atom_K, Rest_K), RestL)
+        # Base layout has shape ((Atom_M, Rest_M), (Atom_K, Rest_K), RestL), where RestL = nheads
         # We need to add batch dimension: ((Atom_M, Rest_M), (Atom_K, Rest_K), RestL, batch)
         sfq_shape_extended = (
             *sfq_layout.shape,
@@ -1490,6 +1490,7 @@ class FlashAttentionForwardSm100:
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
+            # mQ: [s, d, h, b]
             mQ_cur = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[None, None, head_idx]
             gQ = cute.local_tile(mQ_cur, cute.select(self.mma_tiler_qk, mode=[0, 2]), (None, 0)) # (bM, hdim/bK, RestM)
 
@@ -1566,8 +1567,17 @@ class FlashAttentionForwardSm100:
                 tma_atom_sfq, 0, cute.make_layout(1), tSgSFQ, sSFQ
             )
             
-            # Partition SFK similar to K
-            gSFK = cute.local_tile(tma_tensor_sfk, cute.slice_(self.mma_tiler_qk, (0, None, None)), (None, None, None))
+            # Partition SFK similar to K - index batch and head first like mK_cur
+            if const_expr(mPageTable is None):
+                if const_expr(not seqlen.has_cu_seqlens_k):
+                    tma_tensor_sfk_cur = tma_tensor_sfk[None, None, head_idx_kv, batch_idx]
+                    gSFK = cute.local_tile(tma_tensor_sfk_cur, cute.select(self.mma_tiler_qk, mode=[1, 2]), (None, 0))
+                else:
+                    tma_tensor_sfk_cur = cute.domain_offset((seqlen.offset_k, 0), tma_tensor_sfk[None, None, head_idx_kv])
+                    gSFK = cute.local_tile(tma_tensor_sfk_cur, cute.select(self.mma_tiler_qk, mode=[1, 2]), (None, 0))
+            else:
+                tma_tensor_sfk_cur = tma_tensor_sfk[None, None, head_idx_kv, None]
+                gSFK = cute.local_tile(tma_tensor_sfk_cur, cute.select(self.mma_tiler_qk, mode=[1, 2]), (None, 0, None))
             tSgSFK = thr_mma_qk.partition_B(gSFK)
             # Group only the first 3 modes (static MMA modes) to avoid grouping dynamic Rest modes
             tKsSFK, tKgSFK = cpasync.tma_partition(
@@ -1581,7 +1591,16 @@ class FlashAttentionForwardSm100:
             # Partition SFV similar to V
             tVsSFV, tVgSFV = None, None
             if const_expr(tma_atom_sfv is not None and tma_tensor_sfv is not None and sSFV is not None):
-                gSFV = cute.local_tile(tma_tensor_sfv, cute.slice_(self.mma_tiler_qk, (0, None, None)), (None, None, None))
+                if const_expr(mPageTable is None):
+                    if const_expr(not seqlen.has_cu_seqlens_k):
+                        tma_tensor_sfv_cur = tma_tensor_sfv[None, None, head_idx_kv, batch_idx]
+                        gSFV = cute.local_tile(tma_tensor_sfv_cur, cute.select(self.mma_tiler_pv, mode=[1, 2]), (0, None))
+                    else:
+                        tma_tensor_sfv_cur = cute.domain_offset((0, seqlen.offset_k), tma_tensor_sfv[None, None, head_idx_kv])
+                        gSFV = cute.local_tile(tma_tensor_sfv_cur, cute.select(self.mma_tiler_pv, mode=[1, 2]), (0, None))
+                else:
+                    tma_tensor_sfv_cur = tma_tensor_sfv[None, None, head_idx_kv, None]
+                    gSFV = cute.local_tile(tma_tensor_sfv_cur, cute.select(self.mma_tiler_pv, mode=[1, 2]), (0, None, None))
                 tOgSFV = thr_mma_pv.partition_B(gSFV)
                 # Group only the first 3 modes (static MMA modes) to avoid grouping dynamic Rest modes
                 tVsSFV, tVgSFV = cpasync.tma_partition(
