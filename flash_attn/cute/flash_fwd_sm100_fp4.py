@@ -29,7 +29,6 @@ import cutlass.utils.blackwell_helpers as sm100_utils_basic
 from flash_attn.cute.modified_utils.block_scaled_layout_test import make_smem_layout_sfa, make_smem_layout_sfb
 from flash_attn.cute.modified_utils.helpers import make_tiled_tma_atom_A
 import cutlass.utils.blockscaled_layout as blockscaled_utils
-
 from flash_attn.cute.paged_kv import PagedKVManager
 import flash_attn.cute.utils as utils
 from flash_attn.cute import copy_utils
@@ -444,6 +443,7 @@ class FlashAttentionForwardSm100:
         )
         
         sfv_smem_layout_staged = None
+        # # (((Atom_Inst_M, Rest_M),(Atom_Inst_K, Rest_K)), MMA_M, MMA_K, STAGE)
         sfq_smem_layout_staged = make_smem_layout_sfa(
             tiled_mma_qk,
             self.mma_tiler_qk,
@@ -601,7 +601,7 @@ class FlashAttentionForwardSm100:
             self.cluster_shape_mn, tiled_mma_qk.thr_id
         )
         # Setup scale factor tensor gmem layout 
-        # ((Atom_M, Rest_M),(Atom_K, Rest_K),RestL)
+        # ((Atom_M, Rest_M),(Atom_K, Rest_K), RestL/nheads)
         sfq_layout = blockscaled_utils.tile_atom_to_shape_SF(mQ_shape[:3], self.sf_vec_size)
         # Extend layout to include batch dimension
         # Base layout has shape ((Atom_M, Rest_M), (Atom_K, Rest_K), RestL), where RestL = nheads
@@ -1200,7 +1200,8 @@ class FlashAttentionForwardSm100:
             tStS.iterator + tcgen05.find_tmem_tensor_col_offset(tStS),
             dtype=self.sf_dtype,
         )
-        # (MMA, MMA_M, MMA_K)
+        
+        # (MMA, MMA_M, MMA_K) ??
         tCtSFQ_layout = blockscaled_utils.make_tmem_layout_sfa(
             tiled_mma_qk,
             self.mma_tiler_qk,
@@ -1208,7 +1209,6 @@ class FlashAttentionForwardSm100:
             cute.slice_(sfq_smem_layout_staged, (None, None, None, 0)),
         )
         tCtSFQ = cute.make_tensor(sfq_tmem_ptr, tCtSFQ_layout)
-
         # Make SFK tmem tensor (SFB for K)
         sfk_tmem_ptr = cute.recast_ptr(
             tCtSFQ.iterator + tcgen05.find_tmem_tensor_col_offset(tCtSFQ),
@@ -1821,6 +1821,7 @@ class FlashAttentionForwardSm100:
                         None,
                         None,
                         None,
+                        None,
                         stage,
                     )
                     tCsSFQ_compact_s2t_staged = tCsSFQ_compact_s2t[s2t_stage_coord_sfq]
@@ -1832,6 +1833,7 @@ class FlashAttentionForwardSm100:
                     
                     # Copy SFK (scale factor for K, like SFB) - per K stage
                     s2t_stage_coord_sfk = (
+                        None,
                         None,
                         None,
                         None,
