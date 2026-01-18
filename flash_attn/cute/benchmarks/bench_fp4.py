@@ -307,6 +307,7 @@ def create_fp4_attention_tensors(batch, seqlen_q, seqlen_k, nheads, nheads_kv, h
     else:
         v_sf_tensor = None
         v_sf_torch_underlying = None
+
     if return_torch:
         return (q_torch_underlying, k_torch_underlying, v_torch_underlying, q_sf_torch_underlying, k_sf_torch_underlying, v_sf_torch_underlying, 
                 q_ref, k_ref, v_ref)
@@ -364,7 +365,7 @@ def main(ab_dtype, sf_dtype, sf_vec_size, quant_v=False):
             (q_fp4, k_fp4, v_tensor, q_sf, k_sf, v_sf, 
              q_ref, k_ref, v_ref) = create_fp4_attention_tensors(
                 batch_size, seqlen_q, seqlen, nheads, nheads_kv, 
-                headdim, headdim_v, device, dtype_gen, quant_v=quant_v, return_torch=False,
+                headdim, headdim_v, device, dtype_gen, quant_v=quant_v, return_torch=True,
                 ab_dtype=ab_dtype, sf_dtype=sf_dtype, sf_vec_size=sf_vec_size
             )
         except Exception as e:
@@ -441,9 +442,11 @@ if __name__ == "__main__":
         action="store_true",
         help="Quantize V to FP4 (default: False, only QK are quantized)"
     )
-    parser.add_argument("--ab_dtype", type=cutlass.dtype, default=cutlass.Float4E2M1FN)
-    parser.add_argument("--sf_dtype", type=cutlass.dtype, default=cutlass.Float8E4M3FN)
+    # parser.add_argument("--ab_dtype", type=cutlass.dtype, default=cutlass.Float4E2M1FN)
+    # parser.add_argument("--sf_dtype", type=cutlass.dtype, default=cutlass.Float8E4M3FN)
     parser.add_argument("--sf_vec_size", type=int, default=16)
     args = parser.parse_args()
-    main(args.ab_dtype, args.sf_dtype, args.sf_vec_size, args.quant_v)
+    ab_dtype = cutlass.Float4E2M1FN
+    sf_dtype = cutlass.Float8E4M3FN
+    main(ab_dtype, sf_dtype, args.sf_vec_size, args.quant_v)
 
