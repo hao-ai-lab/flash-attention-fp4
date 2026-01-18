@@ -347,6 +347,12 @@ class FlashAttentionForwardSm100:
             raise RuntimeError("The layout of mV is not supported")
 
         # check type consistency
+        if const_expr(self.q_dtype == cutlass.Int8):
+            assert self.q_dtype == self.k_dtype
+            self.q_dtype = self.k_dtype = cutlass.Float4E2M1FN
+            if const_expr(mSFV is not None):
+                self.v_dtype = cutlass.Float4E2M1FN
+
         if const_expr(self.q_dtype != self.k_dtype):
             raise TypeError(f"Type mismatch: {self.q_dtype} != {self.k_dtype}")
         if const_expr(mSFV is not None and self.q_dtype != self.v_dtype):

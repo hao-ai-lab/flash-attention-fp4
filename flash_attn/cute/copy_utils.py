@@ -314,6 +314,7 @@ def tma_get_copy_fn(
         cute.group_modes(smem_tensor, 0, group_rank_smem),
         cute.group_modes(gmem_tensor, 0, group_rank_gmem),
     )
+    
     if const_expr(filter_zeros):
         s = cute.filter_zeros(s)
         g = cute.filter_zeros(g)

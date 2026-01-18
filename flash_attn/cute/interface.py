@@ -264,7 +264,7 @@ def _flash_attn_fwd(
     else:
         use_fp4 = is_nvfp4_dtype(q.dtype)
         if not use_fp4:
-            assert q.dtype in [torch.float16, torch.bfloat16], "inputs must be float16 or bfloat16"
+            assert q.dtype in [torch.float16, torch.bfloat16, torch.float4_e2m1fn_x2], "inputs must be float16, bfloat16, or float4_e2m1fn_x2"
             assert q.dtype == k.dtype == v.dtype, "inputs must have the same dtype"
     
     # Store is_cute_q for later use
