@@ -380,11 +380,10 @@ def main(ab_dtype, sf_dtype, sf_vec_size, quant_v=False):
         
         # Benchmark FP4 attention
         # Pass CUTE tensors directly (like dense GEMM example)
-        m_fp4 = None
+        out_fp4 = None
         try:
-            time.sleep(1)
             # The interface should detect nvfp4 dtype and dispatch to FP4 kernel
-            # Pass scale factor tensors (V scale factors only if quant_v=True)
+            # # Pass scale factor tensors (V scale factors only if quant_v=True)
             desc_str = 'FP4 Attention (QKV quantized)' if quant_v else 'FP4 Attention (QK quantized)'
             m_fp4 = time_fwd(
                 flash_attn_func_python,
@@ -399,24 +398,33 @@ def main(ab_dtype, sf_dtype, sf_vec_size, quant_v=False):
                 desc=desc_str
             )
             print(f'FP4 Attention fwd: {m_fp4.mean * 1e3:.3f}ms, {(nFLOPS / m_fp4.mean * 1e-12):.1f} TFLOPS')
+            out_fp4 = flash_attn_func_python(
+                q_fp4, k_fp4, v_tensor,
+                causal=causal,
+                window_size=window_size,
+                mSFQ=q_sf,
+                mSFK=k_sf,
+                mSFV=v_sf,  # None if quant_v=False, scale factor tensor if quant_v=True
+            )
+        
         except Exception as e:
             print(f"FP4 attention failed: {e}")
             import traceback
             traceback.print_exc()
-            # If FP4 fails, we might need to use a different approach
-            # For now, skip FP4 benchmark if it fails
+            
         
         # Benchmark reference (FP16/BF16) attention for comparison
+        out_bf16 = None
         try:
             # Create reference tensors in standard dtype
-            q_ref_std = q_ref.to(dtype_gen)
-            k_ref_std = k_ref.to(dtype_gen)
-            v_ref_std = v_ref.to(dtype_gen)
+            q_ref = q_ref.to(dtype_gen)
+            k_ref = k_ref.to(dtype_gen)
+            v_ref = v_ref.to(dtype_gen)
             
             time.sleep(1)
             m_ref = time_fwd(
                 flash_attn_func_python,
-                q_ref_std, k_ref_std, v_ref_std,
+                q_ref, k_ref, v_ref,
                 causal=causal,
                 window_size=window_size,
                 repeats=repeats,
@@ -425,14 +433,18 @@ def main(ab_dtype, sf_dtype, sf_vec_size, quant_v=False):
             )
             print(f'Reference fwd: {m_ref.mean * 1e3:.3f}ms, {(nFLOPS / m_ref.mean * 1e-12):.1f} TFLOPS')
             
-            if m_fp4 is not None:
-                speedup = m_ref.mean / m_fp4.mean
-                print(f'Speedup: {speedup:.2f}x')
+            out_bf16 = flash_attn_func_python(
+                q_ref, k_ref, v_ref,
+                causal=causal,
+                window_size=window_size,
+            )
         except Exception as e:
             print(f"Reference attention failed: {e}")
             import traceback
             traceback.print_exc()
-
+        # Check precision
+        if out_fp4 is not None and out_bf16 is not None:
+            torch.testing.assert_close(out_fp4, out_bf16, atol=1e-2, rtol=1e-3)
 
 if __name__ == "__main__":
     import argparse

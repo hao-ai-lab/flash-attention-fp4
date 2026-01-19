@@ -60,6 +60,11 @@ class MaxShift(IntEnum):
     MaxShift32 = 3
 
 
+class ScaleFormat(IntEnum):
+    UE4M3 = 0
+    UE8M0 = 1
+
+
 # ---------------------------------------------------------------------------
 # CUTLASS-type → encoding helpers
 # ---------------------------------------------------------------------------
@@ -103,6 +108,19 @@ def to_C_format(cutlass_type) -> int:
     if cutlass_type is cutlass.Int32:
         return CFormat.S32
     raise TypeError(f"Unsupported CUTLASS scalar type for accumulator: {cutlass_type!r}")
+
+
+def to_ScaleFormat(cutlass_type) -> int:
+    """
+    Map a CUTLASS scalar class to the scale format encoding.
+    """
+    # For now, we'll use UE4M3 as default for FP4 scale factors
+    # This may need to be adjusted based on actual scale factor types used
+    if cutlass_type is cutlass.Float8E4M3FN:
+        return ScaleFormat.UE4M3
+    elif cutlass_type is cutlass.Float8E8M0FNU:
+        return ScaleFormat.UE8M0
+    raise TypeError(f"Unsupported CUTLASS scalar type for scale factor: {cutlass_type!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -163,8 +181,94 @@ def make_instr_desc(
 
     return desc & 0xFFFF_FFFF  # ensure 32-bit result
 
+def make_instr_desc_block_scaled(
+    a_type,
+    b_type,
+    c_type,
+    sf_type,  # Scale factor type
+    M: int,
+    N: int,
+    a_major: Major,
+    b_major: Major,
+    a_neg: ScaleIn = ScaleIn.One,
+    b_neg: ScaleIn = ScaleIn.One,
+    is_sparse: bool = False,
+) -> int:
+    """
+    Build the 32-bit instruction descriptor for Blackwell block-scaled MMA.
+    All matrix/accumulator/scale factor **types must be CUTLASS scalar classes**.
+    """
+    # --- encode element formats -------------------------------------------------
+    a_fmt = int(to_UMMA_format(a_type))
+    b_fmt = int(to_UMMA_format(b_type))
+    sf_fmt = int(to_ScaleFormat(sf_type))
 
+    # --- range checks on M/N -----------------------------------------------------
+    if M not in (64, 128, 256):
+        raise ValueError("M must be 64, 128 or 256")
+    if N < 8 or N > 256 or (N & 7):
+        raise ValueError("N must be a multiple of 8 in the range 8…256")
+
+    m_dim = M >> 4  # 5-bit field
+    n_dim = N >> 3  # 6-bit field
+
+    # --- pack the bit-fields -----------------------------------------------------
+    # Based on InstrDescriptorBlockScaled structure:
+    # sparse_id2_: bits [0, 2) - 2 bits
+    # sparse_flag_: bit [2, 3) - 1 bit
+    # reserved: bit [3, 4) - 1 bit
+    # b_sf_id_: bits [4, 6) - 2 bits (set to 0 initially, updated at runtime)
+    # reserved: bit [6, 7) - 1 bit
+    # a_format_: bits [7, 10) - 3 bits
+    # b_format_: bits [10, 13) - 3 bits
+    # a_negate_: bit [13, 14) - 1 bit
+    # b_negate_: bit [14, 15) - 1 bit
+    # a_major_: bit [15, 16) - 1 bit
+    # b_major_: bit [16, 17) - 1 bit
+    # n_dim_: bits [17, 23) - 6 bits
+    # scale_format_: bit [23, 24) - 1 bit
+    # m_dim_: bits [24, 29) - 5 bits
+    # a_sf_id_: bits [29, 31) - 2 bits (set to 0 initially, updated at runtime)
+    # k_size_: bit [31, 32) - 1 bit. MXF8F6F4Format: 0=[dense: K32, sparse: K64]
+    
+    desc = 0
+    desc |= (0                 & 0x3) << 0        # sparse_id2 (always 0 here)
+    desc |= (int(is_sparse)    & 0x1) << 2        # sparse_flag
+    desc |= (0                 & 0x1) << 3        # reserved
+    desc |= (0                 & 0x3) << 4        # b_sf_id 
+    desc |= (0                 & 0x1) << 6        # reserved
+    desc |= (a_fmt             & 0x7) << 7        # a_format
+    desc |= (b_fmt             & 0x7) << 10       # b_format
+    desc |= (int(a_neg)        & 0x1) << 13       # a_negate
+    desc |= (int(b_neg)        & 0x1) << 14       # b_negate
+    desc |= (int(a_major)      & 0x1) << 15       # a_major
+    desc |= (int(b_major)      & 0x1) << 16       # b_major
+    desc |= (n_dim             & 0x3F) << 17      # n_dim (6 bits)
+    desc |= (sf_fmt            & 0x1) << 23       # scale_format
+    desc |= (m_dim             & 0x1F) << 24      # m_dim (5 bits)
+    desc |= (0                 & 0x3) << 29       # a_sf_id 
+    desc |= (0                 & 0x1) << 31       # k_size 
+
+    return desc & 0xFFFF_FFFF  # ensure 32-bit result
+
+    
 def mma_op_to_idesc(op: cute.nvgpu.tcgen05.mma.MmaOp):
+    # Use block-scaled descriptor for FP4 (nvfp4) which uses MXF8F6F4Format::E2M1
+    if op.a_dtype is cutlass.Float4E2M1FN:
+        # For FP4, we need to pass the scale factor type (typically Float8E4M3FN for nvfp4)
+        # This will be determined from the actual scale factor tensor type
+        # For now, default to Float8E4M3FN as that's the typical scale factor type for nvfp4
+        sf_type = cutlass.Float8E4M3FN  # Scale factors for nvfp4 are typically FP8 E4M3
+        return make_instr_desc_block_scaled(
+            op.a_dtype,
+            op.b_dtype,
+            op.acc_dtype,
+            sf_type,
+            op.shape_mnk[0],
+            op.shape_mnk[1],
+            Major.K if op.a_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K else Major.MN,
+            Major.K if op.b_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K else Major.MN,
+        )
     return make_instr_desc(
         op.a_dtype,
         op.b_dtype,
