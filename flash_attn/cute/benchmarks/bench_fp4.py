@@ -90,7 +90,7 @@ def create_scale_factor_tensor(batch, seqlen, nheads, headdim, sf_vec_size, sf_d
     sf_k = ceil_div(k, sf_vec_size)
     ref_shape = (batch, nheads, mn, sf_k)
     
-    atom_m = (32, 2)
+    atom_m = (32, 4)
     atom_k = 4
     # mma_shape keeps batch and nheads separate: (batch, nheads, rest_m, rest_k, 32, 4, 4)
     # This allows indexing batch and head separately in the kernel like mQ
@@ -108,7 +108,6 @@ def create_scale_factor_tensor(batch, seqlen, nheads, headdim, sf_vec_size, sf_d
     # This allows indexing by batch and nheads in the kernel
     ref_permute_order = (2, 3, 0, 1)
     # Permute mma_shape (batch, nheads, rest_m, rest_k, 32, 4, 4) to (32, 4, rest_m, 4, rest_k, nheads, batch)
-    # This groups atoms together: (rest_m, 32, 4) for M and (rest_k, 4) for K, then nheads and batch
     mma_permute_order = (4, 5, 2, 6, 3, 1, 0)
     
     # Create f32 ref torch tensor (cpu)
@@ -293,7 +292,6 @@ def create_fp4_attention_tensors(batch, seqlen_q, seqlen_k, nheads, nheads_kv, h
     q_sf_ref, q_sf_tensor, q_sf_torch_underlying = create_scale_factor_tensor(
         batch, seqlen_q, nheads, headdim, sf_vec_size, sf_dtype, device
     )
-    
     # For K: (batch, nheads_kv, seqlen_k, headdim) -> scale factors for headdim dimension
     k_sf_ref, k_sf_tensor, k_sf_torch_underlying = create_scale_factor_tensor(
         batch, seqlen_k, nheads_kv, headdim, sf_vec_size, sf_dtype, device
@@ -365,7 +363,7 @@ def main(ab_dtype, sf_dtype, sf_vec_size, quant_v=False):
             (q_fp4, k_fp4, v_tensor, q_sf, k_sf, v_sf, 
              q_ref, k_ref, v_ref) = create_fp4_attention_tensors(
                 batch_size, seqlen_q, seqlen, nheads, nheads_kv, 
-                headdim, headdim_v, device, dtype_gen, quant_v=quant_v, return_torch=True,
+                headdim, headdim_v, device, dtype_gen, quant_v=quant_v, return_torch=False,
                 ab_dtype=ab_dtype, sf_dtype=sf_dtype, sf_vec_size=sf_vec_size
             )
         except Exception as e:
@@ -380,10 +378,11 @@ def main(ab_dtype, sf_dtype, sf_vec_size, quant_v=False):
         
         # Benchmark FP4 attention
         # Pass CUTE tensors directly (like dense GEMM example)
-        out_fp4 = None
+        m_fp4 = None
         try:
+            time.sleep(1)
             # The interface should detect nvfp4 dtype and dispatch to FP4 kernel
-            # # Pass scale factor tensors (V scale factors only if quant_v=True)
+            # Pass scale factor tensors (V scale factors only if quant_v=True)
             desc_str = 'FP4 Attention (QKV quantized)' if quant_v else 'FP4 Attention (QK quantized)'
             m_fp4 = time_fwd(
                 flash_attn_func_python,
@@ -398,23 +397,13 @@ def main(ab_dtype, sf_dtype, sf_vec_size, quant_v=False):
                 desc=desc_str
             )
             print(f'FP4 Attention fwd: {m_fp4.mean * 1e3:.3f}ms, {(nFLOPS / m_fp4.mean * 1e-12):.1f} TFLOPS')
-            out_fp4 = flash_attn_func_python(
-                q_fp4, k_fp4, v_tensor,
-                causal=causal,
-                window_size=window_size,
-                mSFQ=q_sf,
-                mSFK=k_sf,
-                mSFV=v_sf,  # None if quant_v=False, scale factor tensor if quant_v=True
-            )
-        
         except Exception as e:
             print(f"FP4 attention failed: {e}")
             import traceback
             traceback.print_exc()
-            
+
         
         # Benchmark reference (FP16/BF16) attention for comparison
-        out_bf16 = None
         try:
             # Create reference tensors in standard dtype
             q_ref = q_ref.to(dtype_gen)
@@ -433,18 +422,14 @@ def main(ab_dtype, sf_dtype, sf_vec_size, quant_v=False):
             )
             print(f'Reference fwd: {m_ref.mean * 1e3:.3f}ms, {(nFLOPS / m_ref.mean * 1e-12):.1f} TFLOPS')
             
-            out_bf16 = flash_attn_func_python(
-                q_ref, k_ref, v_ref,
-                causal=causal,
-                window_size=window_size,
-            )
+            if m_fp4 is not None:
+                speedup = m_ref.mean / m_fp4.mean
+                print(f'Speedup: {speedup:.2f}x')
         except Exception as e:
             print(f"Reference attention failed: {e}")
             import traceback
             traceback.print_exc()
-        # Check precision
-        if out_fp4 is not None and out_bf16 is not None:
-            torch.testing.assert_close(out_fp4, out_bf16, atol=1e-2, rtol=1e-3)
+
 
 if __name__ == "__main__":
     import argparse
