@@ -1751,7 +1751,7 @@ class FlashAttentionForwardSm100:
 
         gemm_Si = [
             partial(
-                sm100_utils.gemm_ptx_partial,
+                sm100_utils.gemm_ptx_partial_fp4,
                 qk_mma_op,
                 self.tmem_s_offset[stage],
                 tSrQs[stage],
@@ -1853,19 +1853,6 @@ class FlashAttentionForwardSm100:
                     )
                     
                     # 3. gemm
-                    # Set scale factors on tiled_mma_qk
-                    # Scale factors are set per kblock (similar to dense GEMM)
-                    # Set SFA (scale factor for Q) - coordinate matches kblock iteration
-                    sf_kblock_coord = (None, None, None)
-                    tiled_mma_qk.set(
-                        tcgen05.Field.SFA,
-                        tCtSFQ[sf_kblock_coord].iterator,
-                    )
-                    # Set SFB (scale factor for K) - coordinate matches kblock iteration
-                    tiled_mma_qk.set(
-                        tcgen05.Field.SFB,
-                        tCtSFK[sf_kblock_coord].iterator,
-                    )
                     
                     # tiled_mma_qk = sm100_utils.gemm(tiled_mma_qk, tStSs[stage], tSrQs[stage], tSrKi, zero_init=True)
                     sK_cur = sK[None, None, None, mma_kv_consumer_state.index]
@@ -1873,7 +1860,13 @@ class FlashAttentionForwardSm100:
                         sK_cur = self.offset_kv_smem(
                             sK_cur, mma_kv_consumer_state.index, mma_kv_consumer_state.phase
                         )
-                    gemm_Si[stage](tCrB=tSrKi, sB=sK_cur)
+                    
+                    gemm_Si[stage](
+                        tCrB=tSrKi,  # tCrB
+                        sB=sK_cur,  # sB
+                        tScaleA=tCtSFQ,  # tScaleA
+                        tScaleB=tCtSFK,  # tScaleB
+                    )
                     # 4. release S0 / S1
                     with cute.arch.elect_one():
                         tcgen05.commit(mbar_ptr + self.mbar_S_full_offset + stage)
@@ -1944,7 +1937,12 @@ class FlashAttentionForwardSm100:
                         sK_cur = sK[None, None, None, Ki_index]
                         if const_expr(self.uneven_kv_smem):
                             sK_cur = self.offset_kv_smem(sK_cur, Ki_index, Ki_phase)
-                        gemm_Si[stage](tCrB=tSrK[None, None, None, Ki_index], sB=sK_cur)
+                        gemm_Si[stage](
+                            tCrB=tSrK[None, None, None, Ki_index],  # tCrB
+                            sB=sK_cur,  # sB
+                            tScaleA=tCtSFQ,  # tScaleA
+                            tScaleB=tCtSFK,  # tScaleB
+                        )
                         # 3. release S0
                         with cute.arch.elect_one():
                             tcgen05.commit(mbar_ptr + self.mbar_S_full_offset + stage)
@@ -2739,7 +2737,7 @@ class FlashAttentionForwardSm100:
     def correction_epilogue(
         self,
         thr_mma: cute.core.ThrMma,
-        tOtO: cute.Tensor,
+        tOtO: cute.Tensor, # tmem
         tidx: Int32,
         stage: Int32,
         m_block: Int32,
