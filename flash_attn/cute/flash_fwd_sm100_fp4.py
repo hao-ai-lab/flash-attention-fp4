@@ -864,7 +864,7 @@ class FlashAttentionForwardSm100:
             tmem_holding_buf: Int32
             # Smem tensors
             # store row max and row sum
-            sScale: cute.struct.MemRange[Float32, self.q_stage * self.m_block_size * 2]
+            sScale: cute.struct.Align[cute.struct.MemRange[Float32, self.q_stage * self.m_block_size * 2], self.buffer_align_bytes]
             sO: cute.struct.Align[
                 cute.struct.MemRange[self.o_dtype, sO_size],
                 self.buffer_align_bytes,
