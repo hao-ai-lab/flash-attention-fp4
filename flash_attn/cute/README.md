@@ -38,5 +38,5 @@ This should show your local path (e.g., `/sgl-workspace/cutlass/examples/python/
 
 ```bash
 cd examples/python/CuTeDSL/blackwell/flash-attention/flash_attn/cute
-python benchmarks/bench_fp4.py
+CUTE_DSL_ENABLE_TVM_FFI=1 python benchmarks/bench_fp4.py
 ```
