@@ -232,12 +232,12 @@ def create_fp4_attention_tensors(batch, seqlen_q, seqlen_k, nheads, nheads_kv, h
     q_tensor.mark_compact_shape_dynamic(
         mode=1,  # headdim dimension needs divisibility for FP4
         stride_order=q_stride_order,
-        divisibility=2 if ab_dtype == cutlass.Float4E2M1FN else 1,
+        divisibility=32 if ab_dtype == cutlass.Float4E2M1FN else 16,
     )
     k_tensor.mark_compact_shape_dynamic(
         mode=1,  # headdim dimension needs divisibility for FP4
         stride_order=k_stride_order,
-        divisibility=2 if ab_dtype == cutlass.Float4E2M1FN else 1,
+        divisibility=32 if ab_dtype == cutlass.Float4E2M1FN else 1,
     )
     
     # Convert FP32 tensors to FP4 format for Q and K
@@ -258,7 +258,7 @@ def create_fp4_attention_tensors(batch, seqlen_q, seqlen_k, nheads, nheads_kv, h
         v_tensor.mark_compact_shape_dynamic(
             mode=1,  # headdim_v dimension needs divisibility for FP4
             stride_order=v_stride_order,
-            divisibility=2 if ab_dtype == cutlass.Float4E2M1FN else 1,
+            divisibility=32,
         )
         v_tensor = cutlass_torch.convert_cute_tensor(
             v_ref, v_tensor, ab_dtype, is_dynamic_layout=True
@@ -280,7 +280,7 @@ def create_fp4_attention_tensors(batch, seqlen_q, seqlen_k, nheads, nheads_kv, h
         v_tensor.mark_compact_shape_dynamic(
             mode=1,  # headdim_v dimension
             stride_order=v_stride_order,
-            divisibility=1,  # Not FP4, so no divisibility requirement
+            divisibility=16, 
         )
         v_tensor = cutlass_torch.convert_cute_tensor(
             v_ref, v_tensor, v_cute_dtype, is_dynamic_layout=True
@@ -380,7 +380,6 @@ def main(ab_dtype, sf_dtype, sf_vec_size, quant_v=False):
         # Pass CUTE tensors directly (like dense GEMM example)
         m_fp4 = None
         try:
-            time.sleep(1)
             # The interface should detect nvfp4 dtype and dispatch to FP4 kernel
             # Pass scale factor tensors (V scale factors only if quant_v=True)
             desc_str = 'FP4 Attention (QKV quantized)' if quant_v else 'FP4 Attention (QK quantized)'
@@ -391,7 +390,7 @@ def main(ab_dtype, sf_dtype, sf_vec_size, quant_v=False):
                 window_size=window_size,
                 mSFQ=q_sf,
                 mSFK=k_sf,
-                mSFV=v_sf,  # None if quant_v=False, scale factor tensor if quant_v=True
+                mSFV=v_sf, 
                 repeats=repeats,
                 verbose=verbose,
                 desc=desc_str

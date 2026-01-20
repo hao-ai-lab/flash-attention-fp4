@@ -223,6 +223,7 @@ class FlashAttentionForwardSm100:
         self.sf_vec_size = sf_vec_size
         self.mma_inst_bits_k = 256
         if self.sf_vec_size == 16:
+            # Tiling degree along k dimension
             self.mma_inst_tile_k = self.head_dim_padded // (self.mma_inst_bits_k // 8 * 2) # each k tile is 256 bits, NVFP4 is half a byte
             # TODO(Wenxuan): increase q_stage and kv_stage for more pipelining
         else:
@@ -280,6 +281,7 @@ class FlashAttentionForwardSm100:
         mSFQ: Optional[cute.Tensor] = None,  # Scale factor for Q
         mSFK: Optional[cute.Tensor] = None,  # Scale factor for K
         mSFV: Optional[cute.Tensor] = None,  # Scale factor for V
+        
     ):
         """Execute the Fused Multi-Head Attention operation on the provided tensors.
 
@@ -466,11 +468,12 @@ class FlashAttentionForwardSm100:
         )
         # Only create V scale factor layout if V is being quantized
         if const_expr(mSFV is not None):
-            sfv_smem_layout_staged = blockscaled_utils.make_smem_layout_sfb(
+            sfv_smem_layout_staged = make_smem_layout_sfb(
                 tiled_mma_pv,
                 self.mma_tiler_pv,
                 self.sf_vec_size,
                 self.kv_stage,
+                mma_tile_inst_k=self.mma_inst_tile_k,
             )
         
         if const_expr(not self.same_hdim_kv_padded):
@@ -1171,8 +1174,8 @@ class FlashAttentionForwardSm100:
 
         qk_acc_shape = thr_mma_qk.partition_shape_C(self.mma_tiler_qk[:2])
         tStS_fake = thr_mma_qk.make_fragment_C(qk_acc_shape)
-        # This is a fake tensor, by right need to retrieve tmem_ptr. But we know that we always
-        # request 512 columns of tmem, so we know that it starts at 0.
+
+
         tmem_ptr = cute.make_ptr(Float32, 0, mem_space=cute.AddressSpace.tmem, assumed_align=16)
         tStS = cute.make_tensor(tmem_ptr, tStS_fake.layout)
 
