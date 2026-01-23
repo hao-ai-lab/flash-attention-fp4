@@ -613,7 +613,7 @@ class FlashAttentionForwardSm100:
             self.cluster_shape_mn, tiled_mma_qk.thr_id
         )
         # Setup scale factor tensor gmem layout 
-        # ((Atom_M, Rest_M),(Atom_K, Rest_K), RestL/nheads)
+        # ((Atom_M, Rest_M),(Atom_K, Rest_K), RestL)
         sfq_layout = blockscaled_utils.tile_atom_to_shape_SF(mQ_shape[:3], self.sf_vec_size)
         # Extend layout to include batch dimension
         # Base layout has shape ((Atom_M, Rest_M), (Atom_K, Rest_K), RestL), where RestL = nheads
@@ -1209,10 +1209,10 @@ class FlashAttentionForwardSm100:
 
         # Setup scale factor TMEM tensors and S2T copy operations
         # Use the TMEM region immediately following the accumulator (Scores tensor)
-        sfq_tmem_ptr = cute.recast_ptr(
-            tStS.iterator + tcgen05.find_tmem_tensor_col_offset(tStS),
+        sfq_tmem_ptrs = [cute.recast_ptr(
+            tcgen05.find_tmem_tensor_col_offset(tOrPs[1 - stage]),
             dtype=self.sf_dtype,
-        )
+        ) for stage in range(2)]
         
         # (MMA, MMA_M, MMA_K) ??
         tCtSFQ_layout = blockscaled_utils.make_tmem_layout_sfa(
@@ -1863,9 +1863,8 @@ class FlashAttentionForwardSm100:
                         tCtSFK_compact_s2t,
                     )
                     # if cute.arch.thread_idx()[0] % 32 == 0: cute.printf("tCtSFK_compact_s2t: {}", tCtSFK_compact_s2t)
-                    # breakpoint()
-                    # 3. gemm
                     
+                    # 3. gemm
                     # tiled_mma_qk = sm100_utils.gemm(tiled_mma_qk, tStSs[stage], tSrQs[stage], tSrKi, zero_init=True)
                     sK_cur = sK[None, None, None, mma_kv_consumer_state.index]
                     if const_expr(self.uneven_kv_smem):
