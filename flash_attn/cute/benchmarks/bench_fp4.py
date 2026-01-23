@@ -383,19 +383,19 @@ def main(ab_dtype, sf_dtype, sf_vec_size, quant_v=False):
             # The interface should detect nvfp4 dtype and dispatch to FP4 kernel
             # Pass scale factor tensors (V scale factors only if quant_v=True)
             desc_str = 'FP4 Attention (QKV quantized)' if quant_v else 'FP4 Attention (QK quantized)'
-            m_fp4 = time_fwd(
-                flash_attn_func_python,
-                q_fp4, k_fp4, v_tensor,
-                causal=causal,
-                window_size=window_size,
-                mSFQ=q_sf,
-                mSFK=k_sf,
-                mSFV=v_sf, 
-                repeats=repeats,
-                verbose=verbose,
-                desc=desc_str
-            )
-            print(f'FP4 Attention fwd: {m_fp4.mean * 1e3:.3f}ms, {(nFLOPS / m_fp4.mean * 1e-12):.1f} TFLOPS')
+            # m_fp4 = time_fwd(
+            #     flash_attn_func_python,
+            #     q_fp4, k_fp4, v_tensor,
+            #     causal=causal,
+            #     window_size=window_size,
+            #     mSFQ=q_sf,
+            #     mSFK=k_sf,
+            #     mSFV=v_sf, 
+            #     repeats=repeats,
+            #     verbose=verbose,
+            #     desc=desc_str
+            # )
+            # print(f'FP4 Attention fwd: {m_fp4.mean * 1e3:.3f}ms, {(nFLOPS / m_fp4.mean * 1e-12):.1f} TFLOPS')
         except Exception as e:
             print(f"FP4 attention failed: {e}")
             import traceback

@@ -186,11 +186,15 @@ class FlashAttentionForwardSm100:
         self.tmem_s_to_p_offset = self.n_block_size // 2
         self.tmem_p_offset = [
             self.tmem_s_offset[i] + self.tmem_s_to_p_offset for i in range(self.q_stage)
-        ]  # 0, 128
+        ]  # 64, 192
+        
+        # NOTE(Wenxuan): Some tests for tmem reuse. 
+        # self.tmem_o_offset = [self.tmem_s_offset[-1], self.tmem_s_offset[0]] # O1 could overwrite P2
+        # self.tmem_o_offset = self.tmem_s_offset # One mma having the same input and output tmem will certainly fail.
+        # self.tmem_p_offset = [self.tmem_o_offset[-1], self.tmem_o_offset[0]]
 
         # vec buffer for row_max & row_sum
         self.tmem_vec_offset = self.tmem_s_offset
-
         if self.head_dim_padded < 96:
             self.num_regs_softmax = 200
             self.num_regs_correction = 64
@@ -889,8 +893,8 @@ class FlashAttentionForwardSm100:
             for stage in range(self.q_stage)
         )
 
-        tP = cute.make_tensor(tStS.iterator, tP_layout.outer)
-        tOrP = thr_mma_pv.make_fragment_A(tP)[None, None, None, 0]
+        tP = cute.make_tensor(tStS.iterator, tP_layout.outer) # fp32
+        tOrP = thr_mma_pv.make_fragment_A(tP)[None, None, None, 0] # bf16
 
         tOrPs = [
             cute.make_tensor(
@@ -900,7 +904,6 @@ class FlashAttentionForwardSm100:
             )
             for stage in range(self.q_stage)
         ]
-
         block_info = BlockInfo(
             # This is cta_tiler, not mma_tiler_qk, since we move by block by (2 * mma_tiler[0], mma_tiler[1])
             self.cta_tiler[0],
@@ -1908,6 +1911,10 @@ class FlashAttentionForwardSm100:
             cute.recast_ptr(tSrP_r2t_f32.iterator, dtype=self.q_dtype),
             tSrS_t2r.layout,
         )
+        # if cute.arch.thread_idx()[0] % 32 == 0:
+        #     cute.printf("tSrP_r2t addr: %d\n", tSrP_r2t.iterator.toint())
+        #     cute.printf("tSrP_r2t_f32 addr: %d\n", tSrP_r2t_f32.iterator.toint())
+        
         # softmax.scale_apply_exp2_convert(tSrS_t2r, row_max, tSrP_r2t)
         softmax.apply_exp2_convert(
             tSrS_t2r,
@@ -1928,6 +1935,7 @@ class FlashAttentionForwardSm100:
         for i in cutlass.range_constexpr(
             cute.size(tStP_r2t.shape[2]) // 4 * 3, cute.size(tStP_r2t.shape[2])
         ):
+            # breakpoint()
             cute.copy(thr_tmem_store, tSrP_r2t_f32[None, None, i], tStP_r2t[None, None, i])
         cute.arch.fence_view_async_tmem_store()
         # Notify mma warp that the 2nd half of P is ready
@@ -2302,7 +2310,7 @@ class FlashAttentionForwardSm100:
         :type thr_mma: cute.core.ThrMma
         :param tOtO: Tensor containing accumulated attention output
         :type tOtO: cute.Tensor
-        :param scale: Final scaling factor to apply to the output
+        :param scale: Final scaling factor(softmax denominator) to apply to the output
         :type scale: Float32
         :param sO: Shared memory tensor for the final output
         :type sO: cute.Tensor
@@ -2355,6 +2363,7 @@ class FlashAttentionForwardSm100:
             cute.arch.ProxyKind.async_shared,
             space=cute.arch.SharedSpace.shared_cta,
         )
+
 
         if const_expr(self.use_correction_warps_for_epi):
             assert(not self.use_tma_O)

@@ -92,6 +92,7 @@ class FlashAttentionForwardSm100:
         sf_dtype: Optional[Type[cutlass.Numeric]] = None,
         sf_vec_size: Optional[int] = None,
     ):
+        assert sf_vec_size == 16 and sf_dtype == cutlass.Float8E4M3FN, "Only support NVFP4 for now"
         self.use_tma_KV = not paged_kv_non_tma
         # self.dtype = dtype
         # padding head_dim to a multiple of 16 as k_block_size
@@ -186,9 +187,11 @@ class FlashAttentionForwardSm100:
             self.tmem_s_offset[-1] + self.n_block_size + i * self.head_dim_v_padded
             for i in range(self.q_stage)
         ]  # e.g., 256, 384
+        # self.tmem_o_offset = self.tmem_s_offset
         self.tmem_total = self.tmem_o_offset[-1] + self.head_dim_v_padded
         assert self.tmem_total <= SM100_TMEM_CAPACITY_COLUMNS
-        self.tmem_s_to_p_offset = self.n_block_size // 2
+        # self.tmem_s_to_p_offset = self.n_block_size // 2
+        self.tmem_s_to_p_offset = self.n_block_size // 4 # due to fp32 to nvfp4 cast
         self.tmem_p_offset = [
             self.tmem_s_offset[i] + self.tmem_s_to_p_offset for i in range(2)
         ]  # 0, 128
@@ -239,7 +242,7 @@ class FlashAttentionForwardSm100:
         - Configures pipeline stages for softmax, correction, and epilogue operations
         """
 
-        self.kv_stage = 4 if self.q_dtype.width == 8 else 3
+        self.kv_stage = 4 if self.q_dtype.width <= 8 else 3
         self.acc_stage = 1
         self.epi_stage = 2
         # For hdim 192,128, we don't have enough smem to store all 3 stages of KV:
@@ -1223,6 +1226,9 @@ class FlashAttentionForwardSm100:
             tCtSFQ.iterator + tcgen05.find_tmem_tensor_col_offset(tCtSFQ),
             dtype=self.sf_dtype,
         )
+        
+        # tCtSFQ_ptr = tCtSFQ.iterator.toint()
+        # tStS_ptr = tStS.iterator.toint()
         # (MMA, MMA_N, MMA_K)
         tCtSFK_layout = blockscaled_utils.make_tmem_layout_sfb(
             tiled_mma_qk,
@@ -1839,6 +1845,7 @@ class FlashAttentionForwardSm100:
                         tCsSFQ_compact_s2t_staged,
                         tCtSFQ_compact_s2t,
                     )
+                    # if cute.arch.thread_idx()[0] % 32 == 0: cute.printf("tCtSFQ_compact_s2t: {}", tCtSFQ_compact_s2t)
                     
                     # Copy SFK (scale factor for K, like SFB) - per K stage
                     s2t_stage_coord_sfk = (
@@ -1854,7 +1861,8 @@ class FlashAttentionForwardSm100:
                         tCsSFK_compact_s2t_staged,
                         tCtSFK_compact_s2t,
                     )
-                    
+                    # if cute.arch.thread_idx()[0] % 32 == 0: cute.printf("tCtSFK_compact_s2t: {}", tCtSFK_compact_s2t)
+                    # breakpoint()
                     # 3. gemm
                     
                     # tiled_mma_qk = sm100_utils.gemm(tiled_mma_qk, tStSs[stage], tSrQs[stage], tSrKi, zero_init=True)
@@ -2122,7 +2130,7 @@ class FlashAttentionForwardSm100:
 
             softmax = SoftmaxSm100.create(
                 softmax_scale_log2,
-                rescale_threshold=8.0 if const_expr(self.q_dtype.width == 16) else 0.0,
+                rescale_threshold=8.0 if const_expr(self.q_dtype.width == 16) else 0.0, # (Wenxuan) disable skipping rescale until FP4 precision is verified
                 softmax_scale=softmax_scale,
             )
             softmax.reset()
@@ -2768,7 +2776,7 @@ class FlashAttentionForwardSm100:
         :type thr_mma: cute.core.ThrMma
         :param tOtO: Tensor containing accumulated attention output
         :type tOtO: cute.Tensor
-        :param scale: Final scaling factor to apply to the output
+        :param scale: Final scaling factor(softmax denominator) to apply to the output
         :type scale: Float32
         :param sO: Shared memory tensor for the final output
         :type sO: cute.Tensor
@@ -2821,6 +2829,7 @@ class FlashAttentionForwardSm100:
             cute.arch.ProxyKind.async_shared,
             space=cute.arch.SharedSpace.shared_cta,
         )
+        # TODO(Wenxuan) insert tcgen05.wait and mbarrier_arrive here to unblock sfq,k, or put sfq,k after P tmem
 
         if const_expr(self.use_correction_warps_for_epi):
             assert(not self.use_tma_O)
