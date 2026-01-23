@@ -34,9 +34,26 @@ This should show your local path (e.g., `/sgl-workspace/cutlass/examples/python/
 
 **Note:** The `__init__.py` also includes code to move the editable finder to the front of `sys.meta_path` as a backup, but running the fix script is recommended for a permanent solution.
 
-### Benchmarking FP4 attn
+## Benchmarking FP4 attn
 
 ```bash
 cd examples/python/CuTeDSL/blackwell/flash-attention/flash_attn/cute
 CUTE_DSL_ENABLE_TVM_FFI=1 python benchmarks/bench_fp4.py
 ```
+
+## Changes to merge from FA4 main branch
+
+### Commits after 43375aa (Nov 19, 2025)
+Some are only partially merged (like q_stage=1)
+- [ ] `052015a` - add fastdivmod for oob reads in mask_mods (#2020) - Nov 21, 2025
+- [ ] `d063b33` - don't pass mask_fn to softmax_step generically (#2026) - Nov 22, 2025
+- [ ] `92ca9da` - [Cute,Fwd] enable mask mod without blocksparsity (#2031) - Nov 25, 2025
+- [ ] `672381f` - Bump pin (#2025) - Nov 25, 2025
+- [ ] `fd8d5eb` - [Cute,Fwd] Extend score_mod to variable sequence length (#2043) - Dec 15, 2025
+- [ ] `bba578d` - Fix IMA in fwd on m boundary (#2091) - Dec 20, 2025
+- [ ] `58fe37f` - fix shuffle sync for pack gqa epilogue (#2097) - Dec 24, 2025
+- [ ] `9b6dbac` - Add pack-gqa support for blcoksparse impl w/ braodcasted H dim (#2098) - Jan 4, 2026
+- [ ] `f98d345` - [Cute,Fwd] improved block sparsity (#2100) - Jan 5, 2026
+- [ ] `3c8ca4e` - [Cute,Fwd,Sm100] Support `q_stage=1` for inference (#1993) - Jan 8, 2026
+- [ ] `68649fb` - [Cute][Flex]Add pack-gqa divmod (#2180) - Jan 15, 2026
+- [ ] `fffabc3` - [Cute,Fwd,Sm100] distributed offset calculation for paged KV (#2104) - Jan 15, 2026
