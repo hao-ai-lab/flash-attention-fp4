@@ -618,6 +618,7 @@ class FlashAttentionForwardSm100:
         # Extend layout to include batch dimension
         # Base layout has shape ((Atom_M, Rest_M), (Atom_K, Rest_K), RestL), where RestL = nheads
         # We need to add batch dimension: ((Atom_M, Rest_M), (Atom_K, Rest_K), RestL, batch)
+        # See scale factor layouts in https://docs.nvidia.com/cutlass/latest/media/docs/cpp/blackwell_functionality.html#scale-factor-layouts
         sfq_shape_extended = (
             *sfq_layout.shape,
             mQ_shape[3],  # batch dimension
