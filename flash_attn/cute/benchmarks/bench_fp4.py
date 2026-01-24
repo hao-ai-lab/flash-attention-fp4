@@ -41,13 +41,13 @@ def flops(batch, nheads, seqlen_q, seqlen_k, headdim, headdim_v, causal=False, w
 def cvt_sf_MKL_to_M32x4xrm_K4xrk_L(
     sf_ref_tensor: cute.Tensor,
     sf_mma_tensor: cute.Tensor,
+    atom_k: int,
 ):
     """Convert scale factor tensor from MKL layout to mma specification M(32x4xrest_m)xK(4xrest_k)x(nheads,batch) layout"""
     # sf_ref_tensor has shape (mn, sf_k, batch, nheads) after permute
     # sf_mma_tensor has shape (32, 4, rest_m, 4, rest_k, nheads, batch) 
     # Convert coordinates: (mn_idx, sf_k_idx, batch_idx, nhead_idx) -> (atom_m_0, atom_m_1, rest_m_idx, atom_k_idx, rest_k_idx, nhead_idx, batch_idx)
     atom_m = (32, 4)
-    atom_k = 4
     for i in cutlass.range(cute.size(sf_ref_tensor)):
         mkl_coord = sf_ref_tensor.layout.get_hier_coord(i)
         mn_idx, sf_k_idx, batch_idx, nhead_idx = mkl_coord
@@ -64,7 +64,7 @@ def cvt_sf_MKL_to_M32x4xrm_K4xrk_L(
         sf_mma_tensor[mma_coord] = sf_ref_tensor[mkl_coord]
 
 
-def create_scale_factor_tensor(batch, seqlen, nheads, headdim, sf_vec_size, sf_dtype, device='cuda'):
+def create_scale_factor_tensor(batch, seqlen, nheads, headdim, sf_vec_size, sf_dtype, q_dtype, device='cuda'):
     """Create scale factor tensor for Q/K/V.
     
     Args:
@@ -91,7 +91,9 @@ def create_scale_factor_tensor(batch, seqlen, nheads, headdim, sf_vec_size, sf_d
     ref_shape = (batch, nheads, mn, sf_k)
     
     atom_m = (32, 4)
-    atom_k = 4
+    # atom_k = 4
+    # NOTE (Wenxuan): atom_k = mma_tile_inst_k
+    atom_k = headdim_v * q_dtype.width // 256
     # mma_shape keeps batch and nheads separate: (batch, nheads, rest_m, rest_k, 32, 4, 4)
     # This allows indexing batch and head separately in the kernel like mQ
     mma_shape = (
@@ -138,6 +140,7 @@ def create_scale_factor_tensor(batch, seqlen, nheads, headdim, sf_vec_size, sf_d
     cvt_sf_MKL_to_M32x4xrm_K4xrk_L(
         from_dlpack(ref_f32_torch_tensor_cpu),
         from_dlpack(cute_f32_torch_tensor_cpu),
+        atom_k,
     )
     cute_f32_torch_tensor = cute_f32_torch_tensor_cpu.cuda()
     
@@ -290,17 +293,17 @@ def create_fp4_attention_tensors(batch, seqlen_q, seqlen_k, nheads, nheads_kv, h
     # For Q: (batch, nheads, seqlen_q, headdim) -> scale factors for headdim dimension
     # Scale factors are per (batch * nheads, seqlen_q, ceil_div(headdim, sf_vec_size))
     q_sf_ref, q_sf_tensor, q_sf_torch_underlying = create_scale_factor_tensor(
-        batch, seqlen_q, nheads, headdim, sf_vec_size, sf_dtype, device
+        batch, seqlen_q, nheads, headdim, sf_vec_size, sf_dtype, ab_dtype, device
     )
     # For K: (batch, nheads_kv, seqlen_k, headdim) -> scale factors for headdim dimension
     k_sf_ref, k_sf_tensor, k_sf_torch_underlying = create_scale_factor_tensor(
-        batch, seqlen_k, nheads_kv, headdim, sf_vec_size, sf_dtype, device
+        batch, seqlen_k, nheads_kv, headdim, sf_vec_size, sf_dtype, ab_dtype, device
     )
     
     # Create V scale factors only if V is being quantized
     if quant_v:
         v_sf_ref, v_sf_tensor, v_sf_torch_underlying = create_scale_factor_tensor(
-            batch, seqlen_k, nheads_kv, headdim_v, sf_vec_size, sf_dtype, device
+            batch, seqlen_k, nheads_kv, headdim_v, sf_vec_size, sf_dtype, ab_dtype, device
         )
     else:
         v_sf_tensor = None
@@ -440,9 +443,10 @@ if __name__ == "__main__":
     )
     # parser.add_argument("--ab_dtype", type=cutlass.dtype, default=cutlass.Float4E2M1FN)
     # parser.add_argument("--sf_dtype", type=cutlass.dtype, default=cutlass.Float8E4M3FN)
-    parser.add_argument("--sf_vec_size", type=int, default=16)
+
     args = parser.parse_args()
     ab_dtype = cutlass.Float4E2M1FN
     sf_dtype = cutlass.Float8E4M3FN
-    main(ab_dtype, sf_dtype, args.sf_vec_size, args.quant_v)
+    sf_vec_size = 16
+    main(ab_dtype, sf_dtype, sf_vec_size, args.quant_v)
 
