@@ -190,7 +190,7 @@ class FlashAttentionForwardSm100:
         
         # NOTE(Wenxuan): Some tests for tmem reuse. 
         # self.tmem_o_offset = [self.tmem_s_offset[-1], self.tmem_s_offset[0]] # O1 could overwrite P2
-        # self.tmem_o_offset = self.tmem_s_offset # One mma having the same input and output tmem will certainly fail.
+        # self.tmem_o_offset = self.tmem_s_offset
         # self.tmem_p_offset = [self.tmem_o_offset[-1], self.tmem_o_offset[0]]
 
         # vec buffer for row_max & row_sum
