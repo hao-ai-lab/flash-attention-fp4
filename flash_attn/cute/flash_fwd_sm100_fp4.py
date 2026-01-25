@@ -438,7 +438,7 @@ class FlashAttentionForwardSm100:
         tP_layout = sm100_utils_basic.make_smem_layout_a(
             tiled_mma_pv,
             self.mma_tiler_pv,
-            self.q_dtype,
+            self.v_dtype,
             self.acc_stage,
         )
         sV_layout = sm100_utils_basic.make_smem_layout_b(
@@ -1184,6 +1184,8 @@ class FlashAttentionForwardSm100:
                 )
         # Relying on pipeline_kv constructor to call mbarrier_init_fence and sync
         pipeline_kv = self.make_and_init_load_kv_pipeline(mbar_ptr + self.mbar_load_kv_full_offset)
+        # only for debugging, when kv have diff
+        pipeline_v = self.make_and_init_load_kv_pipeline(mbar_ptr + self.mbar_load_kv_full_offset, use_k_bytes=False)
 
         #  Generate smem tensor Q/K/V/O
         # (MMA, MMA_Q, MMA_D, PIPE)
@@ -1640,7 +1642,7 @@ class FlashAttentionForwardSm100:
             gSFQ = cute.local_tile(tma_tensor_sfq_cur, cute.select(self.mma_tiler_qk, mode=[0, 2]), (None, 0))
             tSgSFQ = thr_mma_qk.partition_A(gSFQ)
             load_SFQ_fn, _, _ = copy_utils.tma_get_copy_fn(
-                tma_atom_sfq, 0, cute.make_layout(1), tSgSFQ, sSFQ
+                tma_atom_sfq, 0, cute.make_layout(1), tSgSFQ, sSFQ, filter_zeros=True
             )
             
             # Partition SFK similar to K - index batch and head first like mK_cur
@@ -1663,6 +1665,8 @@ class FlashAttentionForwardSm100:
                 cute.group_modes(sSFK, 0, 3),
                 cute.group_modes(tSgSFK, 0, 3),
             )
+            tKsSFK = cute.filter_zeros(tKsSFK)
+            tKgSFK = cute.filter_zeros(tKgSFK)
             
             # Partition SFV similar to V
             tVsSFV, tVgSFV = None, None
@@ -1686,6 +1690,8 @@ class FlashAttentionForwardSm100:
                     cute.group_modes(sSFV, 0, 3),
                     cute.group_modes(tOgSFV, 0, 3),
                 )
+                tVsSFV = cute.filter_zeros(tVsSFV)
+                tVgSFV = cute.filter_zeros(tVgSFV)
 
             load_Q = partial(
                 self.load_Q,
@@ -1829,7 +1835,7 @@ class FlashAttentionForwardSm100:
                 sA=sQ[None, None, None, stage],
                 zero_init=True,
             )
-            for stage in range(2)
+            for stage in range(self.q_stage)
         ]
         gemm_Pi = [
             partial(
@@ -1839,7 +1845,7 @@ class FlashAttentionForwardSm100:
                 tOrPs[stage],
                 sA=None,
             )
-            for stage in range(2)
+            for stage in range(self.q_stage)
         ]
 
         mma_q_consumer_phase = Int32(0)
@@ -1931,7 +1937,6 @@ class FlashAttentionForwardSm100:
                         tCsSFK_compact_s2t_staged,
                         tCtSFK_compact_s2t,
                     )
-                    # if cute.arch.thread_idx()[0] % 32 == 0: cute.printf("tCtSFK_compact_s2t: {}", tCtSFK_compact_s2t)
                     
                     # 3. gemm
                     # tiled_mma_qk = sm100_utils.gemm(tiled_mma_qk, tStSs[stage], tSrQs[stage], tSrKi, zero_init=True)
@@ -1969,7 +1974,7 @@ class FlashAttentionForwardSm100:
                     mma_kv_release_state = mma_kv_consumer_state.clone()
                     Vi_index, Vi_phase = mma_kv_consumer_state.index, mma_kv_consumer_state.phase
                     tOrVi = tOrV[None, None, None, Vi_index]
-                    for stage in cutlass.range_constexpr(2):
+                    for stage in cutlass.range_constexpr(self.q_stage):
                         # 2. acquire corrected O0/O1_partial and P0 / P1
                         # For the first iteration in this work tile, waiting for O0/O1_partial
                         # means that the correction warps has finished reading tO during
@@ -2018,7 +2023,7 @@ class FlashAttentionForwardSm100:
                         sK_cur = sK[None, None, None, Ki_index]
                         if const_expr(self.uneven_kv_smem):
                             sK_cur = self.offset_kv_smem(sK_cur, Ki_index, Ki_phase)
-
+                        # if cute.arch.thread_idx()[0] % 32 == 0: cute.printf("stage: {}, block_loop_count: {}", stage, block_loop_count)
                         gemm_Si[stage](
                             tCrB=tSrK[None, None, None, Ki_index],  # tCrB
                             sB=sK_cur,  # sB
@@ -2046,7 +2051,7 @@ class FlashAttentionForwardSm100:
                 pipeline_kv.consumer_wait(mma_kv_consumer_state)
                 Vi_index, Vi_phase = mma_kv_consumer_state.index, mma_kv_consumer_state.phase
                 tOrVi = tOrV[None, None, None, Vi_index]
-                for stage in cutlass.range_constexpr(2):
+                for stage in cutlass.range_constexpr(self.q_stage):
                     # 2. acquire corrected Oi_partial and Pi
                     cute.arch.mbarrier_wait(
                         mbar_ptr + self.mbar_P_full_O_rescaled_offset + stage, P_full_O_rescaled_phase
@@ -3320,7 +3325,7 @@ class FlashAttentionForwardSm100:
         else:
             return sX
 
-    def make_and_init_load_kv_pipeline(self, load_kv_mbar_ptr):
+    def make_and_init_load_kv_pipeline(self, load_kv_mbar_ptr, use_k_bytes: bool = True):
         load_kv_consumer_group = cutlass.pipeline.CooperativeGroup(
             cutlass.pipeline.Agent.Thread, len([self.mma_warp_id])
         )
@@ -3333,7 +3338,7 @@ class FlashAttentionForwardSm100:
                 num_stages=self.kv_stage,
                 producer_group=load_kv_producer_group,
                 consumer_group=load_kv_consumer_group,
-                tx_count=self.tma_copy_bytes["K"],
+                tx_count=self.tma_copy_bytes["K"] if use_k_bytes else self.tma_copy_bytes["V"],
             )
         else:
             load_kv_producer_group = cutlass.pipeline.CooperativeGroup(

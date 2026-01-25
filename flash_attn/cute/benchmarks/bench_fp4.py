@@ -380,6 +380,7 @@ def main(ab_dtype, sf_dtype, sf_vec_size, quant_v=False):
         # Benchmark FP4 attention
         # Pass CUTE tensors directly (like dense GEMM example)
         m_fp4 = None
+        fp4_out = None
         try:
             # The interface should detect nvfp4 dtype and dispatch to FP4 kernel
             # Pass scale factor tensors (V scale factors only if quant_v=True)
@@ -397,6 +398,14 @@ def main(ab_dtype, sf_dtype, sf_vec_size, quant_v=False):
                 desc=desc_str
             )
             print(f'FP4 Attention fwd: {m_fp4.mean * 1e3:.3f}ms, {(nFLOPS / m_fp4.mean * 1e-12):.1f} TFLOPS')
+            fp4_out = flash_attn_func_python(
+                q_fp4, k_fp4, v_tensor,
+                causal=causal,
+                window_size=window_size,
+                mSFQ=q_sf,
+                mSFK=k_sf,
+                mSFV=v_sf,
+            )
         except Exception as e:
             print(f"FP4 attention failed: {e}")
             import traceback
@@ -404,6 +413,7 @@ def main(ab_dtype, sf_dtype, sf_vec_size, quant_v=False):
 
         
         # Benchmark reference (FP16/BF16) attention for comparison
+        ref_out = None
         try:
             # Create reference tensors in standard dtype
             q_ref = q_ref.to(dtype_gen)
@@ -421,7 +431,11 @@ def main(ab_dtype, sf_dtype, sf_vec_size, quant_v=False):
                 desc='Reference (FP16/BF16) Attention'
             )
             print(f'Reference fwd: {m_ref.mean * 1e3:.3f}ms, {(nFLOPS / m_ref.mean * 1e-12):.1f} TFLOPS')
-            
+            ref_out = flash_attn_func_python(
+                q_ref, k_ref, v_ref,
+                causal=causal,
+                window_size=window_size,
+            )
             if m_fp4 is not None:
                 speedup = m_ref.mean / m_fp4.mean
                 print(f'Speedup: {speedup:.2f}x')
@@ -430,6 +444,9 @@ def main(ab_dtype, sf_dtype, sf_vec_size, quant_v=False):
             import traceback
             traceback.print_exc()
 
+        # Compare FP4 and reference outputs
+        if fp4_out is not None and ref_out is not None:
+            torch.testing.assert_close(fp4_out, ref_out, atol=1e-3, rtol=1e-3)
 
 if __name__ == "__main__":
     import argparse
