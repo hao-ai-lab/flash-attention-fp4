@@ -557,6 +557,7 @@ def _flash_attn_fwd(
             to_cute_tensor(t) for t in (q, k, v, out if not is_split_kv else out_partial)
         ]
         # Pass through scale factor tensors if using FP4 (tvm-ffi handles conversion)
+        mSFQ_tensor = mSFK_tensor = mSFV_tensor = None
         if use_fp4:
             mSFQ_tensor = to_cute_tensor(mSFQ, leading_dim=3, assumed_align=16) if mSFQ is not None else None
             mSFK_tensor = to_cute_tensor(mSFK, leading_dim=3, assumed_align=16) if mSFK is not None else None
@@ -612,14 +613,14 @@ def _flash_attn_fwd(
                 has_aux_tensors=aux_tensors is not None,
             )
         elif compute_capability == 10:
-            if use_fp4:
+            if use_fp4 or force_fp4_impl:
                 # Use FP4 kernel with scale factors
                 # Use extracted sf_dtype if available, otherwise default
                 if sf_dtype is None:
                     sf_dtype = cutlass.Float8E4M3FN  # Default scale factor dtype for FP4
                 # Validate dtype and scale factor combinations
-                ab_dtype = cutlass.Float4E2M1FN  # MXFP4 and NVFP4 use Float4E2M1FN for Q/K/V
-                if not is_valid_dtypes_and_scale_factor_vec_size(ab_dtype, sf_dtype, sf_vec_size):
+                ab_dtype = q_tensor.element_type  # MXFP4 and NVFP4 use Float4E2M1FN for Q/K/V
+                if not force_fp4_impl and not is_valid_dtypes_and_scale_factor_vec_size(ab_dtype, sf_dtype, sf_vec_size):
                     raise ValueError(
                         f"Invalid dtype combination: ab_dtype={ab_dtype}, "
                         f"sf_dtype={sf_dtype}, sf_vec_size={sf_vec_size}"
@@ -699,10 +700,15 @@ def _flash_attn_fwd(
             cute_aux_tensors,
         ]
         # Add scale factor tensors if using FP4
-        if use_fp4:
+        if use_fp4 or force_fp4_impl:
             compile_args.extend([mSFQ_tensor, mSFK_tensor, mSFV_tensor])
         _flash_attn_fwd.compile_cache[compile_key] = cute.compile(*compile_args, options="--enable-tvm-ffi",
         )
+        # test 
+        if force_fp4_impl:
+            run_args = compile_args[1:]
+            run_args[6] = current_stream
+            _flash_attn_fwd.compile_cache[compile_key](*run_args)
 
     # Expand block sparse tensors to match actual head count (may be broadcast from 1)
     normalized_block_sparse_tensors = None
@@ -737,12 +743,11 @@ def _flash_attn_fwd(
     ]
 
     # Add scale factor tensors if using FP4
-    if use_fp4:
+    if use_fp4 or force_fp4_impl:
         call_args.extend([mSFQ, mSFK, mSFV])
-    try:
-        _flash_attn_fwd.compile_cache[compile_key](*call_args)
-    except Exception as e:
-        breakpoint()
+
+    _flash_attn_fwd.compile_cache[compile_key](*call_args)
+
     if is_split_kv:
         _flash_attn_fwd_combine(
             out_partial,
