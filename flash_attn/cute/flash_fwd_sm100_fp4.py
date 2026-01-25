@@ -190,11 +190,11 @@ class FlashAttentionForwardSm100:
         # self.tmem_o_offset = self.tmem_s_offset
         self.tmem_total = self.tmem_o_offset[-1] + self.head_dim_v_padded
         assert self.tmem_total <= SM100_TMEM_CAPACITY_COLUMNS
-        # self.tmem_s_to_p_offset = self.n_block_size // 2
-        self.tmem_s_to_p_offset = self.n_block_size // 4 # due to fp32 to nvfp4 cast
+        self.tmem_s_to_p_offset = self.n_block_size // 2
+
         self.tmem_p_offset = [
             self.tmem_s_offset[i] + self.tmem_s_to_p_offset for i in range(2)
-        ]  # 0, 128
+        ]  # e.g., 64, 192
 
         # vec buffer for row_max & row_sum
         self.tmem_vec_offset = self.tmem_s_offset
@@ -944,7 +944,6 @@ class FlashAttentionForwardSm100:
         print(f"sfp_smem_size: {sfp_bytes / 1024:.2f} KB")
         print(f"sfv_smem_size: {sfv_bytes / 1024:.2f} KB")
         
-
         LOG2_E = math.log2(math.e)
         if const_expr(self.score_mod is None):
             softmax_scale_log2 = softmax_scale * LOG2_E
@@ -1243,12 +1242,11 @@ class FlashAttentionForwardSm100:
         tOrPs = [
             cute.make_tensor(
                 tOrP.iterator
-                + self.qk_acc_dtype.width // self.q_dtype.width * self.tmem_p_offset[stage],
+                + self.qk_acc_dtype.width // tOrP._dtype.width * self.tmem_p_offset[stage],
                 tOrP.layout,
             )
             for stage in range(2)
         ]
-
 
         # Setup scale factor TMEM tensors and S2T copy operations
         # Use the TMEM region immediately following the accumulator (O tensor)
@@ -1823,7 +1821,8 @@ class FlashAttentionForwardSm100:
 
         gemm_Si = [
             partial(
-                sm100_utils.gemm_ptx_partial_fp4,
+                # sm100_utils.gemm_ptx_partial_fp4,
+                sm100_utils.gemm_ptx_partial,
                 qk_mma_op,
                 self.tmem_s_offset[stage],
                 tSrQs[stage],
@@ -1945,8 +1944,8 @@ class FlashAttentionForwardSm100:
                     gemm_Si[stage](
                         tCrB=tSrKi,  # tCrB
                         sB=sK_cur,  # sB
-                        tScaleA=tCtSFQs[stage],  # tScaleA - per Q stage
-                        tScaleB=tCtSFKs[stage],  # tScaleB - per K stage
+                        # tScaleA=tCtSFQs[stage],  # tScaleA - per Q stage
+                        # tScaleB=tCtSFKs[stage],  # tScaleB - per K stage
                     )
 
                     # 4. release S0 / S1
@@ -2023,8 +2022,8 @@ class FlashAttentionForwardSm100:
                         gemm_Si[stage](
                             tCrB=tSrK[None, None, None, Ki_index],  # tCrB
                             sB=sK_cur,  # sB
-                            tScaleA=tCtSFQs[stage],  # tScaleA
-                            tScaleB=tCtSFKs[stage],  # tScaleB
+                            # tScaleA=tCtSFQs[stage],  # tScaleA
+                            # tScaleB=tCtSFKs[stage],  # tScaleB
                         )
                         # 3. release S0
                         with cute.arch.elect_one():
