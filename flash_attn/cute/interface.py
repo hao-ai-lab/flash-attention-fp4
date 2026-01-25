@@ -188,6 +188,7 @@ def _flash_attn_fwd(
     mSFQ: Optional[Union[torch.Tensor, cute.Tensor]] = None,  # Scale factor for Q
     mSFK: Optional[Union[torch.Tensor, cute.Tensor]] = None,  # Scale factor for K
     mSFV: Optional[Union[torch.Tensor, cute.Tensor]] = None,  # Scale factor for V
+    force_fp4_impl: bool = False, # Test fp4 attn impl under bf16 precision w/o sf
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Forward pass for FlashAttention.
 
@@ -255,7 +256,7 @@ def _flash_attn_fwd(
     is_cute_q = isinstance(q, cute.Tensor)
     if is_cute_q:
         q_dtype = q.element_type
-        use_fp4 = q.element_type == cutlass.Float4E2M1FN
+        use_fp4 = q.element_type == cutlass.Float4E2M1FN 
         if not use_fp4:
             k_dtype = k.element_type if isinstance(k, cute.Tensor) else k.dtype
             v_dtype = v.element_type if isinstance(v, cute.Tensor) else v.dtype
@@ -515,6 +516,7 @@ def _flash_attn_fwd(
         mSFQ is not None,  # Include scale factor flags
         mSFK is not None,
         mSFV is not None,
+        force_fp4_impl,
     )
     if compile_key not in _flash_attn_fwd.compile_cache:
         (
@@ -737,7 +739,10 @@ def _flash_attn_fwd(
     # Add scale factor tensors if using FP4
     if use_fp4:
         call_args.extend([mSFQ, mSFK, mSFV])
-    _flash_attn_fwd.compile_cache[compile_key](*call_args)
+    try:
+        _flash_attn_fwd.compile_cache[compile_key](*call_args)
+    except Exception as e:
+        breakpoint()
     if is_split_kv:
         _flash_attn_fwd_combine(
             out_partial,
@@ -1308,6 +1313,7 @@ class FlashAttnFunc(torch.autograd.Function):
         mSFQ: Optional[torch.Tensor] = None,
         mSFK: Optional[torch.Tensor] = None,
         mSFV: Optional[torch.Tensor] = None,
+        force_fp4_impl: bool = False,
     ):
         # Only create block sparse tensors if at least one block sparse parameter is provided
         block_sparse_tensors = None
@@ -1335,6 +1341,7 @@ class FlashAttnFunc(torch.autograd.Function):
             mSFQ=mSFQ,
             mSFK=mSFK,
             mSFV=mSFV,
+            force_fp4_impl=force_fp4_impl,
         )
         ctx.save_for_backward(q, k, v, out, lse)
         ctx.softmax_scale = softmax_scale
@@ -1448,6 +1455,7 @@ def flash_attn_func(
     mSFQ: Optional[torch.Tensor] = None,
     mSFK: Optional[torch.Tensor] = None,
     mSFV: Optional[torch.Tensor] = None,
+    force_fp4_impl: bool = False,
 ):
     return FlashAttnFunc.apply(
         q,
@@ -1468,6 +1476,7 @@ def flash_attn_func(
         mSFQ,
         mSFK,
         mSFV,
+        force_fp4_impl,
     )
 
 
