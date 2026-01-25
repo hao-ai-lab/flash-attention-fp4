@@ -1821,8 +1821,8 @@ class FlashAttentionForwardSm100:
 
         gemm_Si = [
             partial(
-                # sm100_utils.gemm_ptx_partial_fp4,
-                sm100_utils.gemm_ptx_partial,
+                sm100_utils.gemm_ptx_partial_fp4,
+                # sm100_utils.gemm_ptx_partial,
                 qk_mma_op,
                 self.tmem_s_offset[stage],
                 tSrQs[stage],
@@ -1944,8 +1944,8 @@ class FlashAttentionForwardSm100:
                     gemm_Si[stage](
                         tCrB=tSrKi,  # tCrB
                         sB=sK_cur,  # sB
-                        # tScaleA=tCtSFQs[stage],  # tScaleA - per Q stage
-                        # tScaleB=tCtSFKs[stage],  # tScaleB - per K stage
+                        tScaleA=tCtSFQs[stage],  # tScaleA - per Q stage
+                        tScaleB=tCtSFKs[stage],  # tScaleB - per K stage
                     )
 
                     # 4. release S0 / S1
@@ -2022,8 +2022,8 @@ class FlashAttentionForwardSm100:
                         gemm_Si[stage](
                             tCrB=tSrK[None, None, None, Ki_index],  # tCrB
                             sB=sK_cur,  # sB
-                            # tScaleA=tCtSFQs[stage],  # tScaleA
-                            # tScaleB=tCtSFKs[stage],  # tScaleB
+                            tScaleA=tCtSFQs[stage],  # tScaleA
+                            tScaleB=tCtSFKs[stage],  # tScaleB
                         )
                         # 3. release S0
                         with cute.arch.elect_one():

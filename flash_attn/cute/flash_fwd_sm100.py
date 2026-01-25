@@ -904,7 +904,7 @@ class FlashAttentionForwardSm100:
             )
             for stage in range(self.q_stage)
         ]
-        breakpoint()
+
         block_info = BlockInfo(
             # This is cta_tiler, not mma_tiler_qk, since we move by block by (2 * mma_tiler[0], mma_tiler[1])
             self.cta_tiler[0],
