@@ -241,8 +241,8 @@ class FlashAttentionForwardSm100:
         - Sets up staging parameters for Q, K, V inputs and accumulator data
         - Configures pipeline stages for softmax, correction, and epilogue operations
         """
-
-        self.kv_stage = 4 if self.q_dtype.width <= 8 else 3
+        # do not increase if only testing quant qk
+        self.kv_stage = 12 if self.q_dtype.width < 8 and self.v_dtype.width < 8 else 3 
         self.acc_stage = 1
         self.epi_stage = 2
         # For hdim 192,128, we don't have enough smem to store all 3 stages of KV:
@@ -251,9 +251,10 @@ class FlashAttentionForwardSm100:
         # 128 x 192 and smem_small is 128 x 128. We set the stride between the stages to be
         # 128 * 160, so that indexing the 0th and 2nd stages will get the right address,
         # but for the 1st stage we need to add or subtract (depending on phase) 128 x 64.
-        self.uneven_kv_smem = (
-            self.head_dim_padded == 192 and self.head_dim_v_padded == 128 and self.kv_stage == 3
-        )
+        # self.uneven_kv_smem = (
+            # self.head_dim_padded == 192 and self.head_dim_v_padded == 128 and self.kv_stage == 3
+        # )
+        self.uneven_kv_smem = False
         self.uneven_kv_smem_offset = (
             self.m_block_size * (self.head_dim_padded - self.head_dim_v_padded) // 2
             if self.uneven_kv_smem
@@ -640,7 +641,7 @@ class FlashAttentionForwardSm100:
         )
         sfq_layout = cute.make_layout(sfq_shape_extended, stride=sfq_stride_extended)
         mSFQ = cute.make_tensor(mSFQ.iterator, sfq_layout)
-        
+
         tma_atom_sfq, tma_tensor_sfq = make_tiled_tma_atom_A(
             sfq_op,
             mSFQ,
@@ -897,6 +898,11 @@ class FlashAttentionForwardSm100:
                 cute.struct.MemRange[self.k_dtype, cute.cosize(sK_layout)],
                 self.buffer_align_bytes,
             ]
+            reuse_kv = self.v_dtype == self.k_dtype
+            sV: cute.struct.Align[
+                cute.struct.MemRange[self.v_dtype, cute.cosize(sV_layout)] if not const_expr(reuse_kv) else cute.struct.MemRange[self.k_dtype, 0],
+                self.buffer_align_bytes if not const_expr(reuse_kv) else 0,
+            ]
             # Scale factor shared memory (if block-scaled quantization is used)
             sSFQ: cute.struct.Align[
                 cute.struct.MemRange[cutlass.Uint8, sfq_smem_size],
@@ -923,6 +929,7 @@ class FlashAttentionForwardSm100:
         sO_bytes = cute.size_in_bytes(self.o_dtype, sO_layout) if const_expr(not self.overlap_sO_sQ) else 0
         sQ_bytes = cute.size_in_bytes(self.q_dtype, sQ_layout)
         sK_bytes = cute.size_in_bytes(self.k_dtype, sK_layout)
+        sV_bytes = cute.size_in_bytes(self.v_dtype, sV_layout)
         sfq_bytes = cute.size_in_bytes(cutlass.Uint8, sfq_smem_layout_staged)
         sfk_bytes = cute.size_in_bytes(cutlass.Uint8, sfk_smem_layout_staged)
         sfp_bytes = cute.size_in_bytes(cutlass.Uint8, sfp_smem_layout_staged) if const_expr(sfp_smem_layout_staged is not None) else 0
@@ -930,6 +937,8 @@ class FlashAttentionForwardSm100:
         print(f"sO_size: {sO_bytes / 1024:.2f} KB")
         print(f"sQ_size: {sQ_bytes / 1024:.2f} KB")
         print(f"sK_size: {sK_bytes / 1024:.2f} KB")
+        if const_expr(self.v_dtype != self.k_dtype):
+            print(f"sV_size: {sV_bytes / 1024:.2f} KB")
         print(f"sfq_smem_size: {sfq_bytes / 1024:.2f} KB")
         print(f"sfk_smem_size: {sfk_bytes / 1024:.2f} KB")
         print(f"sfp_smem_size: {sfp_bytes / 1024:.2f} KB")
@@ -1184,7 +1193,11 @@ class FlashAttentionForwardSm100:
         sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
         # (MMA, MMA_K, MMA_D, PIPE)
         # Strip swizzle info to reuse smem
-        sV = cute.make_tensor(cute.recast_ptr(sK.iterator, sV_layout.inner), sV_layout.outer)
+        if const_expr(self.v_dtype == self.k_dtype):
+            sV = cute.make_tensor(cute.recast_ptr(sK.iterator, sV_layout.inner), sV_layout.outer)
+        else:
+            sV = storage.sV.get_tensor(sV_layout.outer, swizzle=sV_layout.inner)
+            
         if const_expr(not self.overlap_sO_sQ):
             sO = storage.sO.get_tensor(sO_layout.outer, swizzle=sO_layout.inner)
         else:
@@ -1267,7 +1280,7 @@ class FlashAttentionForwardSm100:
         
         # Setup SFP and SFV TMEM tensors
         # Reuse the TMEM of S
-        sfp_tmem_ptrs = [cute.make_ptr(self.sf_dtype, self.tmem_s_offset[stage], mem_space=cute.AddressSpace.tmem, assumed_align=align) for stage in range(2)]
+        sfp_tmem_ptrs = [cute.make_ptr(self.sf_dtype, self.tmem_s_offset[stage], mem_space=cute.AddressSpace.tmem, assumed_align=align) for stage in range(self.q_stage)]
         # (MMA, MMA_M, MMA_K) 
         tCtSFP_layout = blockscaled_utils.make_tmem_layout_sfa(
             tiled_mma_pv,
@@ -1275,10 +1288,10 @@ class FlashAttentionForwardSm100:
             self.sf_vec_size,
             cute.slice_(sfp_smem_layout_staged, (None, None, None, 0)),
         ) if const_expr(sfp_smem_layout_staged is not None) else None
-        tCtSFPs = [cute.make_tensor(sfp_tmem_ptrs[stage], tCtSFP_layout) for stage in range(2)] if const_expr(sfp_smem_layout_staged is not None) else [None, None]
+        tCtSFPs = [cute.make_tensor(sfp_tmem_ptrs[stage], tCtSFP_layout) for stage in range(self.q_stage)] if const_expr(sfp_smem_layout_staged is not None) else [None] * self.q_stage
         
         # Make SFV tmem tensor
-        sfv_tmem_ptrs = [sfp_tmem_ptrs[stage] + tcgen05.find_tmem_tensor_col_offset(tCtSFPs[stage]) for stage in range(2)] if const_expr(sfp_smem_layout_staged is not None) else [None, None]
+        sfv_tmem_ptrs = [sfp_tmem_ptrs[stage] + tcgen05.find_tmem_tensor_col_offset(tCtSFPs[stage]) for stage in range(self.q_stage)] if const_expr(sfp_smem_layout_staged is not None) else [None] * self.q_stage
         # (MMA, MMA_N, MMA_K) for P*V operation (V is the B matrix)
         tCtSFV_layout = blockscaled_utils.make_tmem_layout_sfb(
             tiled_mma_pv,
@@ -1286,7 +1299,7 @@ class FlashAttentionForwardSm100:
             self.sf_vec_size,
             cute.slice_(sfv_smem_layout_staged, (None, None, None, 0)),
         ) if const_expr(sfv_smem_layout_staged is not None) else None
-        tCtSFVs = [cute.make_tensor(sfv_tmem_ptrs[stage], tCtSFV_layout) for stage in range(2)] if const_expr(sfv_smem_layout_staged is not None) else [None, None]
+        tCtSFVs = [cute.make_tensor(sfv_tmem_ptrs[stage], tCtSFV_layout) for stage in range(self.q_stage)] if const_expr(sfv_smem_layout_staged is not None) else [None] * self.q_stage
 
         block_info = BlockInfo(
             # This is cta_tiler, not mma_tiler_qk, since we move by block by (2 * mma_tiler[0], mma_tiler[1])
@@ -1928,7 +1941,7 @@ class FlashAttentionForwardSm100:
                         sK_cur = self.offset_kv_smem(
                             sK_cur, mma_kv_consumer_state.index, mma_kv_consumer_state.phase
                         )
-                    
+
                     gemm_Si[stage](
                         tCrB=tSrKi,  # tCrB
                         sB=sK_cur,  # sB

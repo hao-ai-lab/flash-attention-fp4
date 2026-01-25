@@ -41,7 +41,7 @@ def flops(batch, nheads, seqlen_q, seqlen_k, headdim, headdim_v, causal=False, w
 def cvt_sf_MKL_to_M32x4xrm_K4xrk_L(
     sf_ref_tensor: cute.Tensor,
     sf_mma_tensor: cute.Tensor,
-    atom_k: int,
+    atom_k: cute.Int32,
 ):
     """Convert scale factor tensor from MKL layout to mma specification M(32x4xrest_m)xK(4xrest_k)x(nheads,batch) layout"""
     # sf_ref_tensor has shape (mn, sf_k, batch, nheads) after permute
@@ -91,9 +91,7 @@ def create_scale_factor_tensor(batch, seqlen, nheads, headdim, sf_vec_size, sf_d
     ref_shape = (batch, nheads, mn, sf_k)
     
     atom_m = (32, 4)
-    # atom_k = 4
-    # NOTE (Wenxuan): atom_k = mma_tile_inst_k
-    atom_k = headdim_v * q_dtype.width // 256
+    atom_k = 4
     # mma_shape keeps batch and nheads separate: (batch, nheads, rest_m, rest_k, 32, 4, 4)
     # This allows indexing batch and head separately in the kernel like mQ
     mma_shape = (
