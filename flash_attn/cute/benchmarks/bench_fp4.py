@@ -398,13 +398,19 @@ def main(ab_dtype, sf_dtype, sf_vec_size, quant_v=False):
                 desc=desc_str
             )
             print(f'FP4 Attention fwd: {m_fp4.mean * 1e3:.3f}ms, {(nFLOPS / m_fp4.mean * 1e-12):.1f} TFLOPS')
+            # fp4_out = flash_attn_func_python(
+            #     q_fp4, k_fp4, v_tensor,
+            #     causal=causal,
+            #     window_size=window_size,
+            #     mSFQ=q_sf,
+            #     mSFK=k_sf,
+            #     mSFV=v_sf,
+            # )
             fp4_out = flash_attn_func_python(
-                q_fp4, k_fp4, v_tensor,
+                q_ref.to(torch.bfloat16), k_ref.to(torch.bfloat16), v_ref.to(torch.bfloat16),
                 causal=causal,
                 window_size=window_size,
-                mSFQ=q_sf,
-                mSFK=k_sf,
-                mSFV=v_sf,
+                force_fp4_impl=True,
             )
         except Exception as e:
             print(f"FP4 attention failed: {e}")
