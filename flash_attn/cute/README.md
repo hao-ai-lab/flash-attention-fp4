@@ -40,6 +40,8 @@ This should show your local path (e.g., `/sgl-workspace/cutlass/examples/python/
 cd examples/python/CuTeDSL/blackwell/flash-attention/flash_attn/cute
 CUTE_DSL_ENABLE_TVM_FFI=1 python benchmarks/bench_fp4.py
 ```
+## Current pipeline graph
+![pipeline graph](figures/pipeline.png)
 
 ## Changes to merge from FA4 main branch
 
