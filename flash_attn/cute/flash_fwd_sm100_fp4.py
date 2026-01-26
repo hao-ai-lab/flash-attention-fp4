@@ -2509,7 +2509,7 @@ class FlashAttentionForwardSm100:
             )
         tSrP_r2t_f32 = cute.make_fragment(thr_tmem_store.partition_S(tScP).shape, Float32)
         tSrP_r2t = cute.make_tensor(
-            cute.recast_ptr(tSrP_r2t_f32.iterator, dtype=self.q_dtype),
+            cute.recast_ptr(tSrP_r2t_f32.iterator, dtype=self.v_dtype),
             tSrS_t2r.layout,
         )
         # softmax.scale_apply_exp2_convert(tSrS_t2r, row_max, tSrP_r2t)
