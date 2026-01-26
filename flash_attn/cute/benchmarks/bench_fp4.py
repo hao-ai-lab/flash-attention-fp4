@@ -21,6 +21,54 @@ from triton.testing import do_bench
 
 Timing = NamedTuple('timing', [('mean', float)])
 
+def check_tensor_for_nans(tensor, name="tensor"):
+    """Check a tensor (CuTe or PyTorch) for NaN values.
+    
+    Note: If you have a CuTe tensor created via cute_tensor_like, use the returned
+    torch tensor directly instead of the CuTe tensor for checking.
+    """
+    # If it's already a torch tensor, use it directly
+    if isinstance(tensor, torch.Tensor):
+        torch_tensor = tensor
+    else:
+        # Try to convert CuTe tensor to PyTorch using DLPack
+        # CuTe tensors created from torch tensors store the DLPack capsule in _dlpack_data
+        try:
+            if hasattr(tensor, '_dlpack_data'):
+                # Use torch.from_dlpack to convert the DLPack capsule back to torch tensor
+                torch_tensor = torch.from_dlpack(tensor._dlpack_data)
+            else:
+                print(f"Warning: {name} is a CuTe tensor but cannot access DLPack data. "
+                      "If created with cute_tensor_like, use the returned torch tensor instead.")
+                raise ValueError(f"Tensor {name} is a CuTe tensor but cannot access DLPack data!")
+        except Exception as e:
+            print(f"Warning: Could not convert {name} to PyTorch tensor: {e}")
+            raise ValueError(f"Could not convert {name} to PyTorch tensor: {e}")
+    
+    has_nan = torch.isnan(torch_tensor).any().item()
+    has_inf = torch.isinf(torch_tensor).any().item()
+    
+    if has_nan:
+        nan_count = torch.isnan(torch_tensor).sum().item()
+        print(f"ERROR: {name} contains {nan_count} NaN values!")
+        print(f"  Shape: {torch_tensor.shape}")
+        print(f"  Dtype: {torch_tensor.dtype}")
+        if torch_tensor.numel() > 0:
+            finite_mask = torch.isfinite(torch_tensor)
+            if finite_mask.any():
+                print(f"  Finite values - Min: {torch_tensor[finite_mask].min().item():.6f}, "
+                      f"Max: {torch_tensor[finite_mask].max().item():.6f}")
+        raise ValueError(f"Tensor {name} contains NaN values!")
+    
+    if has_inf:
+        inf_count = torch.isinf(torch_tensor).sum().item()
+        print(f"WARNING: {name} contains {inf_count} Inf values!")
+        print(f"  Shape: {torch_tensor.shape}")
+        print(f"  Dtype: {torch_tensor.dtype}")
+        raise ValueError(f"Tensor {name} contains Inf values!")
+    
+    return torch_tensor
+
 
 def flops(batch, nheads, seqlen_q, seqlen_k, headdim, headdim_v, causal=False, window_size=(None, None)):
     """Calculate FLOPS for attention computation."""
@@ -173,6 +221,8 @@ def create_scale_factor_tensor(batch, seqlen, nheads, headdim, sf_vec_size, sf_d
         sf_dtype,
         is_dynamic_layout=True,
     )
+    
+    
     return ref_f32_torch_tensor_cpu, cute_tensor, cute_torch_tensor
 
 
@@ -367,6 +417,11 @@ def main(ab_dtype, sf_dtype, sf_vec_size, quant_v=False):
                 headdim, headdim_v, device, dtype_gen, quant_v=quant_v, return_torch=False,
                 ab_dtype=ab_dtype, sf_dtype=sf_dtype, sf_vec_size=sf_vec_size
             )
+            q_sf_torch = check_tensor_for_nans(q_sf, name="q_sf")
+            k_sf_torch = check_tensor_for_nans(k_sf, name="k_sf")
+            if quant_v:
+                v_sf_torch = check_tensor_for_nans(v_sf, name="v_sf")
+
         except Exception as e:
             print(f"Failed to create FP4 tensors: {e}")
             import traceback
@@ -398,20 +453,20 @@ def main(ab_dtype, sf_dtype, sf_vec_size, quant_v=False):
                 desc=desc_str
             )
             print(f'FP4 Attention fwd: {m_fp4.mean * 1e3:.3f}ms, {(nFLOPS / m_fp4.mean * 1e-12):.1f} TFLOPS')
-            # fp4_out = flash_attn_func_python(
-            #     q_fp4, k_fp4, v_tensor,
-            #     causal=causal,
-            #     window_size=window_size,
-            #     mSFQ=q_sf,
-            #     mSFK=k_sf,
-            #     mSFV=v_sf,
-            # )
             fp4_out = flash_attn_func_python(
-                q_ref.to(torch.bfloat16), k_ref.to(torch.bfloat16), v_ref.to(torch.bfloat16),
+                q_fp4, k_fp4, v_tensor,
                 causal=causal,
                 window_size=window_size,
-                force_fp4_impl=True,
+                mSFQ=q_sf,
+                mSFK=k_sf,
+                mSFV=v_sf,
             )
+            # fp4_out = flash_attn_func_python(
+            #     q_ref.to(torch.bfloat16), k_ref.to(torch.bfloat16), v_ref.to(torch.bfloat16),
+            #     causal=causal,
+            #     window_size=window_size,
+            #     force_fp4_impl=True,
+            # )
         except Exception as e:
             print(f"FP4 attention failed: {e}")
             import traceback
