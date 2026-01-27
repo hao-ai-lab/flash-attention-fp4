@@ -1934,8 +1934,8 @@ class FlashAttentionForwardSm100:
             # for i in cutlass.range_constexpr(cute.size(tCrSFQs0_t2r.shape[0])):
                 # cute.printf("tCrSFQs0_t2r[{}]: {}", i, tCrSFQs0_t2r[i, None, None, None])
         # breakpoint()
-        if tidx == 0:
-            cute.print_tensor(tCrSFQs0_t2r.load().to(Float32))
+        # if tidx == 0:
+            # cute.print_tensor(tCrSFQs0_t2r.load().to(Float32))
         
         # Copy sSFQ from smem to reg fragment for debugging
         if const_expr(self.quant_qk) and sSFQ is not None and tiled_copy_s2t_sfq is not None:
