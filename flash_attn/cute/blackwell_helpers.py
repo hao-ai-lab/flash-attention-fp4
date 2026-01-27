@@ -634,7 +634,6 @@ def gemm_ptx_partial_fp4(
     offset_b_diff = [offset_b[k] - offset_b[k - 1] for k in range(1, cute.size(tCrB.shape[2]))]
     offset_sfa = [cute.crd2idx((0, 0, k), tScaleA.layout) for k in range(cute.size(tCrA.shape[2]))]
     offset_sfb = [cute.crd2idx((0, 0, k), tScaleB.layout) for k in range(cute.size(tCrB.shape[2]))]
-
     if const_expr(not is_ts):
         smem_desc_start_a_lo = Int32(
             smem_desc_base_a_lo | sm100_desc.make_smem_desc_start_addr(sA[None, None, 0].iterator)
