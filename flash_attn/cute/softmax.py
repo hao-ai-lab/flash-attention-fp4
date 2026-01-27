@@ -1,5 +1,6 @@
 # Copyright (c) 2025, Tri Dao.
 
+from typing import Optional
 import math
 import operator
 from typing import Tuple
@@ -159,17 +160,24 @@ class Softmax(ParamsBase):
 @dataclass
 class SoftmaxSm100(Softmax):
     rescale_threshold: cutlass.Constexpr[float] = 0.0
+    compute_sp1: cutlass.Constexpr[bool] = False
+    sp1_scale: Float32 | None = None
 
     @staticmethod
     def create(
         scale_log2: Float32,
         rescale_threshold: cutlass.Constexpr[float] = 0.0,
         softmax_scale: Float32 | None = None,
+        compute_sp1: cutlass.Constexpr[bool] = False,
     ):
         num_rows = 1
         arch = 100
         row_max = cute.make_fragment(num_rows, Float32)
         row_sum = cute.make_fragment(num_rows, Float32)
+        sp1_scale = None
+        if cutlass.const_expr(compute_sp1):
+            sp1_scale= Float32(1.0 / (6 * 448))
+
         return SoftmaxSm100(
             scale_log2,
             num_rows,
@@ -178,6 +186,8 @@ class SoftmaxSm100(Softmax):
             arch,
             softmax_scale,
             rescale_threshold=rescale_threshold,
+            compute_sp1=compute_sp1,
+            sp1_scale=sp1_scale,
         )
 
     @cute.jit
@@ -261,9 +271,67 @@ class SoftmaxSm100(Softmax):
                         acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = utils.ex2_emulation_2(
                             acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j]
                         )
-            acc_S_row_converted_frg[None, j].store(
-                acc_S_row_frg[None, j].load().to(acc_S_row_converted.element_type)
-            )
+            if cutlass.const_expr(acc_S_row_converted is not None):
+                acc_S_row_converted_frg[None, j].store(
+                    acc_S_row_frg[None, j].load().to(acc_S_row_converted.element_type)
+                )
+
+            
+    @cute.jit
+    def apply_quant(
+        self,
+        tSrP_f32: cute.Tensor,
+        tSrP: cute.Tensor,
+        tSrPSF: cute.Tensor,
+        sf_vec_size: cutlass.Constexpr[int] = 16,
+    ):
+        tSrP_frag = cute.logical_divide(tSrP, cute.make_layout(sf_vec_size))
+        tSrP_f32_frag = cute.logical_divide(tSrP_f32, cute.make_layout(sf_vec_size))
+        tSrPSF_f32 = cute.make_rmem_tensor(tSrPSF.layout, cute.Float32)
+        tSrPSF_u32_view = cute.recast_tensor(tSrPSF, cute.Int32)
+
+        for i in cutlass.range_constexpr(0, cute.size(tSrP_f32_frag, mode=[1])):
+            max_val = self._compute_row_max(tSrP_f32_frag[None, i].load())
+            tSrPSF_f32[i] = max_val / 6
+            tSrP_f32_frag.store(tSrP_f32_frag.load() / tSrPSF_f32[i])
+            
+        # Process in groups of 4 for UE4M3 conversion
+        for i in cutlass.range_constexpr(0, cute.size(tSrPSF_f32)):
+            if i + 3 < cute.size(tSrPSF_f32):
+                # Pack 4 FP32 values into UE4M3 format
+                packed_ue4m3 = packed_float_to_ue4m3(
+                    tSrPSF_f32[i],
+                    tSrPSF_f32[i + 1], 
+                    tSrPSF_f32[i + 2],
+                    tSrPSF_f32[i + 3]
+                )
+                tSrPSF_u32_view[i // 4] = packed_ue4m3
+        
+        # Quantize main tensor to E2M1 format (8 values per uint32_t)
+        # Process in groups of 8 for E2M1 conversion
+        for i in cutlass.range_constexpr(0, cute.size(tSrP_frag, mode=[1])):
+            tSrP_u32_view = cute.recast_tensor(tSrP_frag[None, i], cute.Int32)
+            for k in cutlass.range_constexpr(0, cute.size(tSrP_u32_view, mode=[0])):
+                packed_e2m1 = packed_float_to_e2m1(
+                    tSrP_f32_frag[k * 8, i],
+                    tSrP_f32_frag[k * 8 + 1, i],
+                    tSrP_f32_frag[k * 8 + 2, i],
+                    tSrP_f32_frag[k * 8 + 3, i],
+                    tSrP_f32_frag[k * 8 + 4, i],
+                    tSrP_f32_frag[k * 8 + 5, i],
+                    tSrP_f32_frag[k * 8 + 6, i],
+                    tSrP_f32_frag[k * 8 + 7, i]
+                )
+                tSrP_u32_view[k, i] = packed_e2m1
+
+    @cute.jit
+    def apply_sage_sp1(self, P_row: cute.Tensor):
+        row_max = self._compute_row_max(P_row.load())
+        sp1 = row_max * self.sp1_scale
+        inv_sp1 = 1.0 / sp1
+        P_row.store(P_row.load() * inv_sp1)
+        return sp1
+    
 
     @cute.jit
     def scale_apply_exp2_convert(

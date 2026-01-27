@@ -108,7 +108,6 @@ class FlashAttentionForwardSm100:
         self.n_block_size = n_block_size
         self.q_stage = 2 if not is_split_kv else 1
         assert self.q_stage in [1, 2]
-    
         # 2 Q tile per CTA
         self.cta_tiler = (self.q_stage * m_block_size, n_block_size, self.head_dim_padded)
         self.mma_tiler_qk = (m_block_size, n_block_size, self.head_dim_padded)
@@ -640,27 +639,10 @@ class FlashAttentionForwardSm100:
         tma_tensor_sfv = None
         # Setup TMA load for SFQ
         if const_expr(self.quant_qk):
+            sfq_layout = cute.tile_to_shape(blockscaled_utils.BlockScaledBasicChunk(self.sf_vec_size).layout, mQ_shape, (2, 1, 3, 4))
             sfq_op = sm100_utils_basic.cluster_shape_to_tma_atom_A(
                 self.cluster_shape_mn, tiled_mma_qk.thr_id
             )
-            # Setup scale factor tensor gmem layout 
-            # ((Atom_M, Rest_M),(Atom_K, Rest_K), RestL)
-            sfq_layout = blockscaled_utils.tile_atom_to_shape_SF(mQ_shape[:3], self.sf_vec_size)
-            # Extend layout to include batch dimension
-            # Base layout has shape ((Atom_M, Rest_M), (Atom_K, Rest_K), RestL), where RestL = nheads
-            # We need to add batch dimension: ((Atom_M, Rest_M), (Atom_K, Rest_K), RestL, batch)
-            # See scale factor layouts in https://docs.nvidia.com/cutlass/latest/media/docs/cpp/blackwell_functionality.html#scale-factor-layouts
-            sfq_shape_extended = (
-                *sfq_layout.shape,
-                mQ_shape[3],  # batch dimension
-            )
-            # Calculate batch stride: total size of first 3 dimensions
-            sfq_size_base = cute.size(sfq_layout)
-            sfq_stride_extended = (
-                *sfq_layout.stride,
-                sfq_size_base,  # batch stride
-            )
-            sfq_layout = cute.make_layout(sfq_shape_extended, stride=sfq_stride_extended)
             mSFQ = cute.make_tensor(mSFQ.iterator, sfq_layout)
 
             tma_atom_sfq, tma_tensor_sfq = make_tiled_tma_atom_A(
@@ -678,20 +660,8 @@ class FlashAttentionForwardSm100:
                 self.cluster_shape_mn, tiled_mma_qk.thr_id
             )
 
-            # Setup scale factor tensor layout
-            sfk_layout = blockscaled_utils.tile_atom_to_shape_SF(mK_shape[:3], self.sf_vec_size)
-            # Extend layout to include batch dimension if present (like SFQ)
-            if const_expr(cute.rank(mK) == 4):
-                sfk_shape_extended = (
-                    *sfk_layout.shape,
-                    mK_shape[3],  # batch dimension
-                )
-                sfk_size_base = cute.size(sfk_layout)
-                sfk_stride_extended = (
-                    *sfk_layout.stride,
-                    sfk_size_base,  # batch stride
-                )
-                sfk_layout = cute.make_layout(sfk_shape_extended, stride=sfk_stride_extended)
+        if const_expr(self.quant_qk):
+            sfk_layout = cute.tile_to_shape(blockscaled_utils.BlockScaledBasicChunk(self.sf_vec_size).layout, mK_shape, (2, 1, 3, 4))
             mSFK = cute.make_tensor(mSFK.iterator, sfk_layout)
 
             # For SFB, compute mma_inst_shape_mnk_sfb: (M // (2 if use_2cta_instrs else 1), round_up(N, 128), K)
@@ -928,19 +898,19 @@ class FlashAttentionForwardSm100:
             ]
             # Scale factor shared memory (if block-scaled quantization is used)
             sSFQ: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Uint8, sfq_smem_size],
+                cute.struct.MemRange[cute.Float8E4M3FN, sfq_smem_size],
                 self.buffer_align_bytes,
             ]
             sSFK: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Uint8, sfk_smem_size],
+                cute.struct.MemRange[cute.Float8E4M3FN, sfk_smem_size],
                 self.buffer_align_bytes,
             ]
             sSFP: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Uint8, sfp_smem_size],
+                cute.struct.MemRange[cute.Float8E4M3FN, sfp_smem_size],
                 self.buffer_align_bytes,
             ]
             sSFV: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Uint8, sfv_smem_size],
+                cute.struct.MemRange[cute.Float8E4M3FN, sfv_smem_size],
                 self.buffer_align_bytes,
             ]
 
@@ -2247,12 +2217,12 @@ class FlashAttentionForwardSm100:
         mma_si_consumer_phase = Int32(0)
         si_corr_producer_phase = Int32(1)
         s0_s1_sequence_phase = Int32(1 if stage == 0 else 0)
-
+        
         # self.warp_scheduler_barrier_init()
 
         warp_idx_in_wg = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
         mbar_s0_s1_sequence_offset = self.mbar_s0_s1_sequence_offset + warp_idx_in_wg
-
+        
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
@@ -2290,7 +2260,9 @@ class FlashAttentionForwardSm100:
             softmax = SoftmaxSm100.create(
                 softmax_scale_log2,
                 rescale_threshold=8.0 if const_expr(self.q_dtype.width == 16) else 0.0, # (Wenxuan) disable skipping rescale until FP4 precision is verified
+                # rescale_threshold=8.0 if const_expr(self.v_dtype.width == 16) else 0.0, # (Wenxuan) disable skipping rescale until FP4 precision is verified
                 softmax_scale=softmax_scale,
+                compute_sp1=const_expr(self.v_dtype == cute.Float4E2M1FN),
             )
             softmax.reset()
 
@@ -2549,13 +2521,27 @@ class FlashAttentionForwardSm100:
             cute.recast_ptr(tSrP_r2t_f32.iterator, dtype=self.v_dtype),
             tSrS_t2r.layout,
         )
-        # softmax.scale_apply_exp2_convert(tSrS_t2r, row_max, tSrP_r2t)
-        softmax.apply_exp2_convert(
-            tSrS_t2r,
-            tSrP_r2t,
-            e2e=mask_fn is None and self.head_dim_padded <= 128,
-            e2e_freq=self.e2e_freq,
-        )
+        if const_expr(self.v_dtype == cute.Float4E2M1FN):
+            # Apply NVFP4 quant for P
+            softmax.apply_exp2(
+                tSrS_t2r, 
+                e2e=mask_fn is None and self.head_dim_padded <= 128,
+                e2e_freq=self.e2e_freq,
+            )
+            sp1 = softmax.apply_sage_sp1(tSrS_t2r)
+            sf_vec_size = 16
+            sf_layout = cute.make_layout((cute.cosize(tSrS_t2r.layout) // sf_vec_size,))
+            tSrP_SF = cute.make_rmem_tensor(sf_layout, cute.Float8E4M3FN)
+            # softmax.apply_quant(tSrS_t2r, tSrP_r2t, tSrP_SF)
+            # TODO: copy tSrP_SF to tmem
+        else:
+            # softmax.scale_apply_exp2_convert(tSrS_t2r, row_max, tSrP_r2t)
+            softmax.apply_exp2_convert(
+                tSrS_t2r,
+                tSrP_r2t,
+                e2e=mask_fn is None and self.head_dim_padded <= 128,
+                e2e_freq=self.e2e_freq,
+            )
         # Sequence barrier arrive
         if const_expr(self.s0_s1_barrier):
             cute.arch.mbarrier_arrive(mbar_ptr + mbar_s0_s1_sequence_offset + (1 - stage) * 4)

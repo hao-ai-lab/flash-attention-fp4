@@ -6,6 +6,7 @@ import cutlass.cute as cute
 from cutlass import Int32, Boolean, const_expr, Float32
 from cutlass.cute.nvgpu import tcgen05
 from cutlass._mlir.dialects import llvm
+from cutlass.cutlass_dsl import T
 
 import flash_attn.cute.mma_sm100_desc as sm100_desc
 from flash_attn.cute.utils import parse_swizzle_from_pointer
