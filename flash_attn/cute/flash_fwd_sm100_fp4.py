@@ -1938,26 +1938,19 @@ class FlashAttentionForwardSm100:
             # cute.print_tensor(tCrSFQs0_t2r.load().to(Float32))
         
         # Copy sSFQ from smem to reg fragment for debugging
-        if const_expr(self.quant_qk) and sSFQ is not None and tiled_copy_s2t_sfq is not None:
+        if const_expr(self.quant_qk) and sSFQ is not None:
             # Filter zeros to get compact layout and get stage 0
             sSFQ_compact = cute.filter_zeros(sSFQ[None, None, 0, 0])
-            # Create a copy atom for smem to rmem
-            smem_copy_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), Float8E4M3FN)
-            # Create tiled copy for smem to rmem using the s2t tiled copy as reference
-            tiled_copy_s2r_sfq = cute.make_tiled_copy_S(smem_copy_atom, tiled_copy_s2t_sfq)
-            # Get thread slice
-            thr_smem_copy = tiled_copy_s2r_sfq.get_slice(tidx)
-            # Partition smem source for this thread
-            tSsSFQ = thr_smem_copy.partition_S(sSFQ_compact)
+            sSFQ_slice = sSFQ_compact[1, None]
             # Create register fragment with matching shape
-            tSrSFQ_shape = thr_smem_copy.partition_D(sSFQ_compact).shape
-            tSrSFQ = cute.make_fragment(tSrSFQ_shape, Float8E4M3FN)
-            # Copy from smem to rmem
-            cute.copy(tiled_copy_s2r_sfq, tSsSFQ, tSrSFQ)
+            tSrSFQ = cute.make_fragment_like(sSFQ_slice, Float8E4M3FN)
+            # Copy from smem to rmem using autovec_copy
+            cute.autovec_copy(sSFQ_slice, tSrSFQ)
+            tSrSFQ_f32 = cute.make_fragment_like(tSrSFQ, Float32)
             # Print to check for NaN
             if tidx == 0:
-                cute.printf("sSFQ (smem) values:\n")
-                cute.print_tensor(tSrSFQ.load().to(Float32))
+                tSrSFQ_f32.store(tSrSFQ_f32.load())
+                cute.print_tensor(tSrSFQ_f32)
 
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
