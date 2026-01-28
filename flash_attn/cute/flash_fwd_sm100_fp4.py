@@ -284,6 +284,7 @@ class FlashAttentionForwardSm100:
         mSFQ: Optional[cute.Tensor] = None,  # Scale factor for Q
         mSFK: Optional[cute.Tensor] = None,  # Scale factor for K
         mSFV: Optional[cute.Tensor] = None,  # Scale factor for V
+        compute_sp1: cutlass.Constexpr[bool] = False,
         
     ):
         """Execute the Fused Multi-Head Attention operation on the provided tensors.
@@ -304,6 +305,7 @@ class FlashAttentionForwardSm100:
         self.k_dtype = mK.element_type
         self.v_dtype = mV.element_type
         self.o_dtype = mO.element_type
+        self.compute_sp1 = const_expr(compute_sp1)
         if const_expr(mSFQ is None):
             assert self.q_dtype.width >= 8
             assert const_expr(mSFK is None), "Must provide both QK sfs or None"
@@ -591,8 +593,8 @@ class FlashAttentionForwardSm100:
         if const_expr(self.quant_qk):
             self.tma_copy_bytes["Q"] += cute.size_in_bytes(mSFQ.element_type, cute.select(sfq_smem_layout_staged, mode=[0, 1, 2]))
             self.tma_copy_bytes["K"] += cute.size_in_bytes(mSFK.element_type, cute.select(sfk_smem_layout_staged, mode=[0, 1, 2]))
-        if const_expr(self.quant_pv):
-            self.tma_copy_bytes["V"] += cute.size_in_bytes(mSFV.element_type, cute.select(sfv_smem_layout_staged, mode=[0, 1, 2]))
+        # if const_expr(self.quant_pv):
+        #     self.tma_copy_bytes["V"] += cute.size_in_bytes(mSFV.element_type, cute.select(sfv_smem_layout_staged, mode=[0, 1, 2]))
 
         # TMA load for Q
         tma_load_op = cpasync.CopyBulkTensorTileG2SOp(self.cta_group)
@@ -712,21 +714,8 @@ class FlashAttentionForwardSm100:
             sfv_op = sm100_utils_basic.cluster_shape_to_tma_atom_SFB(
                 self.cluster_shape_mn, tiled_mma_pv.thr_id
             )
-            sfv_smem_layout = cute.select(sfv_smem_layout_staged, mode=[0, 1, 2])
             # Setup scale factor tensor layout
-            sfv_layout = blockscaled_utils.tile_atom_to_shape_SF(mV_shape[:3], self.sf_vec_size)
-            # Extend layout to include batch dimension if present (like SFK)
-            if const_expr(cute.rank(mV) == 4):
-                sfv_shape_extended = (
-                    *sfv_layout.shape,
-                    mV_shape[3],  # batch dimension
-                )
-                sfv_size_base = cute.size(sfv_layout)
-                sfv_stride_extended = (
-                    *sfv_layout.stride,
-                    sfv_size_base,  # batch stride
-                )
-                sfv_layout = cute.make_layout(sfv_shape_extended, stride=sfv_stride_extended)
+            sfv_layout = cute.tile_to_shape(blockscaled_utils.BlockScaledBasicChunk(self.sf_vec_size).layout, mV_shape, (2, 1, 3, 4))
             mSFV = cute.make_tensor(mSFV.iterator, sfv_layout)
             # For SFB, compute mma_inst_shape_mnk_sfb: (M // (2 if use_2cta_instrs else 1), round_up(N, 128), K)
             mma_inst_shape_mnk_pv = ( # the same processed by one tcgen05.mma instruction
@@ -1254,7 +1243,7 @@ class FlashAttentionForwardSm100:
 
         # sf_tmem_ptr = cute.make_ptr(self.sf_dtype, 0, mem_space=cute.AddressSpace.tmem, assumed_align=16)
 
-        align = 16 # required for tcgen05.cp
+        align = 16 # required for tcgen05.cp TODO: may be just 4, 4 * 32 = 128 bits
         tCtSFQs = [None] * self.q_stage
         tCtSFKs = [None] * self.q_stage
         if const_expr(self.quant_qk):
@@ -1424,8 +1413,11 @@ class FlashAttentionForwardSm100:
                 blocksparse_tensors,
                 sSFQ,
                 sSFK,
+                sSFV,
                 tCtSFQs,
                 tCtSFKs,
+                tCtSFPs,
+                tCtSFVs,
             )
 
             # if warp_idx == self.mma_warp_id:
@@ -1486,6 +1478,10 @@ class FlashAttentionForwardSm100:
 
             if const_expr(not self.s0_s1_barrier):
                 stage = Int32(0 if warp_idx < self.softmax1_warp_ids[0] else 1)
+                if const_expr(self.quant_pv):
+                    tCtSFP = tCtSFPs[0] if stage == 0 else tCtSFPs[1]
+                else:
+                    tCtSFP = None
                 softmax_loop(
                     stage=stage,
                     tStSi=cute.make_tensor(
@@ -1493,17 +1489,18 @@ class FlashAttentionForwardSm100:
                         + (self.tmem_s_offset[0] if stage == 0 else self.tmem_s_offset[1]),
                         tStS.layout,
                     ),
+                    tCtSFP=tCtSFP, # need to copy P sf to tmem after exp
                 )
                 cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_tmem_dealloc_offset)
             else:
                 # If there's s0_s1_barrier, it's faster to have 2 WGs having different code
                 if warp_idx < self.softmax1_warp_ids[0]:
                     tStSi = cute.make_tensor(tStS.iterator + self.tmem_s_offset[0], tStS.layout)
-                    softmax_loop(stage=0, tStSi=tStSi)
+                    softmax_loop(stage=0, tStSi=tStSi, tCtSFP=tCtSFPs[0])
                     cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_tmem_dealloc_offset)
                 if warp_idx < self.correction_warp_ids[0] and warp_idx >= self.softmax1_warp_ids[0]:
                     tStSi = cute.make_tensor(tStS.iterator + self.tmem_s_offset[1], tStS.layout)
-                    softmax_loop(stage=1, tStSi=tStSi)
+                    softmax_loop(stage=1, tStSi=tStSi, tCtSFP=tCtSFPs[1])
                     cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_tmem_dealloc_offset)
 
         # ///////////////////////////////////////////////////////////////////////////////
@@ -1686,7 +1683,7 @@ class FlashAttentionForwardSm100:
             
             # Partition SFV similar to V
             tVsSFV, tVgSFV = None, None
-            if const_expr(tma_atom_sfv is not None and tma_tensor_sfv is not None and sSFV is not None):
+            if const_expr(self.quant_pv):
                 if const_expr(mPageTable is None):
                     if const_expr(not seqlen.has_cu_seqlens_k):
                         tma_tensor_sfv_cur = tma_tensor_sfv[None, None, head_idx_kv, batch_idx]
@@ -1733,6 +1730,7 @@ class FlashAttentionForwardSm100:
                 tXgSF=tKgSFK,
                 tXsSF=tKsSFK,
             )
+
             load_V = partial(
                 self.load_KV,
                 tma_atom_V,
@@ -1743,9 +1741,9 @@ class FlashAttentionForwardSm100:
                 mbar_ptr + self.mbar_load_kv_full_offset,
                 mbar_ptr + self.mbar_load_kv_empty_offset,
                 K_or_V="V",
-                tma_atom_sf=tma_atom_sfv,
-                tXgSF=tVgSFV,
-                tXsSF=tVsSFV,
+                # tma_atom_sf=tma_atom_sfv,
+                # tXgSF=tVgSFV,
+                # tXsSF=tVsSFV,
             )
 
             if const_expr(not self.use_block_sparsity):
@@ -1827,9 +1825,12 @@ class FlashAttentionForwardSm100:
         # In smem
         sSFQ: Optional[cute.Tensor],
         sSFK: Optional[cute.Tensor],
+        sSFV: Optional[cute.Tensor],
         # In tmem - per-stage scale factors
         tCtSFQs: Tuple[cute.Tensor, ...],
         tCtSFKs: Tuple[cute.Tensor, ...],
+        tCtSFPs: Tuple[cute.Tensor, ...],
+        tCtSFVs: Tuple[cute.Tensor, ...],
     ):
         tSrQ = tiled_mma_qk.make_fragment_A(sQ)
         tSrK = tiled_mma_qk.make_fragment_B(sK)
@@ -1863,6 +1864,15 @@ class FlashAttentionForwardSm100:
             for stage in range(self.q_stage)
         ]
         gemm_Pi = [
+            partial(
+                sm100_utils.gemm_ptx_partial_fp4,
+                pv_mma_op,
+                self.tmem_o_offset[stage if self.q_stage == 2 else 0],
+                tOrPs[stage],
+                sA=None,
+                tScaleA=tCtSFPs[stage],
+                tScaleB=tCtSFVs[stage],
+            ) if const_expr(self.quant_pv) else
             partial(
                 sm100_utils.gemm_ptx_partial,
                 pv_mma_op,
@@ -1899,6 +1909,17 @@ class FlashAttentionForwardSm100:
             tCsSFQ_compact_s2t = None
             tiled_copy_s2t_sfk = None
             tCsSFK_compact_s2t = None
+
+        if const_expr(self.quant_pv):
+            tiled_copy_s2t_sfv_staged = [
+                self.mainloop_s2t_copy_and_partition(sSFV, tCtSFVs[stage])
+                for stage in range(self.q_stage)
+            ] 
+            tiled_copy_s2t_sfv, tCsSFV_compact_s2t, _ = tiled_copy_s2t_sfv_staged[0]
+        else:
+            tiled_copy_s2t_sfv_staged = []
+            tiled_copy_s2t_sfv = None
+            tCsSFV_compact_s2t = None
 
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
@@ -1956,7 +1977,7 @@ class FlashAttentionForwardSm100:
                     # are empty. For subsequent iterations, the wait happened at the end
                     # of the while loop.
                     
-                    # Copy SFQ (scale factor for Q, like SFA) - per Q stage
+                    # Copy SFQ 
                     # only tmem changes per q_stage.
                     if const_expr(self.quant_qk):
                         # wait for Si to be copied to reg
@@ -1994,8 +2015,6 @@ class FlashAttentionForwardSm100:
                     #     cute.copy(thr_tmem_load, tCtSFQs0_t2r, tCrSFQs0_t2r)
                     #     if tidx == 0:
                     #         cute.print_tensor(tCrSFQs0_t2r.load().to(Float32))
-                    
-
                     
                     # 3. gemm
                     # tiled_mma_qk = sm100_utils.gemm(tiled_mma_qk, tStSs[stage], tSrQs[stage], tSrKi, zero_init=True)
@@ -2042,10 +2061,20 @@ class FlashAttentionForwardSm100:
                             mbar_ptr + self.mbar_P_full_O_rescaled_offset + stage,
                             P_full_O_rescaled_phase,
                         )
-                        # NOTE: sfpv load doesn't need to wait because it depends on the same Si chunk as the prev qk mma
                         # 3. gemm
                         # sm100_utils.gemm(tiled_mma_pv, tOtO0, tOrP0, tOrVi, zero_init=True)
                         # gemm_Pi[stage](tCrB=tOrVi, sB=sV[None, None, None, Vi_index], zero_init=not O_should_accumulate)
+                        
+                        # No need for mbar.wait because it depends on the same Si as the prev qk mma
+                        if const_expr(self.quant_pv):
+                            _, _, tCtSFV_compact_s2t = tiled_copy_s2t_sfv_staged[stage]
+                            tCsSFV_compact_s2t_staged = tCsSFV_compact_s2t[None, None, None, None, Vi_index]
+                            cute.copy(
+                                tiled_copy_s2t_sfv,
+                                tCsSFV_compact_s2t_staged,
+                                tCtSFV_compact_s2t,
+                            )
+
                         sV_cur = sV[None, None, None, Vi_index]
                         if const_expr(self.uneven_kv_smem):
                             sV_cur = self.offset_kv_smem(sV_cur, Vi_index, Vi_phase)
@@ -2140,6 +2169,15 @@ class FlashAttentionForwardSm100:
                     # 3. gemm
                     # sm100_utils.gemm(tiled_mma_pv, tOtO0, tOrP0, tOrVi, zero_init=True)
                     # gemm_Pi[stage](tCrB=tOrVi, sB=sV[None, None, None, Vi_index], zero_init=not O_should_accumulate)
+
+                    if const_expr(self.quant_pv):
+                        _, _, tCtSFV_compact_s2t = tiled_copy_s2t_sfv_staged[stage]
+                        tCsSFV_compact_s2t_staged = tCsSFV_compact_s2t[None, None, None, None, Vi_index]
+                        cute.copy(
+                            tiled_copy_s2t_sfv,
+                            tCsSFV_compact_s2t_staged,
+                            tCtSFV_compact_s2t,
+                        )
                     sV_cur = sV[None, None, None, Vi_index]
                     if const_expr(self.uneven_kv_smem):
                         sV_cur = self.offset_kv_smem(sV_cur, Vi_index, Vi_phase)
@@ -2191,6 +2229,7 @@ class FlashAttentionForwardSm100:
         aux_tensors: Optional[list] = None,
         fastdiv_mods=(None, None),
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        tCtSFP: Optional[Tuple[cute.Tensor, ...]] = None,
     ):
         """Compute softmax on attention scores from QK matrix multiplication.
 
@@ -2293,6 +2332,8 @@ class FlashAttentionForwardSm100:
                 rescale_threshold=8.0 if const_expr(self.q_dtype.width == 16) else 0.0, # (Wenxuan) disable skipping rescale until FP4 precision is verified
                 # rescale_threshold=8.0 if const_expr(self.v_dtype.width == 16) else 0.0, # (Wenxuan) disable skipping rescale until FP4 precision is verified
                 softmax_scale=softmax_scale,
+                quant_pv=self.quant_pv,
+                compute_sp1=self.compute_sp1,
             )
             softmax.reset()
 
@@ -2324,6 +2365,7 @@ class FlashAttentionForwardSm100:
                 aux_tensors=aux_tensors,
                 fastdiv_mods=fastdiv_mods,
                 mask_fn=partial(mask_fn, mask_seqlen=False),
+                tCtSFP=tCtSFP,
             )
 
             if has_work:
@@ -2456,8 +2498,10 @@ class FlashAttentionForwardSm100:
         
     @cute.jit
     def _quant_fp4(self, 
+                   # src
                    tSrP_f32: cute.Tensor,
                    tSrPSF_f32: cute.Tensor,
+                   # dst
                    tSrP: cute.Tensor,
                    tSrPSF: cute.Tensor,
                    ):
@@ -2526,6 +2570,7 @@ class FlashAttentionForwardSm100:
         fastdiv_mods=(None, None),
         mask_fn: Optional[Callable] = None,
         is_first: bool = False,
+        tCtSFP: Optional[cute.Tensor] = None,
     ) -> Tuple[cute.Int32, cute.Int32, cute.Int32]:
         """Perform a single step of the softmax computation on a block of attention scores.
 
@@ -2620,6 +2665,7 @@ class FlashAttentionForwardSm100:
                 e2e_freq=self.e2e_freq,
             )
             self._quant_fp4(tSrS_t2r, tSrPSF_f32, tSrP_r2t, tSrPSF)
+            # TODO(wenxuan) tcgen05.st
         else:
             # softmax.scale_apply_exp2_convert(tSrS_t2r, row_max, tSrP_r2t)
             softmax.apply_exp2_convert(
@@ -3062,8 +3108,6 @@ class FlashAttentionForwardSm100:
             cute.arch.ProxyKind.async_shared,
             space=cute.arch.SharedSpace.shared_cta,
         )
-        # TODO(Wenxuan) insert tcgen05.wait and mbarrier_arrive here to unblock sfq,k, or put sfq,k after P tmem
-
         if const_expr(self.use_correction_warps_for_epi):
             assert(not self.use_tma_O)
             assert(gmem_tiled_copy_O is not None)

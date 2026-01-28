@@ -12,7 +12,7 @@ from cutlass import Float32
 
 import flash_attn.cute.utils as utils
 from flash_attn.cute.cute_dsl_utils import ParamsBase
-
+from cutlass import const_expr
 
 @dataclass
 class Softmax(ParamsBase):
@@ -162,13 +162,17 @@ class SoftmaxSm100(Softmax):
     rescale_threshold: cutlass.Constexpr[float] = 0.0
 
     fp8_scalexfp4_scale_log2: cutlass.Constexpr[float] = -11.392317422778762 # log2f(fp8_scalexfp4_scale=1.0 / (448 * 6))
-    fp4_scale_log2: cutlass.Constexpr[float] = -2.584962500721156 # log2f(fp4_scale=6)
+    fp4_scale_log2: cutlass.Constexpr[float] = -2.584962500721156 # log2f(fp4_scale=1 / 6)
+    quant_pv: cutlass.Constexpr[bool] = False
+    compute_sp1: cutlass.Constexpr[bool] = False
 
     @staticmethod
     def create(
         scale_log2: Float32,
         rescale_threshold: cutlass.Constexpr[float] = 0.0,
         softmax_scale: Float32 | None = None,
+        quant_pv: cutlass.Constexpr[bool] = False,
+        compute_sp1: cutlass.Constexpr[bool] = False,
     ):
         num_rows = 1
         arch = 100
@@ -183,6 +187,8 @@ class SoftmaxSm100(Softmax):
             arch,
             softmax_scale,
             rescale_threshold=rescale_threshold,
+            quant_pv=quant_pv,
+            compute_sp1=compute_sp1,
         )
 
     @cute.jit
@@ -231,8 +237,12 @@ class SoftmaxSm100(Softmax):
         acc_S_row_group_max: Optional[cute.Tensor] = None,
     ):
         assert cute.size(acc_S_row.shape) % 2 == 0, "acc_S_row must have an even number of elements"
-        bias = 0.0 if cutlass.const_expr(acc_S_row_group_max is None) else self.fp8_scalexfp4_scale_log2
-        row_max_scaled = row_max * self.scale_log2 + bias
+        
+        row_max_scaled = Float32(0.0)
+        if const_expr(self.compute_sp1) and const_expr(self.quant_pv):
+            row_max_scaled = row_max * self.scale_log2 + self.fp8_scalexfp4_scale_log2
+        else:
+            row_max_scaled = row_max * self.scale_log2
 
         for i in cutlass.range(0, cute.size(acc_S_row.shape), 2, unroll_full=True):
             acc_S_row[i], acc_S_row[i + 1] = utils.fma_packed_f32x2(
@@ -240,8 +250,10 @@ class SoftmaxSm100(Softmax):
                 (self.scale_log2, self.scale_log2),
                 (-row_max_scaled, -row_max_scaled),
             )
-        if cutlass.const_expr(acc_S_row_group_max is not None):
-            row_max_scaled -= self.fp4_scale_log2
+        
+        if const_expr(acc_S_row_group_max is not None):
+            if const_expr(self.compute_sp1) and const_expr(self.quant_pv):
+                row_max_scaled += self.fp4_scale_log2 # / 6 to scale to fp4 max
             for i in cutlass.range(0, cute.size(acc_S_row_group_max.shape), 2, unroll_full=True):
                 acc_S_row_group_max[i], acc_S_row_group_max[i + 1] = utils.fma_packed_f32x2(
                     (acc_S_row_group_max[i], acc_S_row_group_max[i + 1]),
