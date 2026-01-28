@@ -1252,56 +1252,62 @@ class FlashAttentionForwardSm100:
         # sf_tmem_ptr = cute.make_ptr(self.sf_dtype, 0, mem_space=cute.AddressSpace.tmem, assumed_align=16)
 
         align = 16 # required for tcgen05.cp
-        sfq_tmem_ptrs = [cute.make_ptr(self.sf_dtype, self.tmem_o_offset[self.q_stage - 1 - stage],
-                        mem_space=cute.AddressSpace.tmem, assumed_align=align) for stage in range(self.q_stage)
-                        ] # shuffle to minimize dependency
+        tCtSFQs = [None] * self.q_stage
+        tCtSFKs = [None] * self.q_stage
+        if const_expr(self.quant_qk):
+            sfq_tmem_ptrs = [cute.make_ptr(self.sf_dtype, self.tmem_o_offset[self.q_stage - 1 - stage],
+                            mem_space=cute.AddressSpace.tmem, assumed_align=align) for stage in range(self.q_stage)
+                            ] # shuffle to minimize dependency
 
-        # (MMA, MMA_M, MMA_K) 
-        tCtSFQ_layout = blockscaled_utils.make_tmem_layout_sfa(
-            tiled_mma_qk,
-            self.mma_tiler_qk,
-            self.sf_vec_size,
-            cute.slice_(sfq_smem_layout_staged, (None, None, None, 0)),
-        )
-        tCtSFQs = [cute.make_tensor(sfq_tmem_ptrs[stage], tCtSFQ_layout) for stage in range(self.q_stage)]
+            # (MMA, MMA_M, MMA_K) 
+            tCtSFQ_layout = blockscaled_utils.make_tmem_layout_sfa(
+                tiled_mma_qk,
+                self.mma_tiler_qk,
+                self.sf_vec_size,
+                cute.slice_(sfq_smem_layout_staged, (None, None, None, 0)),
+            )
+            tCtSFQs = [cute.make_tensor(sfq_tmem_ptrs[stage], tCtSFQ_layout) for stage in range(self.q_stage)]
 
-        # Make SFK tmem tensor 
-        sfq_offset = math.ceil(tcgen05.find_tmem_tensor_col_offset(tCtSFQs[0]) / align) * align
-        sfk_tmem_ptrs = [sfq_tmem_ptrs[stage] + sfq_offset for stage in range(self.q_stage)]
+            # Make SFK tmem tensor 
+            sfq_offset = math.ceil(tcgen05.find_tmem_tensor_col_offset(tCtSFQs[0]) / align) * align
+            sfk_tmem_ptrs = [sfq_tmem_ptrs[stage] + sfq_offset for stage in range(self.q_stage)]
 
-        # (MMA, MMA_N, MMA_K)
-        tCtSFK_layout = blockscaled_utils.make_tmem_layout_sfb(
-            tiled_mma_qk,
-            self.mma_tiler_qk,
-            self.sf_vec_size,
-            cute.slice_(sfk_smem_layout_staged, (None, None, None, 0)),
-        )
-        tCtSFKs = [cute.make_tensor(sfk_tmem_ptrs[stage], tCtSFK_layout) for stage in range(self.q_stage)]
+            # (MMA, MMA_N, MMA_K)
+            tCtSFK_layout = blockscaled_utils.make_tmem_layout_sfb(
+                tiled_mma_qk,
+                self.mma_tiler_qk,
+                self.sf_vec_size,
+                cute.slice_(sfk_smem_layout_staged, (None, None, None, 0)),
+            )
+            tCtSFKs = [cute.make_tensor(sfk_tmem_ptrs[stage], tCtSFK_layout) for stage in range(self.q_stage)]
         
         # Setup SFP and SFV TMEM tensors
         # Reuse the TMEM of S
-        sfp_tmem_ptrs = [cute.make_ptr(self.sf_dtype, self.tmem_s_offset[stage], mem_space=cute.AddressSpace.tmem, assumed_align=align) for stage in range(self.q_stage)]
-        # (MMA, MMA_M, MMA_K) 
-        tCtSFP_layout = blockscaled_utils.make_tmem_layout_sfa(
-            tiled_mma_pv,
-            self.mma_tiler_pv,
-            self.sf_vec_size,
-            cute.slice_(sfp_smem_layout_staged, (None, None, None, 0)),
-        ) if const_expr(sfp_smem_layout_staged is not None) else None
-        tCtSFPs = [cute.make_tensor(sfp_tmem_ptrs[stage], tCtSFP_layout) for stage in range(self.q_stage)] if const_expr(sfp_smem_layout_staged is not None) else [None] * self.q_stage
-        
-        # Make SFV tmem tensor
-        sfp_offset = math.ceil(tcgen05.find_tmem_tensor_col_offset(tCtSFPs[0]) / align) * align
-        sfv_tmem_ptrs = [sfp_tmem_ptrs[stage] + sfp_offset for stage in range(self.q_stage)] 
-        if const_expr(sfv_smem_layout_staged is not None):
-        # (MMA, MMA_N, MMA_K) for P*V operation (V is the B matrix)
-        tCtSFV_layout = blockscaled_utils.make_tmem_layout_sfb(
-            tiled_mma_pv,
-            self.mma_tiler_pv,
-            self.sf_vec_size,
-            cute.slice_(sfv_smem_layout_staged, (None, None, None, 0)),
-        ) if const_expr(sfv_smem_layout_staged is not None) else None
-        tCtSFVs = [cute.make_tensor(sfv_tmem_ptrs[stage], tCtSFV_layout) for stage in range(self.q_stage)] if const_expr(sfv_smem_layout_staged is not None) else [None] * self.q_stage
+        tCtSFPs = [None] * self.q_stage
+        tCtSFVs = [None] * self.q_stage
+        if const_expr(self.quant_pv):
+            sfp_tmem_ptrs = [cute.make_ptr(self.sf_dtype, self.tmem_s_offset[stage], mem_space=cute.AddressSpace.tmem, assumed_align=align) for stage in range(self.q_stage)]
+            # (MMA, MMA_M, MMA_K) 
+            tCtSFP_layout = blockscaled_utils.make_tmem_layout_sfa(
+                tiled_mma_pv,
+                self.mma_tiler_pv,
+                self.sf_vec_size,
+                cute.slice_(sfp_smem_layout_staged, (None, None, None, 0)),
+            )
+            tCtSFPs = [cute.make_tensor(sfp_tmem_ptrs[stage], tCtSFP_layout) for stage in range(self.q_stage)]
+            
+            # Make SFV tmem tensor
+            sfp_offset = math.ceil(tcgen05.find_tmem_tensor_col_offset(tCtSFPs[0]) / align) * align
+            sfv_tmem_ptrs = [sfp_tmem_ptrs[stage] + sfp_offset for stage in range(self.q_stage)] 
+
+            # (MMA, MMA_N, MMA_K) for P*V operation (V is the B matrix)
+            tCtSFV_layout = blockscaled_utils.make_tmem_layout_sfb(
+                tiled_mma_pv,
+                self.mma_tiler_pv,
+                self.sf_vec_size,
+                cute.slice_(sfv_smem_layout_staged, (None, None, None, 0)),
+            )
+            tCtSFVs = [cute.make_tensor(sfv_tmem_ptrs[stage], tCtSFV_layout) for stage in range(self.q_stage)]
 
         block_info = BlockInfo(
             # This is cta_tiler, not mma_tiler_qk, since we move by block by (2 * mma_tiler[0], mma_tiler[1])
@@ -1899,11 +1905,11 @@ class FlashAttentionForwardSm100:
             tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(8)), 
             Float8E4M3FN,
         )
-        thr_tmem_load = tcgen05.make_tmem_copy(tmem_load_atom, tCtSFQs[0]).get_slice(tidx)
-        tCtSFQs0_t2r = thr_tmem_load.partition_S(tCtSFQs[0])
-        tCrSFQs0_t2r_shape = thr_tmem_load.partition_D(tCtSFQs[0]).shape
-        tCrSFQs0_t2r = cute.make_fragment(tCrSFQs0_t2r_shape, Float8E4M3FN)
-        cute.copy(thr_tmem_load, tCtSFQs0_t2r, tCrSFQs0_t2r)
+        # thr_tmem_load = tcgen05.make_tmem_copy(tmem_load_atom, tCtSFQs[0]).get_slice(tidx)
+        # tCtSFQs0_t2r = thr_tmem_load.partition_S(tCtSFQs[0])
+        # tCrSFQs0_t2r_shape = thr_tmem_load.partition_D(tCtSFQs[0]).shape
+        # tCrSFQs0_t2r = cute.make_fragment(tCrSFQs0_t2r_shape, Float8E4M3FN)
+        # cute.copy(thr_tmem_load, tCtSFQs0_t2r, tCrSFQs0_t2r)
         # breakpoint()
         # breakpoint()
         # if tidx == 0:
