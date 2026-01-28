@@ -593,8 +593,8 @@ class FlashAttentionForwardSm100:
         if const_expr(self.quant_qk):
             self.tma_copy_bytes["Q"] += cute.size_in_bytes(mSFQ.element_type, cute.select(sfq_smem_layout_staged, mode=[0, 1, 2]))
             self.tma_copy_bytes["K"] += cute.size_in_bytes(mSFK.element_type, cute.select(sfk_smem_layout_staged, mode=[0, 1, 2]))
-        # if const_expr(self.quant_pv):
-        #     self.tma_copy_bytes["V"] += cute.size_in_bytes(mSFV.element_type, cute.select(sfv_smem_layout_staged, mode=[0, 1, 2]))
+        if const_expr(self.quant_pv):
+            self.tma_copy_bytes["V"] += cute.size_in_bytes(mSFV.element_type, cute.select(sfv_smem_layout_staged, mode=[0, 1, 2]))
 
         # TMA load for Q
         tma_load_op = cpasync.CopyBulkTensorTileG2SOp(self.cta_group)
@@ -1169,8 +1169,6 @@ class FlashAttentionForwardSm100:
                 )
         # Relying on pipeline_kv constructor to call mbarrier_init_fence and sync
         pipeline_kv = self.make_and_init_load_kv_pipeline(mbar_ptr + self.mbar_load_kv_full_offset)
-        # only for debugging, when kv have diff
-        pipeline_v = self.make_and_init_load_kv_pipeline(mbar_ptr + self.mbar_load_kv_full_offset, use_k_bytes=False)
 
         #  Generate smem tensor Q/K/V/O
         # (MMA, MMA_Q, MMA_D, PIPE)
@@ -1741,9 +1739,9 @@ class FlashAttentionForwardSm100:
                 mbar_ptr + self.mbar_load_kv_full_offset,
                 mbar_ptr + self.mbar_load_kv_empty_offset,
                 K_or_V="V",
-                # tma_atom_sf=tma_atom_sfv,
-                # tXgSF=tVgSFV,
-                # tXsSF=tVsSFV,
+                tma_atom_sf=tma_atom_sfv,
+                tXgSF=tVgSFV,
+                tXsSF=tVsSFV,
             )
 
             if const_expr(not self.use_block_sparsity):
