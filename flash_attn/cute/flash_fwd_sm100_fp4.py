@@ -1282,7 +1282,7 @@ class FlashAttentionForwardSm100:
         # sf_tmem_ptr = cute.make_ptr(self.sf_dtype, 0, mem_space=cute.AddressSpace.tmem, assumed_align=16)
 
         align = 16 # required for tcgen05.cp
-        sfq_tmem_ptrs = [cute.make_ptr(self.sf_dtype, self.tmem_o_offset[self.q_stage - 1 - stage], mem_space=cute.AddressSpace.tmem, assumed_align=align) for stage in range(self.q_stage)] # shuffle to minimize dependency
+        sfq_tmem_ptrs = [cute.recast_ptr(tStS.iterator + self.tmem_s_offset[stage], dtype=cute.Float8E4M3FN) for stage in range(self.q_stage)]
         # (MMA, MMA_M, MMA_K) 
         tCtSFQ_layout = blockscaled_utils.make_tmem_layout_sfa(
             tiled_mma_qk,
@@ -1293,7 +1293,7 @@ class FlashAttentionForwardSm100:
         tCtSFQs = [cute.make_tensor(sfq_tmem_ptrs[stage], tCtSFQ_layout) for stage in range(self.q_stage)]
 
         # Make SFK tmem tensor 
-        sfk_tmem_ptrs = [sfq_tmem_ptrs[stage] + math.ceil(tcgen05.find_tmem_tensor_col_offset(tCtSFQs[stage]) / align) * align for stage in range(self.q_stage)]
+        sfk_tmem_ptrs = [cute.recast_ptr(tStS.iterator + self.tmem_s_offset[stage] + 32, dtype=cute.Float8E4M3FN) for stage in range(self.q_stage)]
 
         # (MMA, MMA_N, MMA_K)
         tCtSFK_layout = blockscaled_utils.make_tmem_layout_sfb(
@@ -1938,19 +1938,20 @@ class FlashAttentionForwardSm100:
             # cute.print_tensor(tCrSFQs0_t2r.load().to(Float32))
         
         # Copy sSFQ from smem to reg fragment for debugging
-        if const_expr(self.quant_qk) and sSFQ is not None:
-            # Filter zeros to get compact layout and get stage 0
-            sSFQ_compact = cute.filter_zeros(sSFQ[None, None, 0, 0])
-            sSFQ_slice = sSFQ_compact[1, None]
-            # Create register fragment with matching shape
-            tSrSFQ = cute.make_fragment_like(sSFQ_slice, Float8E4M3FN)
-            # Copy from smem to rmem using autovec_copy
-            cute.autovec_copy(sSFQ_slice, tSrSFQ)
-            tSrSFQ_f32 = cute.make_fragment_like(tSrSFQ, Float32)
-            # Print to check for NaN
-            if tidx == 0:
-                tSrSFQ_f32.store(tSrSFQ_f32.load())
-                cute.print_tensor(tSrSFQ_f32)
+        # if const_expr(self.quant_qk) and sSFQ is not None:
+        #     # Filter zeros to get compact layout and get stage 0
+        #     sSFQ_compact = cute.filter_zeros(sSFQ[None, None, 0, 1])
+        #     # sSFQ_compact = cute.filter_zeros(sSFK[None, None, 0, 1])
+        #     sSFQ_slice = cute.logical_divide(sSFQ_compact, cute.make_layout(16))[None, 1]
+        #     # Create register fragment with matching shape
+        #     tSrSFQ = cute.make_fragment_like(sSFQ_slice, Float8E4M3FN)
+        #     # Copy from smem to rmem using autovec_copy
+        #     cute.autovec_copy(sSFQ_slice, tSrSFQ)
+        #     tSrSFQ_f32 = cute.make_fragment_like(tSrSFQ, Float32)
+        #     # Print to check for NaN
+        #     if tidx == 0:
+        #         tSrSFQ_f32.store(tSrSFQ.load().to(cute.Float32))
+        #         cute.print_tensor(tSrSFQ_f32)
 
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
@@ -2503,6 +2504,9 @@ class FlashAttentionForwardSm100:
         cute.arch.mbarrier_wait(mbar_ptr + self.mbar_S_full_offset + stage, mma_si_consumer_phase)
         tSrS_t2r = cute.make_fragment(thr_tmem_load.partition_D(tScS).shape, self.qk_acc_dtype)
         cute.copy(thr_tmem_load, tStS_t2r, tSrS_t2r)
+        # if cute.arch.thread_idx()[0] == 0:
+        #     cute.print_tensor(tSrS_t2r)
+
         if cutlass.const_expr(self.score_mod is not None):
             self.apply_score_mod(
                 tSrS_t2r,
