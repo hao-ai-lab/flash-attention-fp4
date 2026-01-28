@@ -1252,7 +1252,10 @@ class FlashAttentionForwardSm100:
         # sf_tmem_ptr = cute.make_ptr(self.sf_dtype, 0, mem_space=cute.AddressSpace.tmem, assumed_align=16)
 
         align = 16 # required for tcgen05.cp
-        sfq_tmem_ptrs = [cute.recast_ptr(tStS.iterator + self.tmem_s_offset[stage], dtype=cute.Float8E4M3FN) for stage in range(self.q_stage)]
+        sfq_tmem_ptrs = [cute.make_ptr(self.sf_dtype, self.tmem_o_offset[self.q_stage - 1 - stage],
+                        mem_space=cute.AddressSpace.tmem, assumed_align=align) for stage in range(self.q_stage)
+                        ] # shuffle to minimize dependency
+
         # (MMA, MMA_M, MMA_K) 
         tCtSFQ_layout = blockscaled_utils.make_tmem_layout_sfa(
             tiled_mma_qk,
@@ -1263,7 +1266,8 @@ class FlashAttentionForwardSm100:
         tCtSFQs = [cute.make_tensor(sfq_tmem_ptrs[stage], tCtSFQ_layout) for stage in range(self.q_stage)]
 
         # Make SFK tmem tensor 
-        sfk_tmem_ptrs = [cute.recast_ptr(tStS.iterator + self.tmem_s_offset[stage] + 32, dtype=cute.Float8E4M3FN) for stage in range(self.q_stage)]
+        sfq_offset = math.ceil(tcgen05.find_tmem_tensor_col_offset(tCtSFQs[0]) / align) * align
+        sfk_tmem_ptrs = [sfq_tmem_ptrs[stage] + sfq_offset for stage in range(self.q_stage)]
 
         # (MMA, MMA_N, MMA_K)
         tCtSFK_layout = blockscaled_utils.make_tmem_layout_sfb(
