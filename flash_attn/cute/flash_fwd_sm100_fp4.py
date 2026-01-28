@@ -1258,7 +1258,7 @@ class FlashAttentionForwardSm100:
         tCtSFQs = [None] * self.q_stage
         tCtSFKs = [None] * self.q_stage
         if const_expr(self.quant_qk):
-            sfq_tmem_ptrs = [cute.make_ptr(self.sf_dtype, self.tmem_s_offset[self.      q_stage - 1 - stage], # shuffle to minimize dependency
+            sfq_tmem_ptrs = [cute.make_ptr(self.sf_dtype, self.tmem_s_offset[self.q_stage - 1 - stage], # shuffle to minimize dependency
                             mem_space=cute.AddressSpace.tmem, assumed_align=align) for stage in range(self.q_stage)
                             ] 
 
@@ -1920,6 +1920,7 @@ class FlashAttentionForwardSm100:
         #     if tidx == 0:
         #         tSrSFQ_f32.store(tSrSFQ.load().to(cute.Float32))
         #         cute.print_tensor(tSrSFQ_f32)
+    
         mma_sfqk_producer_phase = Int32(0)
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
@@ -1959,6 +1960,8 @@ class FlashAttentionForwardSm100:
                     # only tmem changes per q_stage.
                     if const_expr(self.quant_qk):
                         # wait for Si to be copied to reg
+                        # if cute.arch.thread_idx()[0] % 32 == 0:
+                        #     cute.printf("waiting on iter 0 stage %d\n", stage)
                         cute.arch.mbarrier_wait(mbar_ptr + self.mbar_sfqk_load_offset + stage, mma_sfqk_producer_phase)
                         _, _, tCtSFQ_compact_s2t = tiled_copy_s2t_sfq_staged[stage]
                         tCsSFQ_compact_s2t_staged = tCsSFQ_compact_s2t[None, None, None, None, stage]
@@ -2082,6 +2085,8 @@ class FlashAttentionForwardSm100:
                             _, _, tCtSFQ_compact_s2t = tiled_copy_s2t_sfq_staged[stage]
                             tCsSFQ_compact_s2t_staged = tCsSFQ_compact_s2t[None, None, None, None, stage]
                             # wait for Si to be copied to reg
+                            # if cute.arch.thread_idx()[0] % 32 == 0:
+                            #     cute.printf("waiting on iter %d stage %d\n", block_loop_count, stage)
                             cute.arch.mbarrier_wait(mbar_ptr + self.mbar_sfqk_load_offset + stage, mma_sfqk_producer_phase)
                             cute.copy(
                                 tiled_copy_s2t_sfq,
@@ -2238,9 +2243,11 @@ class FlashAttentionForwardSm100:
         si_corr_producer_phase = Int32(1)
         s0_s1_sequence_phase = Int32(1 if stage == 0 else 0)
         
-        # First iter: no need for wait correction for sfqk1, 2
-        if stage == 0 and const_expr(self.quant_qk): 
-            sfqk_stage = 1
+        # First iter: no need for wait correction for sfqk1
+        if stage == 1 and const_expr(self.quant_qk): 
+            sfqk_stage = 0
+            # if cute.arch.thread_idx()[0] % 128 == 0:
+            #     cute.printf("arriving sfqk_load iter 0 stage %d\n", sfqk_stage)
             cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_sfqk_load_offset + sfqk_stage)
         # self.warp_scheduler_barrier_init()
 
@@ -2503,6 +2510,8 @@ class FlashAttentionForwardSm100:
         # unblock sfqk load
         cute.arch.fence_view_async_tmem_load()
         sfqk_stage = self.q_stage - 1 - stage
+        # if cute.arch.thread_idx()[0] % 128 == 0:
+        #     cute.printf("arriving sfqk_load iter 1 stage %d\n", sfqk_stage)
         cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_sfqk_load_offset + sfqk_stage)
 
         if cutlass.const_expr(self.score_mod is not None):
@@ -2619,7 +2628,7 @@ class FlashAttentionForwardSm100:
         tStScale_layout = cute.composition(tStS.layout, cute.make_layout((self.m_block_size, 1)))
         tStScales = tuple(
             cute.make_tensor(tStS.iterator + self.tmem_vec_offset[stage], tStScale_layout)
-            for stage in range(2)
+            for stage in range(self.q_stage)
         )
         tScScale = cute.composition(tScS, cute.make_layout((self.m_block_size, 1)))
         tmem_load_v_atom = cute.make_copy_atom(
@@ -2628,7 +2637,7 @@ class FlashAttentionForwardSm100:
         )
         thr_tmem_load_vec = tcgen05.make_tmem_copy(tmem_load_v_atom, tStScales[0]).get_slice(tidx)
 
-        tStScales_t2r = [thr_tmem_load_vec.partition_S(tStScales[stage]) for stage in range(2)]
+        tStScales_t2r = [thr_tmem_load_vec.partition_S(tStScales[stage]) for stage in range(self.q_stage)]
         tSrScale_t2r_shape = thr_tmem_load_vec.partition_D(tScScale).shape
 
         # First iter: no correction is required
@@ -2675,7 +2684,7 @@ class FlashAttentionForwardSm100:
 
                 tSrScale_t2r = cute.make_fragment(tSrScale_t2r_shape, Float32)
                 for i in cutlass.range(total_block_count - 1, unroll=1):
-                    for stage in cutlass.range_constexpr(2):
+                    for stage in cutlass.range_constexpr(self.q_stage):
                         # wait for S0 / S1
                         cute.arch.mbarrier_wait(
                             mbar_ptr + self.mbar_softmax_corr_full_offset + stage,
@@ -3100,87 +3109,6 @@ class FlashAttentionForwardSm100:
             acc_float4[0, 1, i] += delta_s_0
             acc_float4[1, 0, i] += delta_s_1
             acc_float4[1, 1, i] += delta_s_1
-
-    @cute.jit
-    def quantize_fp4(self, tTMEM_STORErS_x4, tTMEM_STORErS_x4_e, tStS_SF, stage):
-        """Quantize FP32 softmax results to FP4 with scale factors.
-        
-        This method implements the FP4 quantization similar to SageAttention:
-        1. Compute absolute maximum values for scale factors
-        2. Convert scale factors to UE4M3 format
-        3. Quantize the main tensor to E2M1 format
-        4. Use warp shuffle to share scale factors between threads
-        
-        :param tTMEM_STORErS_x4: FP32 tensor to be quantized
-        :type tTMEM_STORErS_x4: cute.Tensor
-        :param tTMEM_STORErS_x4_e: Output tensor for quantized values
-        :type tTMEM_STORErS_x4_e: cute.Tensor
-        :param tStS_SF: Scale factor tensor for storing UE4M3 values
-        :type tStS_SF: cute.Tensor
-        :param stage: Processing stage (0 or 1)
-        :type stage: int
-        """
-        # Get thread index for warp shuffle operations
-        tidx, _, _ = cute.arch.thread_idx()
-        quad_id = tidx & 3
-        
-        # Compute absolute maximum values for scale factors
-        # This is a simplified version - in practice, you'd need to compute
-        # the actual max values from the tensor
-        abs_max_values = cute.make_fragment(tTMEM_STORErS_x4.shape, Float32)
-        
-        # Convert scale factors to UE4M3 format (4 values per uint32_t)
-        # Use the provided scale factor tensor
-        sfp_uint32_view = cute.recast(tStS_SF, Int32)
-        
-        # Process in groups of 4 for UE4M3 conversion
-        for i in cutlass.range(0, cute.size(abs_max_values), 4, unroll=True):
-            if i + 3 < cute.size(abs_max_values):
-                # Pack 4 FP32 values into UE4M3 format
-                packed_ue4m3 = packed_float_to_ue4m3(
-                    abs_max_values[i],
-                    abs_max_values[i + 1], 
-                    abs_max_values[i + 2],
-                    abs_max_values[i + 3]
-                )
-                sfp_uint32_view[i // 4] = packed_ue4m3
-        
-        # Quantize main tensor to E2M1 format (8 values per uint32_t)
-        tOrP_uint32_view = cute.recast(tTMEM_STORErS_x4_e, Int32)
-        
-        # Process in groups of 8 for E2M1 conversion
-        for mma_m in cutlass.range(0, cute.size(tTMEM_STORErS_x4_e, mode=1), unroll=True):
-            for i in cutlass.range(0, 4, unroll=True):  # 4 uint32_t per mma_m
-                if i * 8 + 7 < cute.size(tTMEM_STORErS_x4_e, mode=0):
-                    # Pack 8 FP32 values into E2M1 format
-                    packed_e2m1 = packed_float_to_e2m1(
-                        tTMEM_STORErS_x4_e[i * 8, mma_m],
-                        tTMEM_STORErS_x4_e[i * 8 + 1, mma_m],
-                        tTMEM_STORErS_x4_e[i * 8 + 2, mma_m],
-                        tTMEM_STORErS_x4_e[i * 8 + 3, mma_m],
-                        tTMEM_STORErS_x4_e[i * 8 + 4, mma_m],
-                        tTMEM_STORErS_x4_e[i * 8 + 5, mma_m],
-                        tTMEM_STORErS_x4_e[i * 8 + 6, mma_m],
-                        tTMEM_STORErS_x4_e[i * 8 + 7, mma_m]
-                    )
-                    tOrP_uint32_view[i, mma_m] = packed_e2m1
-        
-        # Warp shuffle to share scale factors between threads
-        # This is a simplified version - in practice, you'd need to implement
-        # the actual warp shuffle operations similar to SageAttention
-        if quad_id == 0 or quad_id == 2:  # Even quad IDs
-            # Share scale factors with odd quad IDs
-            local_sfp = sfp_uint32_view[0]
-            peer_sfp = cute.arch.shfl_xor_sync(local_sfp, 2)
-            
-            # Combine scale factors based on quad ID
-            if (quad_id & 1) == 0:
-                combined_sfp = (local_sfp & 0xFF00FF) | ((peer_sfp & 0xFF00FF) << 8)
-            else:
-                combined_sfp = (peer_sfp & 0xFF00FF) | ((local_sfp & 0xFF00FF) >> 8)
-            
-            # Store the combined scale factor
-            sfp_uint32_view[0] = combined_sfp
 
     @cute.jit
     def epilogue_s2g(
