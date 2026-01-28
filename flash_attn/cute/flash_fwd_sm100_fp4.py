@@ -1291,7 +1291,9 @@ class FlashAttentionForwardSm100:
         tCtSFPs = [cute.make_tensor(sfp_tmem_ptrs[stage], tCtSFP_layout) for stage in range(self.q_stage)] if const_expr(sfp_smem_layout_staged is not None) else [None] * self.q_stage
         
         # Make SFV tmem tensor
-        sfv_tmem_ptrs = [sfp_tmem_ptrs[stage] + tcgen05.find_tmem_tensor_col_offset(tCtSFPs[stage]) for stage in range(self.q_stage)] if const_expr(sfp_smem_layout_staged is not None) else [None] * self.q_stage
+        sfp_offset = math.ceil(tcgen05.find_tmem_tensor_col_offset(tCtSFPs[0]) / align) * align
+        sfv_tmem_ptrs = [sfp_tmem_ptrs[stage] + sfp_offset for stage in range(self.q_stage)] 
+        if const_expr(sfv_smem_layout_staged is not None):
         # (MMA, MMA_N, MMA_K) for P*V operation (V is the B matrix)
         tCtSFV_layout = blockscaled_utils.make_tmem_layout_sfb(
             tiled_mma_pv,
