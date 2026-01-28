@@ -2293,7 +2293,6 @@ class FlashAttentionForwardSm100:
                 rescale_threshold=8.0 if const_expr(self.q_dtype.width == 16) else 0.0, # (Wenxuan) disable skipping rescale until FP4 precision is verified
                 # rescale_threshold=8.0 if const_expr(self.v_dtype.width == 16) else 0.0, # (Wenxuan) disable skipping rescale until FP4 precision is verified
                 softmax_scale=softmax_scale,
-                compute_sp1=const_expr(self.v_dtype == cute.Float4E2M1FN),
             )
             softmax.reset()
 
@@ -2454,6 +2453,51 @@ class FlashAttentionForwardSm100:
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
         # End of persistent scheduler loop
+        
+    @cute.jit
+    def _quant_fp4(self, 
+                   tSrP_f32: cute.Tensor,
+                   tSrPSF_f32: cute.Tensor,
+                   tSrP: cute.Tensor,
+                   tSrPSF: cute.Tensor,
+                   ):
+        tSrP_f32_frag = cute.logical_divide(tSrP_f32, cute.make_layout(self.sf_vec_size))
+        assert cute.size(tSrP_f32_frag, mode=[1]) == cute.size(tSrPSF_f32)
+
+        tSrP_frag = cute.logical_divide(tSrP, cute.make_layout(self.sf_vec_size))
+        tSrPSF_u32_view = cute.recast_tensor(tSrPSF, cute.Int32)
+
+        for i in cutlass.range_constexpr(0, cute.size(tSrP_f32_frag, mode=[1])):
+            tSrP_f32_frag.store(tSrP_f32_frag.load() / tSrPSF_f32[i])
+            
+        # Process in groups of 4 for UE4M3 conversion
+        for i in cutlass.range_constexpr(0, cute.size(tSrPSF_f32)):
+            if i + 3 < cute.size(tSrPSF_f32):
+                # Pack 4 FP32 values into UE4M3 format
+                packed_ue4m3 = packed_float_to_ue4m3(
+                    tSrPSF_f32[i],
+                    tSrPSF_f32[i + 1], 
+                    tSrPSF_f32[i + 2],
+                    tSrPSF_f32[i + 3]
+                )
+                tSrPSF_u32_view[i // 4] = packed_ue4m3
+        
+        # Quantize main tensor to E2M1 format (8 values per uint32_t)
+        # Process in groups of 8 for E2M1 conversion
+        for i in cutlass.range_constexpr(0, cute.size(tSrP_frag, mode=[1])):
+            tSrP_u32_view = cute.recast_tensor(tSrP_frag[None, i], cute.Int32)
+            for k in cutlass.range_constexpr(0, cute.size(tSrP_u32_view, mode=[0])):
+                packed_e2m1 = packed_float_to_e2m1(
+                    tSrP_f32_frag[k * 8, i],
+                    tSrP_f32_frag[k * 8 + 1, i],
+                    tSrP_f32_frag[k * 8 + 2, i],
+                    tSrP_f32_frag[k * 8 + 3, i],
+                    tSrP_f32_frag[k * 8 + 4, i],
+                    tSrP_f32_frag[k * 8 + 5, i],
+                    tSrP_f32_frag[k * 8 + 6, i],
+                    tSrP_f32_frag[k * 8 + 7, i]
+                )
+                tSrP_u32_view[k] = packed_e2m1
 
     @cute.jit
     def softmax_step(
@@ -2529,8 +2573,15 @@ class FlashAttentionForwardSm100:
             )
 
         if const_expr(mask_fn is not None):
-            mask_fn(tSrS_t2r, n_block=n_block)
+            mask_fn(tSrS_t2r, n_block=n_block) 
+
         row_max, acc_scale = softmax.update_row_max(tSrS_t2r.load(), is_first)
+        tSrPSF_f32 = None
+        tSrPSF = None
+        if const_expr(self.quant_pv):
+            # Compute grouped scores max (will be converted to sp2 of SageAttention3)
+            tSrPSF_f32 = softmax.compute_group_max(tSrS_t2r, sf_size=self.sf_vec_size)
+            tSrPSF = cute.make_rmem_tensor(tSrPSF_f32.layout, cute.Float8E4M3FN)
 
         if const_expr(not is_first):
             # tSrScale_r2t = cute.make_fragment(thr_tmem_store_scale.partition_S(tScScale).shape, Float32)
@@ -2545,7 +2596,7 @@ class FlashAttentionForwardSm100:
 
         # if thread_idx == 0 and stage == 0: cute.print_tensor(tSrS_t2r)
         # print(tSrS_t2r)
-        softmax.scale_subtract_rowmax(tSrS_t2r, row_max)
+        softmax.scale_subtract_rowmax(tSrS_t2r, row_max, tSrPSF_f32)
         # Sequence barrier wait
         if const_expr(self.s0_s1_barrier):
             cute.arch.mbarrier_wait(
@@ -2556,19 +2607,19 @@ class FlashAttentionForwardSm100:
             cute.recast_ptr(tSrP_r2t_f32.iterator, dtype=self.v_dtype),
             tSrS_t2r.layout,
         )
-        if const_expr(self.v_dtype == cute.Float4E2M1FN):
-            # Apply NVFP4 quant for P
-            softmax.apply_exp2(
+        if const_expr(self.quant_pv):
+            # Exp2 with softmax scale and sp1 scaling
+            softmax.apply_exp2_convert(
                 tSrS_t2r, 
                 e2e=mask_fn is None and self.head_dim_padded <= 128,
                 e2e_freq=self.e2e_freq,
             )
-            sp1 = softmax.apply_sage_sp1(tSrS_t2r)
-            sf_vec_size = 16
-            sf_layout = cute.make_layout((cute.cosize(tSrS_t2r.layout) // sf_vec_size,))
-            tSrP_SF = cute.make_rmem_tensor(sf_layout, cute.Float8E4M3FN)
-            # softmax.apply_quant(tSrS_t2r, tSrP_r2t, tSrP_SF)
-            # TODO: copy tSrP_SF to tmem
+            softmax.apply_exp2_convert(
+                tSrPSF_f32, 
+                e2e=mask_fn is None and self.head_dim_padded <= 128,
+                e2e_freq=self.e2e_freq,
+            )
+            self._quant_fp4(tSrS_t2r, tSrPSF_f32, tSrP_r2t, tSrPSF)
         else:
             # softmax.scale_apply_exp2_convert(tSrS_t2r, row_max, tSrP_r2t)
             softmax.apply_exp2_convert(
