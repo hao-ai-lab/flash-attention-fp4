@@ -1255,7 +1255,7 @@ class FlashAttentionForwardSm100:
         tCtSFQs = [None] * self.q_stage
         tCtSFKs = [None] * self.q_stage
         if const_expr(self.quant_qk):
-            sfq_tmem_ptrs = [cute.make_ptr(self.sf_dtype, self.tmem_o_offset[self.q_stage - 1 - stage],
+            sfq_tmem_ptrs = [cute.make_ptr(self.sf_dtype, self.tmem_s_offset[self.q_stage - 1 - stage],
                             mem_space=cute.AddressSpace.tmem, assumed_align=align) for stage in range(self.q_stage)
                             ] # shuffle to minimize dependency
 
@@ -1899,26 +1899,23 @@ class FlashAttentionForwardSm100:
 
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
+        
+        # NOTE Debug
         # make tmem to reg store atom for debugging
-        tidx = cute.arch.thread_idx()[0] % cute.arch.WARP_SIZE
-        tmem_load_atom = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(8)), 
-            Float8E4M3FN,
-        )
+        # tidx = cute.arch.thread_idx()[0] % cute.arch.WARP_SIZE
+        # tmem_load_atom = cute.make_copy_atom(
+        #     tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(8)), 
+        #     Float8E4M3FN,
+        # )
         # thr_tmem_load = tcgen05.make_tmem_copy(tmem_load_atom, tCtSFQs[0]).get_slice(tidx)
         # tCtSFQs0_t2r = thr_tmem_load.partition_S(tCtSFQs[0])
         # tCrSFQs0_t2r_shape = thr_tmem_load.partition_D(tCtSFQs[0]).shape
         # tCrSFQs0_t2r = cute.make_fragment(tCrSFQs0_t2r_shape, Float8E4M3FN)
         # cute.copy(thr_tmem_load, tCtSFQs0_t2r, tCrSFQs0_t2r)
-        # breakpoint()
-        # breakpoint()
-        # if tidx == 0:
-            # for i in cutlass.range_constexpr(cute.size(tCrSFQs0_t2r.shape[0])):
-                # cute.printf("tCrSFQs0_t2r[{}]: {}", i, tCrSFQs0_t2r[i, None, None, None])
-        # breakpoint()
         # if tidx == 0:
             # cute.print_tensor(tCrSFQs0_t2r.load().to(Float32))
         
+        # NOTE Debug
         # Copy sSFQ from smem to reg fragment for debugging
         # if const_expr(self.quant_qk) and sSFQ is not None:
         #     # Filter zeros to get compact layout and get stage 0
@@ -2214,9 +2211,7 @@ class FlashAttentionForwardSm100:
             tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(1)),
             Float32,
         )
-        thr_tmem_store_scale = tcgen05.make_tmem_copy(tmem_store_scale_atom, tStScale).get_slice(
-            tidx
-        )
+        thr_tmem_store_scale = tcgen05.make_tmem_copy(tmem_store_scale_atom, tStScale).get_slice(tidx)
 
         tStScale_r2t = thr_tmem_store_scale.partition_D(tStScale)
         tmem_store_atom = cute.make_copy_atom(
