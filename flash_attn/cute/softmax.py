@@ -160,23 +160,20 @@ class Softmax(ParamsBase):
 @dataclass
 class SoftmaxSm100(Softmax):
     rescale_threshold: cutlass.Constexpr[float] = 0.0
-    compute_sp1: cutlass.Constexpr[bool] = False
-    sp1_scale: Float32 | None = None
+
+    fp8_scalexfp4_scale_log2: cutlass.Constexpr[float] = -11.392317422778762 # log2f(fp8_scalexfp4_scale=1.0 / (448 * 6))
+    fp4_scale_log2: cutlass.Constexpr[float] = -2.584962500721156 # log2f(fp4_scale=6)
 
     @staticmethod
     def create(
         scale_log2: Float32,
         rescale_threshold: cutlass.Constexpr[float] = 0.0,
         softmax_scale: Float32 | None = None,
-        compute_sp1: cutlass.Constexpr[bool] = False,
     ):
         num_rows = 1
         arch = 100
         row_max = cute.make_fragment(num_rows, Float32)
         row_sum = cute.make_fragment(num_rows, Float32)
-        sp1_scale = None
-        if cutlass.const_expr(compute_sp1):
-            sp1_scale= Float32(1.0 / (6 * 448))
 
         return SoftmaxSm100(
             scale_log2,
@@ -186,8 +183,6 @@ class SoftmaxSm100(Softmax):
             arch,
             softmax_scale,
             rescale_threshold=rescale_threshold,
-            compute_sp1=compute_sp1,
-            sp1_scale=sp1_scale,
         )
 
     @cute.jit
@@ -210,6 +205,15 @@ class SoftmaxSm100(Softmax):
         self.row_max[0] = row_max_new
         return row_max_safe, acc_scale
 
+    @cute.jit
+    def compute_group_max(self, acc_S_row: cute.Tensor, sf_size: cutlass.Constexpr[int] = 16) -> cute.Tensor:
+        acc_S_row_frag = cute.logical_divide(acc_S_row, cute.make_layout(sf_size))
+        num_frags = cute.size(acc_S_row_frag, mode=[1])
+        acc_S_row_group_max = cute.make_rmem_tensor(cute.make_layout(num_frags), Float32)
+        for i in cutlass.range_constexpr(num_frags):
+            acc_S_row_group_max[i] = self._compute_row_max(acc_S_row_frag[None, i].load())
+        return acc_S_row_group_max
+
     def update_row_sum(
         self, acc_S_row_exp: cute.TensorSSA, row_scale: Float32, is_first: int = False
     ) -> None:
@@ -224,35 +228,44 @@ class SoftmaxSm100(Softmax):
         self,
         acc_S_row: cute.Tensor,
         row_max: Float32,
+        acc_S_row_group_max: Optional[cute.Tensor] = None,
     ):
         assert cute.size(acc_S_row.shape) % 2 == 0, "acc_S_row must have an even number of elements"
-        row_max_scaled = row_max * self.scale_log2
+        bias = 0.0 if cutlass.const_expr(acc_S_row_group_max is None) else self.fp8_scalexfp4_scale_log2
+        row_max_scaled = row_max * self.scale_log2 + bias
+
         for i in cutlass.range(0, cute.size(acc_S_row.shape), 2, unroll_full=True):
             acc_S_row[i], acc_S_row[i + 1] = utils.fma_packed_f32x2(
                 (acc_S_row[i], acc_S_row[i + 1]),
                 (self.scale_log2, self.scale_log2),
                 (-row_max_scaled, -row_max_scaled),
             )
+        if cutlass.const_expr(acc_S_row_group_max is not None):
+            row_max_scaled -= self.fp4_scale_log2
+            for i in cutlass.range(0, cute.size(acc_S_row_group_max.shape), 2, unroll_full=True):
+                acc_S_row_group_max[i], acc_S_row_group_max[i + 1] = utils.fma_packed_f32x2(
+                    (acc_S_row_group_max[i], acc_S_row_group_max[i + 1]),
+                    (self.scale_log2, self.scale_log2),
+                    (-row_max_scaled, -row_max_scaled),
+                )
+
 
     @cute.jit
     def apply_exp2_convert(
         self,
         acc_S_row: cute.Tensor,
-        acc_S_row_converted: cute.Tensor,
+        acc_S_row_converted: Optional[cute.Tensor] = None,
         e2e: cutlass.Constexpr[bool] = False,
         e2e_freq: cutlass.Constexpr[int] = 16,
         e2e_res: cutlass.Constexpr[int] = 4,
         e2e_frg_limit: cutlass.Constexpr[int] = 1,
     ):
         assert cute.size(acc_S_row.shape) % 2 == 0, "acc_S_row must have an even number of elements"
-        frg_tile = 32
+        frg_tile = min(32, cute.size(acc_S_row))
         assert frg_tile % 2 == 0
         frg_cnt = cute.size(acc_S_row) // frg_tile
         assert cute.size(acc_S_row) % frg_tile == 0
         acc_S_row_frg = cute.logical_divide(acc_S_row, cute.make_layout(frg_tile))
-        acc_S_row_converted_frg = cute.logical_divide(
-            acc_S_row_converted, cute.make_layout(frg_tile)
-        )
         for j in cutlass.range_constexpr(frg_cnt):
             for k in cutlass.range_constexpr(0, cute.size(acc_S_row_frg, mode=[0]), 2):
                 # acc_S_row_frg[k, j] = utils.exp2f(acc_S_row_frg[k, j])
@@ -272,57 +285,12 @@ class SoftmaxSm100(Softmax):
                             acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j]
                         )
             if cutlass.const_expr(acc_S_row_converted is not None):
+                acc_S_row_converted_frg = cute.logical_divide(
+                    acc_S_row_converted, cute.make_layout(frg_tile)
+                )
                 acc_S_row_converted_frg[None, j].store(
                     acc_S_row_frg[None, j].load().to(acc_S_row_converted.element_type)
                 )
-
-            
-    @cute.jit
-    def apply_quant(
-        self,
-        tSrP_f32: cute.Tensor,
-        tSrP: cute.Tensor,
-        tSrPSF: cute.Tensor,
-        sf_vec_size: cutlass.Constexpr[int] = 16,
-    ):
-        tSrP_frag = cute.logical_divide(tSrP, cute.make_layout(sf_vec_size))
-        tSrP_f32_frag = cute.logical_divide(tSrP_f32, cute.make_layout(sf_vec_size))
-        tSrPSF_f32 = cute.make_rmem_tensor(tSrPSF.layout, cute.Float32)
-        tSrPSF_u32_view = cute.recast_tensor(tSrPSF, cute.Int32)
-
-        for i in cutlass.range_constexpr(0, cute.size(tSrP_f32_frag, mode=[1])):
-            max_val = self._compute_row_max(tSrP_f32_frag[None, i].load())
-            tSrPSF_f32[i] = max_val / 6
-            tSrP_f32_frag.store(tSrP_f32_frag.load() / tSrPSF_f32[i])
-            
-        # Process in groups of 4 for UE4M3 conversion
-        for i in cutlass.range_constexpr(0, cute.size(tSrPSF_f32)):
-            if i + 3 < cute.size(tSrPSF_f32):
-                # Pack 4 FP32 values into UE4M3 format
-                packed_ue4m3 = packed_float_to_ue4m3(
-                    tSrPSF_f32[i],
-                    tSrPSF_f32[i + 1], 
-                    tSrPSF_f32[i + 2],
-                    tSrPSF_f32[i + 3]
-                )
-                tSrPSF_u32_view[i // 4] = packed_ue4m3
-        
-        # Quantize main tensor to E2M1 format (8 values per uint32_t)
-        # Process in groups of 8 for E2M1 conversion
-        for i in cutlass.range_constexpr(0, cute.size(tSrP_frag, mode=[1])):
-            tSrP_u32_view = cute.recast_tensor(tSrP_frag[None, i], cute.Int32)
-            for k in cutlass.range_constexpr(0, cute.size(tSrP_u32_view, mode=[0])):
-                packed_e2m1 = packed_float_to_e2m1(
-                    tSrP_f32_frag[k * 8, i],
-                    tSrP_f32_frag[k * 8 + 1, i],
-                    tSrP_f32_frag[k * 8 + 2, i],
-                    tSrP_f32_frag[k * 8 + 3, i],
-                    tSrP_f32_frag[k * 8 + 4, i],
-                    tSrP_f32_frag[k * 8 + 5, i],
-                    tSrP_f32_frag[k * 8 + 6, i],
-                    tSrP_f32_frag[k * 8 + 7, i]
-                )
-                tSrP_u32_view[k, i] = packed_e2m1
 
     @cute.jit
     def apply_sage_sp1(self, P_row: cute.Tensor):
@@ -331,7 +299,6 @@ class SoftmaxSm100(Softmax):
         inv_sp1 = 1.0 / sp1
         P_row.store(P_row.load() * inv_sp1)
         return sp1
-    
 
     @cute.jit
     def scale_apply_exp2_convert(
