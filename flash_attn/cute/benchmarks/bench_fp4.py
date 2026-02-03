@@ -387,8 +387,9 @@ def main(ab_dtype, sf_dtype, sf_vec_size, quant_v=False):
     dtype_gen = torch.bfloat16
     
     # Benchmark configurations
-    # bs_seqlen_vals = [(32, 1024), (16, 2048), (8, 4096), (4, 8192), (2, 16384), (1, 32768)]
+    # bs_seqlen_vals = [(32, 1024), (16, 2048), (8, 4096), (4, 8192), (2, 16384), (1, 32768), (4, 32768 * 8)]
     bs_seqlen_vals = [(32, 1024)]
+    # bs_seqlen_vals = [(4, 300 * 1000)]
     headdim = 128
     nheads = 16
     nheads_kv = nheads
@@ -453,6 +454,7 @@ def main(ab_dtype, sf_dtype, sf_vec_size, quant_v=False):
                 desc=desc_str
             )
             print(f'FP4 Attention fwd: {m_fp4.mean * 1e3:.3f}ms, {(nFLOPS / m_fp4.mean * 1e-12):.1f} TFLOPS')
+            
             fp4_out = flash_attn_func_python(
                 q_fp4, k_fp4, v_tensor,
                 causal=causal,
@@ -481,7 +483,6 @@ def main(ab_dtype, sf_dtype, sf_vec_size, quant_v=False):
             k_ref = k_ref.to(dtype_gen)
             v_ref = v_ref.to(dtype_gen)
             
-            time.sleep(1)
             m_ref = time_fwd(
                 flash_attn_func_python,
                 q_ref, k_ref, v_ref,

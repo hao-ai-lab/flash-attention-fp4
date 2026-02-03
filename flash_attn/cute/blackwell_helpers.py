@@ -1032,3 +1032,14 @@ def packed_float_to_e2m1(f0: Float32, f1: Float32, f2: Float32, f3: Float32,
         asm_dialect=llvm.AsmDialect.AD_ATT,
     )
     return Int32(out_uint32)
+
+def tcgen05_after_thread_sync():
+    llvm.inline_asm(
+        None,
+        [],
+        "tcgen05.fence::after_thread_sync;",
+        "",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )

@@ -157,6 +157,7 @@ class FlashAttentionForwardSm100:
         self.epilogue_warp_ids = (13,)
         self.load_warp_ids = (14,)
         self.empty_warp_ids = (15,)
+        # self.empty_warp_ids = ()
         SM100_TMEM_CAPACITY_COLUMNS = 512
         self.tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
 
@@ -217,7 +218,9 @@ class FlashAttentionForwardSm100:
             # self.num_regs_other = 96 if self.is_causal or self.is_local else 80
             # self.num_regs_other = 64 if self.is_causal or self.is_local else 80
         self.num_regs_empty = 24
-
+        if len(self.empty_warp_ids) == 0:
+            self.num_regs_softmax += self.num_regs_empty * cute.arch.WARP_SIZE // ((len(self.softmax0_warp_ids) + len(self.softmax1_warp_ids)) * cute.arch.WARP_SIZE)
+            self.num_regs_softmax = int(math.floor(self.num_regs_softmax / 8)) * 8
         self.buffer_align_bytes = 1024
         
         # Scale factor parameters for block-scaled quantization (FP4)
@@ -241,7 +244,7 @@ class FlashAttentionForwardSm100:
         - Configures pipeline stages for softmax, correction, and epilogue operations
         """
         # do not increase if only testing quant qk
-        self.kv_stage = 12 if self.q_dtype.width < 8 and self.v_dtype.width < 8 else 3 
+        self.kv_stage = 8 if self.q_dtype.width < 8 and self.v_dtype.width < 8 else 3 
         self.acc_stage = 1
         self.epi_stage = 2
         # For hdim 192,128, we don't have enough smem to store all 3 stages of KV:
@@ -1981,6 +1984,7 @@ class FlashAttentionForwardSm100:
                         # wait for Si to be copied to reg
                         # if cute.arch.thread_idx()[0] % 32 == 0:
                         #     cute.printf("waiting on iter 0 stage %d\n", stage)
+                        sm100_utils.tcgen05_after_thread_sync()
                         cute.arch.mbarrier_wait(mbar_ptr + self.mbar_sfqk_load_offset + stage, mma_sfqk_producer_phase)
                         _, _, tCtSFQ_compact_s2t = tiled_copy_s2t_sfq_staged[stage]
                         tCsSFQ_compact_s2t_staged = tCsSFQ_compact_s2t[None, None, None, None, stage]
@@ -2114,6 +2118,7 @@ class FlashAttentionForwardSm100:
                             # wait for Si to be copied to reg
                             # if cute.arch.thread_idx()[0] % 32 == 0:
                             #     cute.printf("waiting on iter %d stage %d\n", block_loop_count, stage)
+                            sm100_utils.tcgen05_after_thread_sync()
                             cute.arch.mbarrier_wait(mbar_ptr + self.mbar_sfqk_load_offset + stage, mma_sfqk_producer_phase)
                             cute.copy(
                                 tiled_copy_s2t_sfq,
@@ -2327,8 +2332,8 @@ class FlashAttentionForwardSm100:
 
             softmax = SoftmaxSm100.create(
                 softmax_scale_log2,
-                rescale_threshold=8.0 if const_expr(self.q_dtype.width == 16) else 0.0, # (Wenxuan) disable skipping rescale until FP4 precision is verified
-                # rescale_threshold=8.0 if const_expr(self.v_dtype.width == 16) else 0.0, # (Wenxuan) disable skipping rescale until FP4 precision is verified
+                rescale_threshold=8.0,
+                # rescale_threshold=8.0 if const_expr(self.q_dtype.width == 16) else 0.0, # (Wenxuan) disable skipping rescale until FP4 precision is verified
                 softmax_scale=softmax_scale,
                 quant_pv=self.quant_pv,
                 compute_sp1=self.compute_sp1,
@@ -2505,25 +2510,26 @@ class FlashAttentionForwardSm100:
                    ):
         tSrP_f32_frag = cute.logical_divide(tSrP_f32, cute.make_layout(self.sf_vec_size))
         assert cute.size(tSrP_f32_frag, mode=[1]) == cute.size(tSrPSF_f32)
-
         tSrP_frag = cute.logical_divide(tSrP, cute.make_layout(self.sf_vec_size))
         tSrPSF_u32_view = cute.recast_tensor(tSrPSF, cute.Int32)
 
         for i in cutlass.range_constexpr(0, cute.size(tSrP_f32_frag, mode=[1])):
+        # for i in cutlass.range_constexpr(0, 2):
             tSrP_f32_frag.store(tSrP_f32_frag.load() / tSrPSF_f32[i])
-            
+
         # Process in groups of 4 for UE4M3 conversion
-        for i in cutlass.range_constexpr(0, cute.size(tSrPSF_f32)):
-            if i + 3 < cute.size(tSrPSF_f32):
-                # Pack 4 FP32 values into UE4M3 format
-                packed_ue4m3 = packed_float_to_ue4m3(
-                    tSrPSF_f32[i],
-                    tSrPSF_f32[i + 1], 
-                    tSrPSF_f32[i + 2],
-                    tSrPSF_f32[i + 3]
-                )
-                tSrPSF_u32_view[i // 4] = packed_ue4m3
-        
+        assert cute.size(tSrPSF_f32) % 4 == 0
+        for i in cutlass.range_constexpr(0, cute.size(tSrPSF_f32) // 4):
+        # for i in cutlass.range_constexpr(0, 2):
+            # Pack 4 FP32 values into UE4M3 format
+            packed_ue4m3 = packed_float_to_ue4m3(
+                tSrPSF_f32[i * 4],
+                tSrPSF_f32[i * 4 + 1], 
+                tSrPSF_f32[i * 4 + 2],
+                tSrPSF_f32[i * 4 + 3]
+            )
+            tSrPSF_u32_view[i // 4] = packed_ue4m3
+    
         # Quantize main tensor to E2M1 format (8 values per uint32_t)
         # Process in groups of 8 for E2M1 conversion
         for i in cutlass.range_constexpr(0, cute.size(tSrP_frag, mode=[1])):
@@ -2594,6 +2600,7 @@ class FlashAttentionForwardSm100:
         cute.arch.mbarrier_wait(mbar_ptr + self.mbar_S_full_offset + stage, mma_si_consumer_phase)
         tSrS_t2r = cute.make_fragment(thr_tmem_load.partition_D(tScS).shape, self.qk_acc_dtype)
         cute.copy(thr_tmem_load, tStS_t2r, tSrS_t2r)
+        
         # unblock sfqk load
         cute.arch.fence_view_async_tmem_load()
         sfqk_stage = self.q_stage - 1 - stage
@@ -2662,7 +2669,7 @@ class FlashAttentionForwardSm100:
                 e2e=mask_fn is None and self.head_dim_padded <= 128,
                 e2e_freq=self.e2e_freq,
             )
-            self._quant_fp4(tSrS_t2r, tSrPSF_f32, tSrP_r2t, tSrPSF)
+            # self._quant_fp4(tSrS_t2r, tSrPSF_f32, tSrP_r2t, tSrPSF)
             # TODO(wenxuan) tcgen05.st
         else:
             # softmax.scale_apply_exp2_convert(tSrS_t2r, row_max, tSrP_r2t)
