@@ -1927,6 +1927,7 @@ class FlashAttentionForwardSm100:
         
         
         # NOTE Debug
+        tidx = cute.arch.thread_idx()[0] % cute.arch.WARP_SIZE
         # Copy sSFQ from smem to reg fragment for debugging
         # if const_expr(self.quant_qk) and sSFQ is not None:
         #     # Filter zeros to get compact layout and get stage 0
@@ -1942,6 +1943,22 @@ class FlashAttentionForwardSm100:
         #     if tidx == 0:
         #         tSrSFQ_f32.store(tSrSFQ.load().to(cute.Float32))
         #         cute.print_tensor(tSrSFQ_f32)
+    
+        # Copy tSrQ from smem to reg fragment for debugging
+        # if const_expr(self.quant_qk) and sQ is not None:
+        #     # Filter zeros to get compact layout and get stage 0
+        #     sQ_compact = cute.filter_zeros(sQ[None, None, 0, 1])
+        #     # sSFQ_compact = cute.filter_zeros(sSFK[None, None, 0, 1])
+        #     sQ_slice = cute.logical_divide(sQ_compact, cute.make_layout(16))[None, 1]
+        #     # Create register fragment with matching shape
+        #     tSrQ_frag = cute.make_fragment_like(sQ_slice, Float4E2M1FN)
+        #     # Copy from smem to rmem using autovec_copy
+        #     cute.autovec_copy(sQ_slice, tSrQ_frag)
+        #     tSrQ_f32 = cute.make_fragment_like(tSrQ_frag, Float32)
+        #     # Print to check for NaN
+        #     if tidx == 0:
+        #         tSrQ_f32.store(tSrQ_frag.load().to(cute.Float32))
+        #         cute.print_tensor(tSrQ_f32)
     
         mma_sfqk_producer_phase = Int32(0)
         while work_tile.is_valid_tile:
@@ -2010,13 +2027,15 @@ class FlashAttentionForwardSm100:
                     #         tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(8)), 
                     #         Float8E4M3FN,
                     #     )
-                    #     thr_tmem_load = tcgen05.make_tmem_copy(tmem_load_atom, tCtSFQs[0]).get_slice(tidx)
-                    #     tCtSFQs0_t2r = thr_tmem_load.partition_S(tCtSFQs[stage])
-                    #     tCrSFQs0_t2r_shape = thr_tmem_load.partition_D(tCtSFQs[stage]).shape
-                    #     tCrSFQs0_t2r = cute.make_fragment(tCrSFQs0_t2r_shape, Float8E4M3FN)
-                    #     cute.copy(thr_tmem_load, tCtSFQs0_t2r, tCrSFQs0_t2r)
-                    #     if tidx == 0:
-                    #         cute.print_tensor(tCrSFQs0_t2r.load().to(Float32))
+                        # thr_tmem_load = tcgen05.make_tmem_copy(tmem_load_atom, tCtSFQs[0]).get_slice(tidx)
+                        # tCtSFQs0_t2r = thr_tmem_load.partition_S(tCtSFQs[stage])
+                        # tCrSFQs0_t2r_shape = thr_tmem_load.partition_D(tCtSFQs[stage]).shape
+                        # tCrSFQs0_t2r = cute.make_fragment(tCrSFQs0_t2r_shape, Float8E4M3FN)
+                        # cute.copy(thr_tmem_load, tCtSFQs0_t2r, tCrSFQs0_t2r)
+                        # if tidx == 0:
+                        #     cute.print_tensor(tCrSFQs0_t2r.load().to(Float32))
+    
+
                     
                     # 3. gemm
                     # tiled_mma_qk = sm100_utils.gemm(tiled_mma_qk, tStSs[stage], tSrQs[stage], tSrKi, zero_init=True)
@@ -2669,7 +2688,7 @@ class FlashAttentionForwardSm100:
                 e2e=mask_fn is None and self.head_dim_padded <= 128,
                 e2e_freq=self.e2e_freq,
             )
-            # self._quant_fp4(tSrS_t2r, tSrPSF_f32, tSrP_r2t, tSrPSF)
+            self._quant_fp4(tSrS_t2r, tSrPSF_f32, tSrP_r2t, tSrPSF)
             # TODO(wenxuan) tcgen05.st
         else:
             # softmax.scale_apply_exp2_convert(tSrS_t2r, row_max, tSrP_r2t)

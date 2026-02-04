@@ -112,7 +112,7 @@ def cvt_sf_MKL_to_M32x4xrm_K4xrk_L(
         sf_mma_tensor[mma_coord] = sf_ref_tensor[mkl_coord]
 
 
-def create_scale_factor_tensor(batch, seqlen, nheads, headdim, sf_vec_size, sf_dtype, q_dtype, device='cuda'):
+def create_scale_factor_tensor(batch, seqlen, nheads, headdim, sf_vec_size, sf_dtype, q_dtype, device='cuda', debug=False):
     """Create scale factor tensor for Q/K/V.
     
     Args:
@@ -159,15 +159,12 @@ def create_scale_factor_tensor(batch, seqlen, nheads, headdim, sf_vec_size, sf_d
     mma_permute_order = (4, 5, 2, 6, 3, 1, 0)
     
     # Create f32 ref torch tensor (cpu)
+    init_type = cutlass_torch.TensorInitType.SCALAR
+    init_config = cutlass_torch.ScalarInitConfig(
+        value=1.0
+    )
     ref_f32_torch_tensor_cpu = cutlass_torch.create_and_permute_torch_tensor(
-        ref_shape,
-        torch.float32,
-        permute_order=ref_permute_order,
-        init_type=cutlass_torch.TensorInitType.RANDOM,
-        init_config=cutlass_torch.RandomInitConfig(
-            min_val=1,
-            max_val=3,
-        ),
+        ref_shape, torch.float32, permute_order=ref_permute_order, init_type=init_type, init_config=init_config
     )
     
     # Create f32 cute torch tensor (cpu)
@@ -175,11 +172,8 @@ def create_scale_factor_tensor(batch, seqlen, nheads, headdim, sf_vec_size, sf_d
         mma_shape,
         torch.float32,
         permute_order=mma_permute_order,
-        init_type=cutlass_torch.TensorInitType.RANDOM,
-        init_config=cutlass_torch.RandomInitConfig(
-            min_val=0,
-            max_val=1,
-        ),
+        init_type=init_type,
+        init_config=init_config,
     )
     
     # convert ref f32 tensor to cute f32 tensor
@@ -228,7 +222,7 @@ def create_scale_factor_tensor(batch, seqlen, nheads, headdim, sf_vec_size, sf_d
 
 def create_fp4_attention_tensors(batch, seqlen_q, seqlen_k, nheads, nheads_kv, headdim, headdim_v, 
                                   device='cuda', dtype_gen=torch.bfloat16, quant_v=False, return_torch=True,
-                                  ab_dtype=None, sf_dtype=None, sf_vec_size=None):
+                                  ab_dtype=None, sf_dtype=None, sf_vec_size=None, debug=False):
     """Create FP4 attention tensors (Q, K, V) with scale factors.
     
     Args:
@@ -261,10 +255,15 @@ def create_fp4_attention_tensors(batch, seqlen_q, seqlen_k, nheads, nheads_kv, h
         sf_vec_size = 16  # 1 scale factor per 16 elements
     
     # Create reference FP32 tensors
-    q_ref = torch.randn(batch, seqlen_q, nheads, headdim, device=device, dtype=torch.float32)
-    k_ref = torch.randn(batch, seqlen_k, nheads_kv, headdim, device=device, dtype=torch.float32)
-    v_ref = torch.randn(batch, seqlen_k, nheads_kv, headdim_v, device=device, dtype=torch.float32)
-    
+    if debug:
+        q_ref = torch.full((batch, seqlen_q, nheads, headdim), fill_value=2.5, device=device, dtype=torch.float32)
+        k_ref = torch.full((batch, seqlen_k, nheads_kv, headdim), fill_value=2.5, device=device, dtype=torch.float32)
+        v_ref = torch.full((batch, seqlen_k, nheads_kv, headdim_v), fill_value=2.5, device=device, dtype=torch.float32)
+    else:
+        q_ref = torch.randn(batch, seqlen_q, nheads, headdim, device=device, dtype=torch.float32)
+        k_ref = torch.randn(batch, seqlen_k, nheads_kv, headdim, device=device, dtype=torch.float32)
+        v_ref = torch.randn(batch, seqlen_k, nheads_kv, headdim_v, device=device, dtype=torch.float32)
+
     # Create FP4 tensors for Q and K (V quantization is optional)
     # First create CUTE tensors for Q and K
     q_tensor, q_torch_underlying = cutlass_torch.cute_tensor_like(
@@ -341,22 +340,25 @@ def create_fp4_attention_tensors(batch, seqlen_q, seqlen_k, nheads, nheads_kv, h
     # For Q: (batch, nheads, seqlen_q, headdim) -> scale factors for headdim dimension
     # Scale factors are per (batch * nheads, seqlen_q, ceil_div(headdim, sf_vec_size))
     q_sf_ref, q_sf_tensor, q_sf_torch_underlying = create_scale_factor_tensor(
-        batch, seqlen_q, nheads, headdim, sf_vec_size, sf_dtype, ab_dtype, device
+        batch, seqlen_q, nheads, headdim, sf_vec_size, sf_dtype, ab_dtype, 
+        device, debug=debug
     )
     # For K: (batch, nheads_kv, seqlen_k, headdim) -> scale factors for headdim dimension
     k_sf_ref, k_sf_tensor, k_sf_torch_underlying = create_scale_factor_tensor(
-        batch, seqlen_k, nheads_kv, headdim, sf_vec_size, sf_dtype, ab_dtype, device
+        batch, seqlen_k, nheads_kv, headdim, sf_vec_size, sf_dtype, ab_dtype, 
+        device, debug=debug
     )
     
     # Create V scale factors only if V is being quantized
     if quant_v:
         v_sf_ref, v_sf_tensor, v_sf_torch_underlying = create_scale_factor_tensor(
-            batch, seqlen_k, nheads_kv, headdim_v, sf_vec_size, sf_dtype, ab_dtype, device
+            batch, seqlen_k, nheads_kv, headdim_v, sf_vec_size, sf_dtype, ab_dtype, device, debug=debug
         )
     else:
         v_sf_tensor = None
         v_sf_torch_underlying = None
 
+    # TODO: multiply qkv ref with scale factor tensors
     if return_torch:
         return (q_torch_underlying, k_torch_underlying, v_torch_underlying, q_sf_torch_underlying, k_sf_torch_underlying, v_sf_torch_underlying, 
                 q_ref, k_ref, v_ref)
@@ -370,7 +372,7 @@ def time_fwd(func, *args, repeats=30, verbose=True, desc="", **kwargs):
     return Timing(do_bench(lambda: func(*args, **kwargs), warmup=5, rep=repeats) * 1e-3)
 
 
-def main(ab_dtype, sf_dtype, sf_vec_size, quant_v=False):
+def main(ab_dtype, sf_dtype, sf_vec_size, quant_v=False, debug=False):
     """Main benchmark function.
     
     Args:
@@ -411,23 +413,18 @@ def main(ab_dtype, sf_dtype, sf_vec_size, quant_v=False):
         print(f"\n### Batch={batch_size}, SeqLen={seqlen} ###")
         
         # Create FP4 tensors (V quantization is optional)
-        try:
-            (q_fp4, k_fp4, v_tensor, q_sf, k_sf, v_sf, 
-             q_ref, k_ref, v_ref) = create_fp4_attention_tensors(
-                batch_size, seqlen_q, seqlen, nheads, nheads_kv, 
-                headdim, headdim_v, device, dtype_gen, quant_v=quant_v, return_torch=False,
-                ab_dtype=ab_dtype, sf_dtype=sf_dtype, sf_vec_size=sf_vec_size
-            )
-            q_sf_torch = check_tensor_for_nans(q_sf, name="q_sf")
-            k_sf_torch = check_tensor_for_nans(k_sf, name="k_sf")
-            if quant_v:
-                v_sf_torch = check_tensor_for_nans(v_sf, name="v_sf")
+        (q_fp4, k_fp4, v_tensor, q_sf, k_sf, v_sf, 
+            q_ref, k_ref, v_ref) = create_fp4_attention_tensors(
+            batch_size, seqlen_q, seqlen, nheads, nheads_kv, 
+            headdim, headdim_v, device, dtype_gen, quant_v=quant_v, return_torch=False,
+            ab_dtype=ab_dtype, sf_dtype=sf_dtype, sf_vec_size=sf_vec_size,
+            debug=debug
+        )
+        q_sf_torch = check_tensor_for_nans(q_sf, name="q_sf")
+        k_sf_torch = check_tensor_for_nans(k_sf, name="k_sf")
+        if quant_v:
+            v_sf_torch = check_tensor_for_nans(v_sf, name="v_sf")
 
-        except Exception as e:
-            print(f"Failed to create FP4 tensors: {e}")
-            import traceback
-            traceback.print_exc()
-            continue
         
         # Calculate FLOPS
         nFLOPS = flops(batch_size, nheads, seqlen_q, seqlen, headdim, headdim_v, 
@@ -482,7 +479,6 @@ def main(ab_dtype, sf_dtype, sf_vec_size, quant_v=False):
             q_ref = q_ref.to(dtype_gen)
             k_ref = k_ref.to(dtype_gen)
             v_ref = v_ref.to(dtype_gen)
-            
             m_ref = time_fwd(
                 flash_attn_func_python,
                 q_ref, k_ref, v_ref,
@@ -518,6 +514,7 @@ if __name__ == "__main__":
         action="store_true",
         help="Quantize V to FP4 (default: False, only QK are quantized)"
     )
+    parser.add_argument("--debug", action="store_true", help="Debug precision, set all tensors to 1.0")
     # parser.add_argument("--ab_dtype", type=cutlass.dtype, default=cutlass.Float4E2M1FN)
     # parser.add_argument("--sf_dtype", type=cutlass.dtype, default=cutlass.Float8E4M3FN)
 
@@ -525,5 +522,5 @@ if __name__ == "__main__":
     ab_dtype = cutlass.Float4E2M1FN
     sf_dtype = cutlass.Float8E4M3FN
     sf_vec_size = 16
-    main(ab_dtype, sf_dtype, sf_vec_size, args.quant_v)
+    main(ab_dtype, sf_dtype, sf_vec_size, args.quant_v, args.debug)
 
