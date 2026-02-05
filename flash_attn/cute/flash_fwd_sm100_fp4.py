@@ -157,7 +157,6 @@ class FlashAttentionForwardSm100:
         self.epilogue_warp_ids = (13,)
         self.load_warp_ids = (14,)
         self.empty_warp_ids = (15,)
-        # self.empty_warp_ids = ()
         SM100_TMEM_CAPACITY_COLUMNS = 512
         self.tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
 
@@ -650,7 +649,6 @@ class FlashAttentionForwardSm100:
                 self.cluster_shape_mn, tiled_mma_qk.thr_id
             )
             mSFQ = cute.make_tensor(mSFQ.iterator, sfq_layout)
-
             tma_atom_sfq, tma_tensor_sfq = make_tiled_tma_atom_A(
                 sfq_op,
                 mSFQ,
@@ -2532,9 +2530,9 @@ class FlashAttentionForwardSm100:
         tSrP_frag = cute.logical_divide(tSrP, cute.make_layout(self.sf_vec_size))
         tSrPSF_u32_view = cute.recast_tensor(tSrPSF, cute.Int32)
 
-        for i in cutlass.range_constexpr(0, cute.size(tSrP_f32_frag, mode=[1])):
+        for i in cutlass.range_constexpr(0, cute.size(tSrP_f32_frag, mode=[1]), unroll=2):
         # for i in cutlass.range_constexpr(0, 2):
-            tSrP_f32_frag.store(tSrP_f32_frag.load() / tSrPSF_f32[i])
+            tSrP_f32_frag[None, i].store(tSrP_f32_frag[None, i].load() / tSrPSF_f32[i])
 
         # Process in groups of 4 for UE4M3 conversion
         assert cute.size(tSrPSF_f32) % 4 == 0
@@ -2551,7 +2549,7 @@ class FlashAttentionForwardSm100:
     
         # Quantize main tensor to E2M1 format (8 values per uint32_t)
         # Process in groups of 8 for E2M1 conversion
-        for i in cutlass.range_constexpr(0, cute.size(tSrP_frag, mode=[1])):
+        for i in cutlass.range_constexpr(0, cute.size(tSrP_frag, mode=[1]), unroll=2):
             tSrP_u32_view = cute.recast_tensor(tSrP_frag[None, i], cute.Int32)
             for k in cutlass.range_constexpr(0, cute.size(tSrP_u32_view, mode=[0])):
                 packed_e2m1 = packed_float_to_e2m1(
