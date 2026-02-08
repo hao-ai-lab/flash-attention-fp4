@@ -2530,10 +2530,6 @@ class FlashAttentionForwardSm100:
         tSrP_frag = cute.logical_divide(tSrP, cute.make_layout(self.sf_vec_size))
         tSrPSF_u32_view = cute.recast_tensor(tSrPSF, cute.Int32)
 
-        for i in cutlass.range_constexpr(0, cute.size(tSrP_f32_frag, mode=[1]), unroll=2):
-        # for i in cutlass.range_constexpr(0, 2):
-            tSrP_f32_frag[None, i].store(tSrP_f32_frag[None, i].load() / tSrPSF_f32[i])
-
         # Process in groups of 4 for UE4M3 conversion
         assert cute.size(tSrPSF_f32) % 4 == 0
         for i in cutlass.range_constexpr(0, cute.size(tSrPSF_f32) // 4):
@@ -2686,6 +2682,7 @@ class FlashAttentionForwardSm100:
                 e2e=mask_fn is None and self.head_dim_padded <= 128,
                 e2e_freq=self.e2e_freq,
             )
+            softmax.update_row_sum_sage(tSrS_t2r, tSrPSF_f32, acc_scale, is_first)
             self._quant_fp4(tSrS_t2r, tSrPSF_f32, tSrP_r2t, tSrPSF)
             # TODO(wenxuan) tcgen05.st
         else:
@@ -2716,7 +2713,8 @@ class FlashAttentionForwardSm100:
         cute.arch.mbarrier_wait(
             mbar_ptr + self.mbar_softmax_corr_empty_offset + stage, si_corr_producer_phase
         )
-        softmax.update_row_sum(tSrS_t2r.load(), acc_scale, is_first)
+        if const_expr(not self.quant_pv): # quant_pv already updated row sum
+            softmax.update_row_sum(tSrS_t2r.load(), acc_scale, is_first)
         # acc_scale = cute.arch.exp2(acc_scale_)
         return mma_si_consumer_phase ^ 1, si_corr_producer_phase ^ 1, s0_s1_sequence_phase ^ 1
 

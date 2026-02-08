@@ -227,7 +227,19 @@ class SoftmaxSm100(Softmax):
         # self.row_sum[0] = self._compute_row_sum(acc_S_row_exp, init_val=self.row_sum[0] * row_scale)
         self.row_sum[0] = self._compute_row_sum(acc_S_row_exp, init_val=init_val)
         # tmp = self._compute_row_sum(acc_S_row_exp)
-        # self.row_sum[0] = self.row_sum[0] * row_scale + tmp
+
+    @cute.jit
+    def update_row_sum_sage(
+        self, acc_S_row_exp: cute.Tensor, acc_S_row_group_max_exp: cute.Tensor, row_scale: Float32, is_first: int = False
+    ) -> None:
+        init_val = self.row_sum[0] * row_scale if cutlass.const_expr(not is_first) else None
+        vec_size = const_expr(cute.size(acc_S_row_exp) // cute.size(acc_S_row_group_max_exp))
+        acc_S_row_exp_frag = cute.logical_divide(acc_S_row_exp, cute.make_layout(vec_size))
+        acc_S_group_sum = cute.make_rmem_tensor(acc_S_row_group_max_exp.layout, dtype=Float32)
+
+        for i in cutlass.range_constexpr(0, cute.size(acc_S_row_exp_frag, mode=[1])):
+            acc_S_group_sum[i] = self._compute_row_sum(acc_S_row_exp_frag[None, i].load()) * acc_S_row_group_max_exp[i]
+        self.row_sum[0]= self._compute_row_sum(acc_S_group_sum.load(), init_val=init_val)
 
     @cute.jit
     def scale_subtract_rowmax(
@@ -244,13 +256,6 @@ class SoftmaxSm100(Softmax):
         else:
             row_max_scaled = row_max * self.scale_log2
 
-        for i in cutlass.range(0, cute.size(acc_S_row.shape), 2, unroll_full=True):
-            acc_S_row[i], acc_S_row[i + 1] = utils.fma_packed_f32x2(
-                (acc_S_row[i], acc_S_row[i + 1]),
-                (self.scale_log2, self.scale_log2),
-                (-row_max_scaled, -row_max_scaled),
-            )
-        
         if const_expr(acc_S_row_group_max is not None):
             if const_expr(self.compute_sp1) and const_expr(self.quant_pv):
                 row_max_scaled += self.fp4_scale_log2 # / 6 to scale to fp4 max
@@ -260,7 +265,23 @@ class SoftmaxSm100(Softmax):
                     (self.scale_log2, self.scale_log2),
                     (-row_max_scaled, -row_max_scaled),
                 )
-
+            vec_size = cute.size(acc_S_row) // cute.size(acc_S_row_group_max)
+            acc_S_row_frag = cute.logical_divide(acc_S_row, cute.make_layout(vec_size))
+            for j in cutlass.range_constexpr(0, cute.size(acc_S_row_frag, mode=[1])):
+                for i in cutlass.range(0, cute.size(acc_S_row_frag, mode=[0]), 2, unroll_full=True):
+                    bias = -row_max_scaled - acc_S_row_group_max[j]
+                    acc_S_row_frag[i, j], acc_S_row_frag[i + 1, j] = utils.fma_packed_f32x2(
+                        (acc_S_row_frag[i, j], acc_S_row_frag[i + 1, j]),
+                        (self.scale_log2, self.scale_log2),
+                        (bias, bias),
+                    )
+        else:
+            for i in cutlass.range(0, cute.size(acc_S_row.shape), 2, unroll_full=True):
+                acc_S_row[i], acc_S_row[i + 1] = utils.fma_packed_f32x2(
+                    (acc_S_row[i], acc_S_row[i + 1]),
+                    (self.scale_log2, self.scale_log2),
+                    (-row_max_scaled, -row_max_scaled),
+                )
 
     @cute.jit
     def apply_exp2_convert(
@@ -303,6 +324,48 @@ class SoftmaxSm100(Softmax):
                 acc_S_row_converted_frg[None, j].store(
                     acc_S_row_frg[None, j].load().to(acc_S_row_converted.element_type)
                 )
+                
+    @cute.jit
+    def fused_exp2_scale_update_rowsum(self,
+                                       # exp2 related
+                                       acc_S_row: cute.Tensor, # 128 f32
+                                       acc_S_row_group_max: cute.Tensor, # 8 f32
+                                       row_scale: Float32,
+                                       is_first: int = False,
+                                       e2e: cutlass.Constexpr[bool] = False,
+                                       e2e_freq: cutlass.Constexpr[int] = 16,
+                                       e2e_res: cutlass.Constexpr[int] = 4,
+                                       e2e_frg_limit: cutlass.Constexpr[int] = 1,
+                                      ):
+        # This function does: 
+        # 1. Apply exp2 to S (get P) and group max of S (get sp2)
+        # 2. Rescale and accumulate P to rowsum
+        # 3. Scale P by divide sp2
+        assert cute.size(acc_S_row.shape) % 2 == 0, "acc_S_row must have an even number of elements"
+        frg_tile = min(32, cute.size(acc_S_row))
+        assert frg_tile % 2 == 0
+        frg_cnt = cute.size(acc_S_row) // frg_tile
+        assert cute.size(acc_S_row) % frg_tile == 0
+        acc_S_row_frg = cute.logical_divide(acc_S_row, cute.make_layout(frg_tile))
+        for j in cutlass.range_constexpr(frg_cnt):
+            for k in cutlass.range_constexpr(0, cute.size(acc_S_row_frg, mode=[0]), 2):
+                # acc_S_row_frg[k, j] = utils.exp2f(acc_S_row_frg[k, j])
+                # acc_S_row_frg[k + 1, j] = utils.exp2f(acc_S_row_frg[k + 1, j])
+                if cutlass.const_expr(not e2e):
+                    acc_S_row_frg[k, j] = cute.arch.exp2(acc_S_row_frg[k, j])
+                    acc_S_row_frg[k + 1, j] = cute.arch.exp2(acc_S_row_frg[k + 1, j])
+                else:
+                    if cutlass.const_expr(
+                        k % e2e_freq < e2e_freq - e2e_res or j >= frg_cnt - e2e_frg_limit
+                    ):
+                        acc_S_row_frg[k, j] = cute.arch.exp2(acc_S_row_frg[k, j])
+                        acc_S_row_frg[k + 1, j] = cute.arch.exp2(acc_S_row_frg[k + 1, j])
+                    else:
+                        # acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = utils.e2e_asm2(acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j])
+                        acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = utils.ex2_emulation_2(
+                            acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j]
+                        )
+        
 
     @cute.jit
     def apply_sage_sp1(self, P_row: cute.Tensor):
