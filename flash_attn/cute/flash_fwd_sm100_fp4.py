@@ -2536,7 +2536,7 @@ class FlashAttentionForwardSm100:
 
         # Process in groups of 4 for UE4M3 conversion
         assert cute.size(tSrPSF_f32) % 4 == 0
-        for i in cutlass.range_constexpr(0, cute.size(tSrPSF_f32) // 4):
+        for i in cutlass.range_constexpr(0, cute.size(tSrPSF_f32) // 4, unroll=1):
         # for i in cutlass.range_constexpr(0, 2):
             # Pack 4 FP32 values into UE4M3 format
             packed_ue4m3 = packed_float_to_ue4m3(
@@ -2611,6 +2611,7 @@ class FlashAttentionForwardSm100:
         tilePlikeFP32 = self.mma_tiler_qk[1] // Float32.width * self.v_dtype.width
         tScS = thr_mma_qk.partition_C(cute.make_identity_tensor(self.mma_tiler_qk[:2]))
         tScScale = cute.composition(tScS, cute.make_layout((self.m_block_size, 1)))
+        # P size when in FP32
         tScP = cute.composition(tScS, cute.make_layout((self.m_block_size, tilePlikeFP32)))
 
         # Wait for Si
@@ -2672,8 +2673,10 @@ class FlashAttentionForwardSm100:
         tSrP_r2t_f32 = cute.make_fragment(thr_tmem_store.partition_S(tScP).shape, Float32)
         tSrP_r2t = cute.make_tensor(
             cute.recast_ptr(tSrP_r2t_f32.iterator, dtype=self.v_dtype),
-            tSrS_t2r.layout,
+            tSrS_t2r.layout, # shape of S owned by this thread
         )
+
+
         if const_expr(self.quant_pv):
             # Exp2 with softmax scale and sp1 scaling
             softmax.apply_exp2_convert(
