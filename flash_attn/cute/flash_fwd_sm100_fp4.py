@@ -2545,7 +2545,7 @@ class FlashAttentionForwardSm100:
     
         # Quantize main tensor to E2M1 format (8 values per uint32_t)
         # Process in groups of 8 for E2M1 conversion
-        for i in cutlass.range_constexpr(0, cute.size(tSrP_frag, mode=[1]), unroll=2):
+        for i in cutlass.range_constexpr(0, cute.size(tSrP_frag, mode=[1])):
             tSrP_u32_view = cute.recast_tensor(tSrP_frag[None, i], cute.Int32)
             for k in cutlass.range_constexpr(0, cute.size(tSrP_u32_view, mode=[0])):
                 packed_e2m1 = packed_float_to_e2m1(

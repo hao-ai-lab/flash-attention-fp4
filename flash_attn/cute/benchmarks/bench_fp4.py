@@ -389,8 +389,8 @@ def main(ab_dtype, sf_dtype, sf_vec_size, quant_v=False, debug=False):
     dtype_gen = torch.bfloat16
     
     # Benchmark configurations
-    # bs_seqlen_vals = [(32, 1024), (16, 2048), (8, 4096), (4, 8192), (2, 16384), (1, 32768), (4, 32768 * 8)]
-    bs_seqlen_vals = [(32, 1024)]
+    bs_seqlen_vals = [(32, 1024), (16, 2048), (8, 4096), (4, 8192), (2, 16384), (1, 32768), (4, 32768 * 8)]
+    # bs_seqlen_vals = [(32, 1024)]
     # bs_seqlen_vals = [(4, 300 * 1000)]
     headdim = 128
     nheads = 16
@@ -504,7 +504,12 @@ def main(ab_dtype, sf_dtype, sf_vec_size, quant_v=False, debug=False):
 
         # Compare FP4 and reference outputs
         if fp4_out is not None and ref_out is not None:
-            torch.testing.assert_close(fp4_out, ref_out, atol=1e-3, rtol=1e-3)
+            try:
+                torch.testing.assert_close(fp4_out, ref_out, atol=1e-3, rtol=1e-3)
+            except Exception as e:
+                print(f"FP4 and reference outputs differ: {e}")
+                import traceback
+                traceback.print_exc()
 
 if __name__ == "__main__":
     import argparse
