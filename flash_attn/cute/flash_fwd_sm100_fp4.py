@@ -476,7 +476,7 @@ class FlashAttentionForwardSm100:
             self.num_regs_other = 48
         else:
             # self.num_regs_softmax = 192 if self.is_causal or self.is_local else 184
-            self.num_regs_softmax = 200
+            self.num_regs_softmax = 208
             # self.num_regs_softmax = 176
             # self.num_regs_correction = 96
             # self.num_regs_correction = 80
@@ -485,13 +485,10 @@ class FlashAttentionForwardSm100:
             # self.num_regs_other = 32
             # self.num_regs_other = 64
             # self.num_regs_other = 80
-            self.num_regs_other = 48
+            self.num_regs_other = 24
             # self.num_regs_other = 96 if self.is_causal or self.is_local else 80
             # self.num_regs_other = 64 if self.is_causal or self.is_local else 80
         self.num_regs_empty = 24
-        if len(self.empty_warp_ids) == 0:
-            self.num_regs_softmax += self.num_regs_empty * cute.arch.WARP_SIZE // ((len(self.softmax0_warp_ids) + len(self.softmax1_warp_ids)) * cute.arch.WARP_SIZE)
-            self.num_regs_softmax = int(math.floor(self.num_regs_softmax / 8)) * 8
         self.buffer_align_bytes = 1024
         
         # Scale factor parameters for block-scaled quantization (FP4)
