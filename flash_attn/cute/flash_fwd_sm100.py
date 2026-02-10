@@ -151,7 +151,7 @@ class FlashAttentionForwardSm100:
         self.mma_warp_id = 12
         self.epilogue_warp_ids = (13,)
         self.load_warp_ids = (14,)
-        self.empty_warp_ids = (15,)
+        self.empty_warp_ids = (15, )
         SM100_TMEM_CAPACITY_COLUMNS = 512
         self.tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
 
@@ -801,10 +801,10 @@ class FlashAttentionForwardSm100:
         if warp_idx == 2:
             for i in cutlass.range_constexpr(self.q_stage):
                 cute.arch.mbarrier_init(
-                    mbar_ptr + self.mbar_softmax_corr_empty_offset + i, cute.arch.WARP_SIZE * 4
+                    mbar_ptr + self.mbar_softmax_corr_empty_offset + i, cute.arch.WARP_SIZE * len(self.correction_warp_ids)
                 )
                 cute.arch.mbarrier_init(
-                    mbar_ptr + self.mbar_softmax_corr_full_offset + i, cute.arch.WARP_SIZE * 4
+                    mbar_ptr + self.mbar_softmax_corr_full_offset + i, cute.arch.WARP_SIZE * len(self.correction_warp_ids)
                 )
         if warp_idx == 3:
             if const_expr(self.s0_s1_barrier):
@@ -948,7 +948,7 @@ class FlashAttentionForwardSm100:
             if warp_idx == self.empty_warp_ids[1]:
                 cute.arch.warpgroup_reg_dealloc(self.num_regs_empty)
 
-        assert len(self.empty_warp_ids) <= 2
+        # assert len(self.empty_warp_ids) <= 2
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  LOAD

@@ -17,7 +17,7 @@ import enum
 import math
 from typing import Type, Tuple, Callable, Optional, Literal
 from functools import partial
-
+from dataclasses import dataclass
 import cuda.bindings.driver as cuda
 
 import cutlass
@@ -34,7 +34,8 @@ import flash_attn.cute.utils as utils
 from flash_attn.cute import copy_utils
 import flash_attn.cute.pipeline as pipeline
 from flash_attn.cute.mask import AttentionMask
-from flash_attn.cute.softmax import SoftmaxSm100, apply_score_mod_inner
+# from flash_attn.cute.softmax import SoftmaxSm100, apply_score_mod_inner
+from flash_attn.cute.softmax import Softmax, apply_score_mod_inner
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
 from flash_attn.cute.block_sparsity import BlockSparseTensors
@@ -57,6 +58,275 @@ from flash_attn.cute.tile_scheduler import (
     SingleTileVarlenScheduler,
     ParamsBase,
 )
+
+
+@dataclass
+class SoftmaxSm100(Softmax):
+    rescale_threshold: cutlass.Constexpr[float] = 0.0
+
+    fp8_scalexfp4_scale_log2: cutlass.Constexpr[float] = -11.392317422778762 # log2f(fp8_scalexfp4_scale=1.0 / (448 * 6))
+    fp4_scale_log2: cutlass.Constexpr[float] = -2.584962500721156 # log2f(fp4_scale=1 / 6)
+    quant_pv: cutlass.Constexpr[bool] = False
+    compute_sp1: cutlass.Constexpr[bool] = False
+
+    @staticmethod
+    def create(
+        scale_log2: Float32,
+        rescale_threshold: cutlass.Constexpr[float] = 0.0,
+        softmax_scale: Float32 | None = None,
+        quant_pv: cutlass.Constexpr[bool] = False,
+        compute_sp1: cutlass.Constexpr[bool] = False,
+    ):
+        num_rows = 1
+        arch = 100
+        row_max = cute.make_fragment(num_rows, Float32)
+        row_sum = cute.make_fragment(num_rows, Float32)
+
+        return SoftmaxSm100(
+            scale_log2,
+            num_rows,
+            row_max,
+            row_sum,
+            arch,
+            softmax_scale,
+            rescale_threshold=rescale_threshold,
+            quant_pv=quant_pv,
+            compute_sp1=compute_sp1,
+        )
+
+    @cute.jit
+    def update_row_max(self, acc_S_row: cute.TensorSSA, is_first: int) -> Tuple[Float32, Float32]:
+        if cutlass.const_expr(is_first):
+            row_max_new = self._compute_row_max(acc_S_row)
+            row_max_safe = row_max_new if row_max_new != -cutlass.Float32.inf else 0.0
+            acc_scale = 0.0
+        else:
+            row_max_old = self.row_max[0]
+            row_max_new = self._compute_row_max(acc_S_row, init_val=row_max_old)
+            row_max_safe = row_max_new if row_max_new != -cutlass.Float32.inf else 0.0
+            acc_scale_ = (row_max_old - row_max_safe) * self.scale_log2
+            acc_scale = utils.exp2f(acc_scale_)
+            if cutlass.const_expr(self.rescale_threshold > 0.0):
+                if acc_scale_ >= -self.rescale_threshold:
+                    row_max_new = row_max_old
+                    row_max_safe = row_max_old
+                    acc_scale = 1.0
+        self.row_max[0] = row_max_new
+        return row_max_safe, acc_scale
+
+    @cute.jit
+    def compute_group_max(self, acc_S_row: cute.Tensor, sf_size: cutlass.Constexpr[int] = 16) -> cute.Tensor:
+        acc_S_row_frag = cute.logical_divide(acc_S_row, cute.make_layout(sf_size))
+        num_frags = cute.size(acc_S_row_frag, mode=[1])
+        acc_S_row_group_max = cute.make_rmem_tensor(cute.make_layout(num_frags), Float32)
+        for i in cutlass.range_constexpr(num_frags):
+            acc_S_row_group_max[i] = self._compute_row_max(acc_S_row_frag[None, i].load())
+        return acc_S_row_group_max
+
+    def update_row_sum(
+        self, acc_S_row_exp: cute.TensorSSA, row_scale: Float32, is_first: int = False
+    ) -> None:
+        init_val = self.row_sum[0] * row_scale if cutlass.const_expr(not is_first) else None
+        # self.row_sum[0] = self._compute_row_sum(acc_S_row_exp, init_val=self.row_sum[0] * row_scale)
+        self.row_sum[0] = self._compute_row_sum(acc_S_row_exp, init_val=init_val)
+        # tmp = self._compute_row_sum(acc_S_row_exp)
+
+    @cute.jit
+    def update_row_sum_sage(
+        self, acc_S_row_exp: cute.Tensor, acc_S_row_group_max_exp: cute.Tensor, row_scale: Float32, is_first: int = False
+    ) -> None:
+        init_val = self.row_sum[0] * row_scale if cutlass.const_expr(not is_first) else None
+        vec_size = const_expr(cute.size(acc_S_row_exp) // cute.size(acc_S_row_group_max_exp))
+        acc_S_row_exp_frag = cute.logical_divide(acc_S_row_exp, cute.make_layout(vec_size))
+        acc_S_group_sum = cute.make_rmem_tensor(acc_S_row_group_max_exp.layout, dtype=Float32)
+
+        for i in cutlass.range_constexpr(0, cute.size(acc_S_row_exp_frag, mode=[1])):
+            acc_S_group_sum[i] = self._compute_row_sum(acc_S_row_exp_frag[None, i].load()) * acc_S_row_group_max_exp[i]
+        self.row_sum[0]= self._compute_row_sum(acc_S_group_sum.load(), init_val=init_val)
+
+    @cute.jit
+    def scale_subtract_rowmax(
+        self,
+        acc_S_row: cute.Tensor,
+        row_max: Float32,
+        acc_S_row_group_max: Optional[cute.Tensor] = None,
+    ):
+        assert cute.size(acc_S_row.shape) % 2 == 0, "acc_S_row must have an even number of elements"
+        
+        row_max_scaled = Float32(0.0)
+        if const_expr(self.compute_sp1) and const_expr(self.quant_pv):
+            row_max_scaled = row_max * self.scale_log2 + self.fp8_scalexfp4_scale_log2
+        else:
+            row_max_scaled = row_max * self.scale_log2
+
+        if const_expr(acc_S_row_group_max is not None):
+            if const_expr(self.compute_sp1) and const_expr(self.quant_pv):
+                row_max_scaled += self.fp4_scale_log2 # / 6 to scale to fp4 max
+            for i in cutlass.range(0, cute.size(acc_S_row_group_max.shape), 2, unroll_full=True):
+                acc_S_row_group_max[i], acc_S_row_group_max[i + 1] = utils.fma_packed_f32x2(
+                    (acc_S_row_group_max[i], acc_S_row_group_max[i + 1]),
+                    (self.scale_log2, self.scale_log2),
+                    (-row_max_scaled, -row_max_scaled),
+                )
+            vec_size = cute.size(acc_S_row) // cute.size(acc_S_row_group_max)
+            acc_S_row_frag = cute.logical_divide(acc_S_row, cute.make_layout(vec_size))
+            for j in cutlass.range_constexpr(0, cute.size(acc_S_row_frag, mode=[1])):
+                for i in cutlass.range(0, cute.size(acc_S_row_frag, mode=[0]), 2, unroll_full=True):
+                    bias = -row_max_scaled - acc_S_row_group_max[j]
+                    acc_S_row_frag[i, j], acc_S_row_frag[i + 1, j] = utils.fma_packed_f32x2(
+                        (acc_S_row_frag[i, j], acc_S_row_frag[i + 1, j]),
+                        (self.scale_log2, self.scale_log2),
+                        (bias, bias),
+                    )
+        else:
+            for i in cutlass.range(0, cute.size(acc_S_row.shape), 2, unroll_full=True):
+                acc_S_row[i], acc_S_row[i + 1] = utils.fma_packed_f32x2(
+                    (acc_S_row[i], acc_S_row[i + 1]),
+                    (self.scale_log2, self.scale_log2),
+                    (-row_max_scaled, -row_max_scaled),
+                )
+
+    @cute.jit
+    def apply_exp2_convert(
+        self,
+        acc_S_row: cute.Tensor,
+        acc_S_row_converted: Optional[cute.Tensor] = None,
+        e2e: cutlass.Constexpr[bool] = False,
+        e2e_freq: cutlass.Constexpr[int] = 16,
+        e2e_res: cutlass.Constexpr[int] = 4,
+        e2e_frg_limit: cutlass.Constexpr[int] = 1,
+    ):
+        assert cute.size(acc_S_row.shape) % 2 == 0, "acc_S_row must have an even number of elements"
+        frg_tile = min(32, cute.size(acc_S_row))
+        assert frg_tile % 2 == 0
+        frg_cnt = cute.size(acc_S_row) // frg_tile
+        assert cute.size(acc_S_row) % frg_tile == 0
+        acc_S_row_frg = cute.logical_divide(acc_S_row, cute.make_layout(frg_tile))
+        for j in cutlass.range_constexpr(frg_cnt):
+            for k in cutlass.range_constexpr(0, cute.size(acc_S_row_frg, mode=[0]), 2):
+                # acc_S_row_frg[k, j] = utils.exp2f(acc_S_row_frg[k, j])
+                # acc_S_row_frg[k + 1, j] = utils.exp2f(acc_S_row_frg[k + 1, j])
+                if cutlass.const_expr(not e2e):
+                    acc_S_row_frg[k, j] = cute.arch.exp2(acc_S_row_frg[k, j])
+                    acc_S_row_frg[k + 1, j] = cute.arch.exp2(acc_S_row_frg[k + 1, j])
+                else:
+                    if cutlass.const_expr(
+                        k % e2e_freq < e2e_freq - e2e_res or j >= frg_cnt - e2e_frg_limit
+                    ):
+                        acc_S_row_frg[k, j] = cute.arch.exp2(acc_S_row_frg[k, j])
+                        acc_S_row_frg[k + 1, j] = cute.arch.exp2(acc_S_row_frg[k + 1, j])
+                    else:
+                        # acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = utils.e2e_asm2(acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j])
+                        acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = utils.ex2_emulation_2(
+                            acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j]
+                        )
+            if cutlass.const_expr(acc_S_row_converted is not None):
+                acc_S_row_converted_frg = cute.logical_divide(
+                    acc_S_row_converted, cute.make_layout(frg_tile)
+                )
+                acc_S_row_converted_frg[None, j].store(
+                    acc_S_row_frg[None, j].load().to(acc_S_row_converted.element_type)
+                )
+                
+    @cute.jit
+    def fused_exp2_scale_update_rowsum(self,
+                                       # exp2 related
+                                       acc_S_row: cute.Tensor, # 128 f32
+                                       acc_S_row_group_max: cute.Tensor, # 8 f32
+                                       row_scale: Float32,
+                                       is_first: int = False,
+                                       e2e: cutlass.Constexpr[bool] = False,
+                                       e2e_freq: cutlass.Constexpr[int] = 16,
+                                       e2e_res: cutlass.Constexpr[int] = 4,
+                                       e2e_frg_limit: cutlass.Constexpr[int] = 1,
+                                      ):
+        # This function does: 
+        # 1. Apply exp2 to S (get P) and group max of S (get sp2)
+        # 2. Rescale and accumulate P to rowsum
+        # 3. Scale P by divide sp2
+        assert cute.size(acc_S_row.shape) % 2 == 0, "acc_S_row must have an even number of elements"
+        frg_tile = min(32, cute.size(acc_S_row))
+        assert frg_tile % 2 == 0
+        frg_cnt = cute.size(acc_S_row) // frg_tile
+        assert cute.size(acc_S_row) % frg_tile == 0
+        acc_S_row_frg = cute.logical_divide(acc_S_row, cute.make_layout(frg_tile))
+        for j in cutlass.range_constexpr(frg_cnt):
+            for k in cutlass.range_constexpr(0, cute.size(acc_S_row_frg, mode=[0]), 2):
+                # acc_S_row_frg[k, j] = utils.exp2f(acc_S_row_frg[k, j])
+                # acc_S_row_frg[k + 1, j] = utils.exp2f(acc_S_row_frg[k + 1, j])
+                if cutlass.const_expr(not e2e):
+                    acc_S_row_frg[k, j] = cute.arch.exp2(acc_S_row_frg[k, j])
+                    acc_S_row_frg[k + 1, j] = cute.arch.exp2(acc_S_row_frg[k + 1, j])
+                else:
+                    if cutlass.const_expr(
+                        k % e2e_freq < e2e_freq - e2e_res or j >= frg_cnt - e2e_frg_limit
+                    ):
+                        acc_S_row_frg[k, j] = cute.arch.exp2(acc_S_row_frg[k, j])
+                        acc_S_row_frg[k + 1, j] = cute.arch.exp2(acc_S_row_frg[k + 1, j])
+                    else:
+                        # acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = utils.e2e_asm2(acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j])
+                        acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = utils.ex2_emulation_2(
+                            acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j]
+                        )
+        
+
+    @cute.jit
+    def apply_sage_sp1(self, P_row: cute.Tensor):
+        row_max = self._compute_row_max(P_row.load())
+        sp1 = row_max * self.sp1_scale
+        inv_sp1 = 1.0 / sp1
+        P_row.store(P_row.load() * inv_sp1)
+        return sp1
+
+    @cute.jit
+    def scale_apply_exp2_convert(
+        self,
+        acc_S_row: cute.Tensor,
+        row_max: Float32,
+        acc_S_row_converted: cute.Tensor,
+    ):
+        assert cute.size(acc_S_row.shape) % 2 == 0, "acc_S_row must have an even number of elements"
+        minus_row_max_scaled = -row_max * self.scale_log2
+        for i in cutlass.range_constexpr(0, cute.size(acc_S_row.shape), 2):
+            acc_S_row[i], acc_S_row[i + 1] = utils.fma_packed_f32x2(
+                (acc_S_row[i], acc_S_row[i + 1]),
+                (self.scale_log2, self.scale_log2),
+                (minus_row_max_scaled, minus_row_max_scaled),
+            )
+
+        # for i in cutlass.range_constexpr(0, cute.size(acc_S_row.shape), 2):
+        #     acc_S_row[i], acc_S_row[i + 1] = utils.fma_packed_f32x2(
+        #         (acc_S_row[i], acc_S_row[i + 1]),
+        #         (self.scale_log2, self.scale_log2),
+        #         (minus_row_max_scaled, minus_row_max_scaled),
+        #     )
+        #     acc_S_row[i] = cute.arch.exp2(acc_S_row[i])
+        #     acc_S_row[i + 1] = cute.arch.exp2(acc_S_row[i + 1])
+
+        frg_tile = 32
+        assert frg_tile % 2 == 0
+        frg_cnt = cute.size(acc_S_row) // frg_tile
+        assert cute.size(acc_S_row) % frg_tile == 0
+        acc_S_row_frg = cute.logical_divide(acc_S_row, cute.make_layout(frg_tile))
+        acc_S_row_converted_frg = cute.logical_divide(
+            acc_S_row_converted, cute.make_layout(frg_tile)
+        )
+        for j in cutlass.range_constexpr(frg_cnt):
+            for k in cutlass.range_constexpr(0, cute.size(acc_S_row_frg, mode=[0]), 2):
+                # acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = (
+                #     utils.fma_packed_f32x2(
+                #         (acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j]),
+                #         (self.scale_log2, self.scale_log2),
+                #         (minus_row_max_scaled, minus_row_max_scaled),
+                #     )
+                # )
+                # acc_S_row_frg[k, j] = utils.exp2f(acc_S_row_frg[k, j])
+                # acc_S_row_frg[k + 1, j] = utils.exp2f(acc_S_row_frg[k + 1, j])
+                acc_S_row_frg[k, j] = cute.arch.exp2(acc_S_row_frg[k, j])
+                acc_S_row_frg[k + 1, j] = cute.arch.exp2(acc_S_row_frg[k + 1, j])
+            acc_S_row_converted_frg[None, j].store(
+                acc_S_row_frg[None, j].load().to(acc_S_row_converted.element_type)
+            )
 
 
 class NamedBarrierFwd(enum.IntEnum):
@@ -152,11 +422,13 @@ class FlashAttentionForwardSm100:
 
         self.softmax0_warp_ids = (0, 1, 2, 3) # stage 0
         self.softmax1_warp_ids = (4, 5, 6, 7) # stage 1
+        # self.correction_warp_ids = (8, 9)
         self.correction_warp_ids = (8, 9, 10, 11)
+        # self.mma_warp_id = 10
         self.mma_warp_id = 12
         self.epilogue_warp_ids = (13,)
         self.load_warp_ids = (14,)
-        self.empty_warp_ids = (15,)
+        self.empty_warp_ids = (15, )
         SM100_TMEM_CAPACITY_COLUMNS = 512
         self.tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
 
@@ -243,7 +515,7 @@ class FlashAttentionForwardSm100:
         - Configures pipeline stages for softmax, correction, and epilogue operations
         """
         # do not increase if only testing quant qk
-        self.kv_stage = 8 if self.q_dtype.width < 8 and self.v_dtype.width < 8 else 3 
+        self.kv_stage = 6 if self.q_dtype.width < 8 and self.v_dtype.width < 8 else 3 
         self.acc_stage = 1
         self.epi_stage = 2
         # For hdim 192,128, we don't have enough smem to store all 3 stages of KV:
@@ -848,7 +1120,7 @@ class FlashAttentionForwardSm100:
         self.mbar_sfpv_load_offset = self.mbar_sfqk_load_offset + self.q_stage
         self.mbar_total = self.mbar_sfpv_load_offset + self.q_stage
         # self.mbar_total = self.mbar_P_full_2_offset + self.q_stage
-
+        self.mbar_p_split = lambda k: k // 4 * 3 if cutlass.const_expr(self.v_dtype.width >= 8) else k // 2 
         sO_size = cute.cosize(sO_layout) if const_expr(not self.overlap_sO_sQ) else 1
         sQ_size = (
             cute.cosize(sQ_layout) if const_expr(not self.overlap_sO_sQ) else
@@ -2097,13 +2369,42 @@ class FlashAttentionForwardSm100:
                         sV_cur = sV[None, None, None, Vi_index]
                         if const_expr(self.uneven_kv_smem):
                             sV_cur = self.offset_kv_smem(sV_cur, Vi_index, Vi_phase)
-                        gemm_Pi[stage](
-                            tCrB=tOrVi,
-                            sB=sV_cur,
-                            zero_init=not O_should_accumulate,
-                            mbar_ptr=mbar_ptr + self.mbar_P_full_2_offset + stage,
-                            mbar_phase=P_full_O_rescaled_phase,
-                        )
+                        
+                        # The PTX version sometimes throws "Warp out of range address"
+                        tiled_mma_pv.set(tcgen05.Field.ACCUMULATE, False)
+                        for k_tile in cutlass.range_constexpr(self.mbar_p_split(self.mma_inst_tile_k)):
+                            if const_expr(self.quant_pv):
+                                tiled_mma_pv.set(tcgen05.Field.SFA, tCtSFPs[stage][None, None, k_tile].iterator)
+                                tiled_mma_pv.set(tcgen05.Field.SFB, tCtSFVs[stage][None, None, k_tile].iterator)
+                            cute.gemm(
+                                tiled_mma_pv,
+                                tOtOs[stage],
+                                tOrPs[stage][None, None, k_tile],
+                                tOrVi[None, None, k_tile],
+                                tOtOs[stage],
+                            )
+                            tiled_mma_pv.set(tcgen05.Field.ACCUMULATE, True)
+                        cute.arch.mbarrier_wait(mbar_ptr + self.mbar_P_full_2_offset + stage, P_full_O_rescaled_phase)
+                        for k_tile in cutlass.range_constexpr(self.mbar_p_split(self.mma_inst_tile_k), self.mma_inst_tile_k):
+                            if const_expr(self.quant_pv):
+                                tiled_mma_pv.set(tcgen05.Field.SFA, tCtSFPs[stage][None, None, k_tile].iterator)
+                                tiled_mma_pv.set(tcgen05.Field.SFB, tCtSFVs[stage][None, None, k_tile].iterator)
+                            cute.gemm(
+                                tiled_mma_pv,
+                                tOtOs[stage],
+                                tOrPs[stage][None, None, k_tile],
+                                tOrVi[None, None, k_tile],
+                                tOtOs[stage],
+                            )
+
+                        # gemm_Pi[stage](
+                        #     tCrB=tOrVi,
+                        #     sB=sV_cur,
+                        #     zero_init=not O_should_accumulate,
+                        #     mbar_ptr=mbar_ptr + self.mbar_P_full_2_offset + stage,
+                        #     mbar_phase=P_full_O_rescaled_phase,
+                        # )
+
                         # 4. release accumulated O0_partial / O1_partial
                         # Don't need to signal O_full to the correction warps anymore since the
                         # correction warps wait for the softmax warps anyway. By the time the softmax
@@ -2201,13 +2502,38 @@ class FlashAttentionForwardSm100:
                     sV_cur = sV[None, None, None, Vi_index]
                     if const_expr(self.uneven_kv_smem):
                         sV_cur = self.offset_kv_smem(sV_cur, Vi_index, Vi_phase)
-                    gemm_Pi[stage](
-                        tCrB=tOrVi,
-                        sB=sV_cur,
-                        zero_init=not O_should_accumulate,
-                        mbar_ptr=mbar_ptr + self.mbar_P_full_2_offset + stage,
-                        mbar_phase=P_full_O_rescaled_phase,
-                    )
+                    # gemm_Pi[stage](
+                    #     tCrB=tOrVi,
+                    #     sB=sV_cur,
+                    #     zero_init=not O_should_accumulate,
+                    #     mbar_ptr=mbar_ptr + self.mbar_P_full_2_offset + stage,
+                    #     mbar_phase=P_full_O_rescaled_phase,
+                    # )
+                    
+                    # Just for debugging
+                    for k_tile in cutlass.range_constexpr(self.mbar_p_split(self.mma_inst_tile_k)):
+                        if const_expr(self.quant_pv):
+                            tiled_mma_pv.set(tcgen05.Field.SFA, tCtSFPs[stage][None, None, k_tile].iterator)
+                            tiled_mma_pv.set(tcgen05.Field.SFB, tCtSFVs[stage][None, None, k_tile].iterator)
+                        cute.gemm(
+                            tiled_mma_pv,
+                            tOtOs[stage],
+                            tOrPs[stage][None, None, k_tile],
+                            tOrVi[None, None, k_tile],
+                            tOtOs[stage],
+                        )
+                    cute.arch.mbarrier_wait(mbar_ptr + self.mbar_P_full_2_offset + stage, P_full_O_rescaled_phase)
+                    for k_tile in cutlass.range_constexpr(self.mbar_p_split(self.mma_inst_tile_k), self.mma_inst_tile_k):
+                        if const_expr(self.quant_pv):
+                            tiled_mma_pv.set(tcgen05.Field.SFA, tCtSFPs[stage][None, None, k_tile].iterator)
+                            tiled_mma_pv.set(tcgen05.Field.SFB, tCtSFVs[stage][None, None, k_tile].iterator)
+                        cute.gemm(
+                            tiled_mma_pv,
+                            tOtOs[stage],
+                            tOrPs[stage][None, None, k_tile],
+                            tOrVi[None, None, k_tile],
+                            tOtOs[stage],
+                        )
                     # 4. release accumulated O0_partial
                     # We do need O_full here since for the last tile, by the time the softmax warp
                     # has signaled to the correction warps, the softmax warp has just finished compute
@@ -2698,13 +3024,13 @@ class FlashAttentionForwardSm100:
             cute.arch.mbarrier_arrive(mbar_ptr + mbar_s0_s1_sequence_offset + (1 - stage) * 4)
         # print(tSrP_r2t_f32, tStP_r2t)
         # cute.copy(thr_tmem_store, tSrP_r2t_f32, tStP_r2t)
-        for i in cutlass.range_constexpr(cute.size(tStP_r2t.shape[2]) // 4 * 3):
+        for i in cutlass.range_constexpr(self.mbar_p_split(cute.size(tStP_r2t.shape[2]))):
             cute.copy(thr_tmem_store, tSrP_r2t_f32[None, None, i], tStP_r2t[None, None, i])
         cute.arch.fence_view_async_tmem_store()
         # Notify mma warp that P is ready
         cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_O_rescaled_offset + stage)
         for i in cutlass.range_constexpr(
-            cute.size(tStP_r2t.shape[2]) // 4 * 3, cute.size(tStP_r2t.shape[2])
+            self.mbar_p_split(cute.size(tStP_r2t.shape[2])), cute.size(tStP_r2t.shape[2])
         ):
             cute.copy(thr_tmem_store, tSrP_r2t_f32[None, None, i], tStP_r2t[None, None, i])
         cute.arch.fence_view_async_tmem_store()
@@ -3561,3 +3887,4 @@ class FlashAttentionForwardSm100:
             constant_q_idx=q_idx_logical,
             qhead_per_kvhead=self.qhead_per_kvhead if cutlass.const_expr(self.pack_gqa) else 1,
         )
+

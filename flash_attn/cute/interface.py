@@ -736,10 +736,12 @@ def _flash_attn_fwd(
         # Add scale factor tensors if using FP4
         if use_fp4 or force_fp4_impl:
             compile_args.extend([mSFQ_tensor, mSFK_tensor, mSFV_tensor])
-        _flash_attn_fwd.compile_cache[compile_key] = cute.compile(*compile_args, options="--enable-tvm-ffi",
+        _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
+            *compile_args,
+            options="--enable-tvm-ffi",
+            # options="--ptxas-options '-g-tmem-access-check'"
         )
         # dump_kernel_attributes(_flash_attn_fwd.compile_cache[compile_key])
-
 
     # Expand block sparse tensors to match actual head count (may be broadcast from 1)
     normalized_block_sparse_tensors = None
