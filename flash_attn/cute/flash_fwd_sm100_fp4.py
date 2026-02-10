@@ -140,8 +140,13 @@ class SoftmaxSm100(Softmax):
         acc_S_row_exp_frag = cute.logical_divide(acc_S_row_exp, cute.make_layout(vec_size))
         acc_S_group_sum = cute.make_rmem_tensor(acc_S_row_group_max_exp.layout, dtype=Float32)
 
-        for i in cutlass.range_constexpr(0, cute.size(acc_S_row_exp_frag, mode=[1])):
-            acc_S_group_sum[i] = self._compute_row_sum(acc_S_row_exp_frag[None, i].load()) * acc_S_row_group_max_exp[i]
+        num_groups = cute.size(acc_S_row_exp_frag, mode=[1])
+        assert num_groups % 2 == 0
+        for i in cutlass.range_constexpr(0, num_groups, 2):
+            acc_S_group_sum[i], acc_S_group_sum[i + 1] = utils.mul_packed_f32x2(
+                (self._compute_row_sum(acc_S_row_exp_frag[None, i].load()), self._compute_row_sum(acc_S_row_exp_frag[None, i + 1].load())),
+                (acc_S_row_group_max_exp[i], acc_S_row_group_max_exp[i + 1]),
+            )
         self.row_sum[0]= self._compute_row_sum(acc_S_group_sum.load(), init_val=init_val)
 
     @cute.jit
