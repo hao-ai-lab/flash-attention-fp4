@@ -390,7 +390,7 @@ def main(ab_dtype, sf_dtype, sf_vec_size, quant_v=False, debug=False):
     
     # Benchmark configurations
     # bs_seqlen_vals = [(32, 1024), (16, 2048), (2, 4096), (1, 8192), (2, 16384), (1, 32768), (4, 32768 * 8)]
-    bs_seqlen_vals = [(1, 16384)]
+    bs_seqlen_vals = [(4, 2048), (1, 16384)]
     # bs_seqlen_vals = [(32, 1024)]
     # bs_seqlen_vals = [(4, 300 * 1000)]
     headdim = 128
