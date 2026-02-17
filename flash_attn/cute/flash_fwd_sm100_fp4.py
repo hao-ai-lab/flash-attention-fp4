@@ -2699,6 +2699,7 @@ class FlashAttentionForwardSm100:
         tSrPSF = None
         if const_expr(self.quant_pv):
             # Compute grouped scores max (will be converted to sp2 of SageAttention3)
+            # little speed diff
             tSrPSF_f32 = softmax.compute_group_max(tSrS_t2r, sf_size=self.sf_vec_size)
             tSrPSF = cute.make_rmem_tensor(tSrPSF_f32.layout, cute.Float8E4M3FN)
 
@@ -2715,6 +2716,7 @@ class FlashAttentionForwardSm100:
 
         # if thread_idx == 0 and stage == 0: cute.print_tensor(tSrS_t2r)
         # print(tSrS_t2r)
+        # little speed diff
         softmax.scale_subtract_rowmax(tSrS_t2r, row_max, tSrPSF_f32)
         # Sequence barrier wait
         if const_expr(self.s0_s1_barrier):
@@ -2732,15 +2734,17 @@ class FlashAttentionForwardSm100:
             # Exp2 with softmax scale and sp1 scaling
             softmax.apply_exp2_convert(
                 tSrS_t2r, 
+                # tSrP_r2t, # 1.3x -> 1.2x
                 e2e=mask_fn is None and self.head_dim_padded <= 128,
                 e2e_freq=self.e2e_freq,
             )
+            # little speed diff
             softmax.apply_exp2_convert(
                 tSrPSF_f32, 
                 e2e=mask_fn is None and self.head_dim_padded <= 128,
                 e2e_freq=self.e2e_freq,
             )
-            self._quant_fp4(tSrS_t2r, tSrPSF_f32, tSrP_r2t, tSrPSF)
+            # self._quant_fp4(tSrS_t2r, tSrPSF_f32, tSrP_r2t, tSrPSF)
             # TODO(wenxuan) tcgen05.st
         else:
             # softmax.scale_apply_exp2_convert(tSrS_t2r, row_max, tSrP_r2t)
