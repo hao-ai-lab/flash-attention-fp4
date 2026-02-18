@@ -35,7 +35,7 @@ from flash_attn.cute import copy_utils
 import flash_attn.cute.pipeline as pipeline
 from flash_attn.cute.mask import AttentionMask
 # from flash_attn.cute.softmax import SoftmaxSm100, apply_score_mod_inner
-from flash_attn.cute.softmax import Softmax, apply_score_mod_inner
+from flash_attn.cute.softmax import apply_score_mod_inner
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
 from flash_attn.cute.block_sparsity import BlockSparseTensors
@@ -58,6 +58,197 @@ from flash_attn.cute.tile_scheduler import (
     SingleTileVarlenScheduler,
     ParamsBase,
 )
+from cutlass.cute.arch.nvvm_wrappers import calc_packed_f32x2_op
+from cutlass._mlir.dialects import nvvm
+mul_packed_f32x2 = partial(
+    calc_packed_f32x2_op, src_c=None, calc_func=nvvm.mul_packed_f32x2
+)
+add_packed_f32x2 = partial(
+    calc_packed_f32x2_op, src_c=None, calc_func=nvvm.add_packed_f32x2
+)
+
+@cute.jit
+def fadd_reduce(
+    x: cute.TensorSSA, init_val: float | Float32 | None = None, arch: cutlass.Constexpr[int] = 80
+) -> Float32:
+    if const_expr(arch < 100 or cute.size(x.shape) % 8 != 0):
+        if const_expr(init_val is None):
+            init_val = Float32.zero
+        return x.reduce(cute.ReductionOp.ADD, init_val, 0)
+        # res = cute.make_fragment(x.shape, Float32)
+        # res.store(x)
+        # local_sum = [res[0], res[1], res[2], res[3]]
+        # for i in cutlass.range_constexpr(4, cute.size(x.shape), 4):
+        #     local_sum[0] += res[i + 0]
+        #     local_sum[1] += res[i + 1]
+        #     local_sum[2] += res[i + 2]
+        #     local_sum[3] += res[i + 3]
+        # local_sum[0] += local_sum[1]
+        # local_sum[2] += local_sum[3]
+        # local_sum[0] += local_sum[2]
+        # return local_sum[0] if const_expr(init_val is None) else local_sum[0] + init_val
+    else:
+        res = cute.make_fragment(x.shape, Float32)
+        res.store(x)
+        local_sum_0 = (
+            add_packed_f32x2((init_val, 0.0), (res[0], res[1]))
+            # add_packed_f32x2((init_val / 2, init_val / 2), (res[0], res[1]))
+            if const_expr(init_val is not None)
+            else (res[0], res[1])
+        )
+        local_sum = [local_sum_0, (res[2], res[3]), (res[4], res[5]), (res[6], res[7])]
+        for i in cutlass.range_constexpr(8, cute.size(x.shape), 8):
+            local_sum[0] = add_packed_f32x2(local_sum[0], (res[i + 0], res[i + 1]))
+            local_sum[1] = add_packed_f32x2(local_sum[1], (res[i + 2], res[i + 3]))
+            local_sum[2] = add_packed_f32x2(local_sum[2], (res[i + 4], res[i + 5]))
+            local_sum[3] = add_packed_f32x2(local_sum[3], (res[i + 6], res[i + 7]))
+        local_sum[0] = add_packed_f32x2(local_sum[0], local_sum[1])
+        local_sum[2] = add_packed_f32x2(local_sum[2], local_sum[3])
+        local_sum[0] = add_packed_f32x2(local_sum[0], local_sum[2])
+        return local_sum[0][0] + local_sum[0][1]
+
+@dataclass
+class Softmax(ParamsBase):
+    scale_log2: Float32
+    num_rows: cutlass.Constexpr[int]
+    row_max: cute.Tensor
+    row_sum: cute.Tensor
+    arch: cutlass.Constexpr[int] = 80
+    softmax_scale: Float32 | None = None
+
+    @staticmethod
+    def create(
+        scale_log2: Float32,
+        num_rows: cutlass.Constexpr[int],
+        arch: cutlass.Constexpr[int] = 80,
+        softmax_scale: Float32 | None = None,
+    ):
+        row_max = cute.make_fragment(num_rows, Float32)
+        row_sum = cute.make_fragment(num_rows, Float32)
+        return Softmax(scale_log2, num_rows, row_max, row_sum, arch, softmax_scale)
+
+    def reset(self) -> None:
+        self.row_max.fill(-Float32.inf)
+        self.row_sum.fill(0.0)
+
+    def _compute_row_max(
+        self, acc_S_row: cute.TensorSSA, init_val: float | Float32 | None = None
+    ) -> Float32:
+        return utils.fmax_reduce(acc_S_row, init_val, arch=self.arch)
+
+    def _compute_row_sum(
+        self, acc_S_row_exp: cute.TensorSSA, init_val: float | Float32 | None = None
+    ) -> Float32:
+        return fadd_reduce(acc_S_row_exp, init_val, arch=self.arch)
+
+    @cute.jit
+    def online_softmax(
+        self,
+        acc_S: cute.Tensor,
+        is_first: cutlass.Constexpr[bool] = False,
+        check_inf: cutlass.Constexpr[bool] = True,
+    ) -> cute.Tensor:
+        """Apply online softmax and return the row_scale to rescale O.
+
+        :param acc_S: acc_S tensor
+        :type acc_S: cute.Tensor
+        :param is_first: is first n_block
+        :type is_first: cutlass.Constexpr
+        """
+        # Change acc_S to M,N layout view.
+        acc_S_mn = utils.make_acc_tensor_mn_view(acc_S)
+        row_scale = cute.make_fragment_like(self.row_max, Float32)
+
+        row_max = self.row_max
+        row_sum = self.row_sum
+        scale_log2 = self.scale_log2
+        arch = self.arch
+
+        # Each iteration processes one row of acc_S
+        for r in cutlass.range(cute.size(row_max), unroll_full=True):
+            acc_S_row = acc_S_mn[r, None].load()  # (n_block_size)
+
+            row_max_cur = utils.fmax_reduce(
+                acc_S_row,
+                init_val=row_max[r] if cutlass.const_expr(not is_first) else None,
+                arch=arch,
+            )
+
+            row_max_cur = utils.warp_reduce(row_max_cur, cute.arch.fmax, width=4)
+            if cutlass.const_expr(check_inf):
+                row_max_cur = 0.0 if row_max_cur == -Float32.inf else row_max_cur
+
+            if cutlass.const_expr(is_first):
+                row_max_cur_scaled = row_max_cur * scale_log2
+                acc_S_row_exp = utils.exp2f(acc_S_row * scale_log2 - row_max_cur_scaled)
+
+                acc_S_row_sum = utils.fadd_reduce(acc_S_row_exp, init_val=None, arch=arch)
+                row_scale[r] = 1.0
+            else:
+                row_max_prev = row_max[r]
+                row_max_cur_scaled = row_max_cur * scale_log2
+                acc_S_row_exp = utils.exp2f(acc_S_row * scale_log2 - row_max_cur_scaled)
+                # row_scale[r] = utils.exp2f(row_max_prev * self.scale_log2 - row_max_cur_scaled)
+                row_scale[r] = utils.exp2f((row_max_prev - row_max_cur) * scale_log2)
+
+                acc_S_row_sum = utils.fadd_reduce(
+                    acc_S_row_exp, init_val=row_sum[r] * row_scale[r], arch=arch
+                )
+
+            row_max[r] = row_max_cur
+            row_sum[r] = acc_S_row_sum
+            acc_S_mn[r, None].store(acc_S_row_exp)
+
+        return row_scale
+
+    @cute.jit
+    def finalize(
+        self, final_scale: Float32 = 1.0, sink_val: Float32 | cute.Tensor | None = None
+    ) -> cute.Tensor:
+        """Finalize the online softmax by computing the scale and logsumexp."""
+        if cutlass.const_expr(sink_val is not None and isinstance(sink_val, cute.Tensor)):
+            assert cute.size(sink_val) == cute.size(self.row_sum)
+        row_sum = self.row_sum
+        row_max = self.row_max
+        scale_log2 = self.scale_log2
+
+        # quad reduction for row_sum as we didn't do it during each iteration of online softmax
+        row_sum.store(utils.warp_reduce(row_sum.load(), operator.add, width=4))
+        row_scale = cute.make_fragment_like(row_max, Float32)
+
+        for r in cutlass.range(cute.size(row_sum), unroll_full=True):
+            if cutlass.const_expr(sink_val is not None):
+                sink_val_cur = sink_val if not isinstance(sink_val, cute.Tensor) else sink_val[r]
+                LOG2_E = math.log2(math.e)
+                row_sum[r] += utils.exp2f(sink_val_cur * LOG2_E - row_max[r] * scale_log2)
+
+            # if row_sum is zero or nan, set acc_O_mn_row to 1.0
+            acc_O_mn_row_is_zero_or_nan = row_sum[r] == 0.0 or row_sum[r] != row_sum[r]
+            row_scale[r] = (
+                cute.arch.rcp_approx(row_sum[r] if not acc_O_mn_row_is_zero_or_nan else 1.0)
+            ) * final_scale
+            row_sum_cur = row_sum[r]
+            LN2 = math.log(2.0)
+            row_sum[r] = (
+                (row_max[r] * scale_log2 + utils.log2f(row_sum_cur)) * LN2
+                if not acc_O_mn_row_is_zero_or_nan
+                else -Float32.inf
+            )
+        return row_scale
+
+    @cute.jit
+    def rescale_O(self, acc_O: cute.Tensor, row_scale: cute.Tensor) -> None:
+        """Scale each row of acc_O by the given scale tensor.
+        :param acc_O: input tensor
+        :type acc_O: cute.Tensor
+        :param row_scale: row_scale tensor
+        :type row_scale: cute.Tensor
+        """
+        acc_O_mn = utils.make_acc_tensor_mn_view(acc_O)
+        assert cute.size(row_scale) == cute.size(acc_O_mn, mode=[0])
+        for r in cutlass.range(cute.size(row_scale), unroll_full=True):
+            acc_O_mn[r, None].store(acc_O_mn[r, None].load() * row_scale[r])
+
 
 
 @dataclass
@@ -133,20 +324,26 @@ class SoftmaxSm100(Softmax):
 
     @cute.jit
     def update_row_sum_sage(
-        self, acc_S_row_exp: cute.Tensor, acc_S_row_group_max_exp: cute.Tensor, row_scale: Float32, is_first: int = False
+        self, acc_S_row_exp: cute.Tensor, acc_S_row_group_max_exp: cute.Tensor, 
+        group_max_layout: cute.Layout,
+        row_scale: Float32, is_first: int = False
     ) -> None:
         init_val = self.row_sum[0] * row_scale if cutlass.const_expr(not is_first) else None
-        vec_size = const_expr(cute.size(acc_S_row_exp) // cute.size(acc_S_row_group_max_exp))
+        vec_size = const_expr(cute.size(acc_S_row_exp) // cute.size(group_max_layout))
         acc_S_row_exp_frag = cute.logical_divide(acc_S_row_exp, cute.make_layout(vec_size))
-        acc_S_group_sum = cute.make_rmem_tensor(acc_S_row_group_max_exp.layout, dtype=Float32)
+        acc_S_group_sum = cute.make_rmem_tensor(group_max_layout, dtype=Float32)
 
         num_groups = cute.size(acc_S_row_exp_frag, mode=[1])
         assert num_groups % 2 == 0
         for i in cutlass.range_constexpr(0, num_groups, 2):
-            acc_S_group_sum[i], acc_S_group_sum[i + 1] = utils.mul_packed_f32x2(
-                (self._compute_row_sum(acc_S_row_exp_frag[None, i].load()), self._compute_row_sum(acc_S_row_exp_frag[None, i + 1].load())),
-                (acc_S_row_group_max_exp[i], acc_S_row_group_max_exp[i + 1]),
-            )
+            if const_expr(acc_S_row_group_max_exp is None):
+                acc_S_group_sum[i] = self._compute_row_sum(acc_S_row_exp_frag[None, i].load())
+                acc_S_group_sum[i + 1] = self._compute_row_sum(acc_S_row_exp_frag[None, i + 1].load())
+            else:
+                acc_S_group_sum[i], acc_S_group_sum[i + 1] = mul_packed_f32x2(
+                    (self._compute_row_sum(acc_S_row_exp_frag[None, i].load()), self._compute_row_sum(acc_S_row_exp_frag[None, i + 1].load())),
+                    (acc_S_row_group_max_exp[i], acc_S_row_group_max_exp[i + 1]), # NOTE: hardcoding to 1.0 only causes 15% slowdown, stupid compiler issue
+                )
         self.row_sum[0]= self._compute_row_sum(acc_S_group_sum.load(), init_val=init_val)
 
     @cute.jit
@@ -176,8 +373,8 @@ class SoftmaxSm100(Softmax):
             vec_size = cute.size(acc_S_row) // cute.size(acc_S_row_group_max)
             acc_S_row_frag = cute.logical_divide(acc_S_row, cute.make_layout(vec_size))
             for j in cutlass.range_constexpr(0, cute.size(acc_S_row_frag, mode=[1])):
+                bias = -row_max_scaled - acc_S_row_group_max[j]
                 for i in cutlass.range(0, cute.size(acc_S_row_frag, mode=[0]), 2, unroll_full=True):
-                    bias = -row_max_scaled - acc_S_row_group_max[j]
                     acc_S_row_frag[i, j], acc_S_row_frag[i + 1, j] = utils.fma_packed_f32x2(
                         (acc_S_row_frag[i, j], acc_S_row_frag[i + 1, j]),
                         (self.scale_log2, self.scale_log2),
@@ -439,12 +636,12 @@ class FlashAttentionForwardSm100:
             self.num_regs_other = 48
         else:
             # self.num_regs_softmax = 192 if self.is_causal or self.is_local else 184
-            self.num_regs_softmax = 208
+            self.num_regs_softmax = 216
             # self.num_regs_softmax = 176
             # self.num_regs_correction = 96
             # self.num_regs_correction = 80
             # self.num_regs_correction = 64 if self.is_causal or self.is_local else 80
-            self.num_regs_correction = 64
+            self.num_regs_correction = 48
             # self.num_regs_other = 32
             # self.num_regs_other = 64
             # self.num_regs_other = 80
@@ -2968,7 +3165,8 @@ class FlashAttentionForwardSm100:
                 e2e=mask_fn is None and self.head_dim_padded <= 128,
                 e2e_freq=self.e2e_freq,
             )
-            softmax.update_row_sum_sage(tSrS_t2r, tSrPSF_f32, acc_scale, is_first)
+            softmax.update_row_sum_sage(tSrS_t2r, tSrPSF_f32, tSrPSF_f32.layout, acc_scale, is_first)
+            # softmax.update_row_sum(tSrS_t2r.load(), acc_scale, is_first)
             self._quant_fp4(tSrS_t2r, tSrPSF_f32, tSrP_r2t, tSrPSF)
             # TODO(wenxuan) tcgen05.st
         else:
