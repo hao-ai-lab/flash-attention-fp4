@@ -2,7 +2,7 @@
 
 ## Overview
 
-This document summarizes a debugging session investigating performance anomalies in a Blackwell FP4 quantized Flash Attention kernel. The kernel uses CUDA with CuTe DSL.
+This document summarizes a debugging session investigating performance anomalies in a Blackwell FP4 quantized Flash Attention kernel. The kernel uses CuTe DSL and current has performance and precision issues.
 
 **Key Files:**
 - `/sgl-workspace/cutlass/examples/python/CuTeDSL/blackwell/flash-attention/flash_attn/cute/flash_fwd_sm100_fp4.py` - Main kernel implementation
@@ -24,7 +24,7 @@ CUTE_DSL_KEEP_CUBIN=1 CUTE_DSL_LINEINFO=1 CUTE_DSL_ENABLE_TVM_FFI=1 CUDA_VISIBLE
 ncu --set full -f \
     --kernel-id ::regex:".*fp4FlashAttention.*":1 \
     -o <output>.ncu-rep \
-    python benchmarks/bench_fp4.py --quant_v
+    python benchmarks/bench_fp4.py --quant_v --debug
 ```
 
 ---
