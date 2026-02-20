@@ -286,16 +286,16 @@ class SoftmaxSm100(Softmax):
                     acc_S_row_frg[k, j] = cute.arch.exp2(acc_S_row_frg[k, j])
                     acc_S_row_frg[k + 1, j] = cute.arch.exp2(acc_S_row_frg[k + 1, j])
                 else:
-                    if cutlass.const_expr(
-                        k % e2e_freq < e2e_freq - e2e_res or j >= frg_cnt - e2e_frg_limit
-                    ):
-                        acc_S_row_frg[k, j] = cute.arch.exp2(acc_S_row_frg[k, j])
-                        acc_S_row_frg[k + 1, j] = cute.arch.exp2(acc_S_row_frg[k + 1, j])
-                    else:
-                        # acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = utils.e2e_asm2(acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j])
-                        acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = utils.ex2_emulation_2(
-                            acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j]
-                        )
+                    # if cutlass.const_expr(
+                    #     k % e2e_freq < e2e_freq - e2e_res or j >= frg_cnt - e2e_frg_limit
+                    # ):
+                    #     acc_S_row_frg[k, j] = cute.arch.exp2(acc_S_row_frg[k, j])
+                    #     acc_S_row_frg[k + 1, j] = cute.arch.exp2(acc_S_row_frg[k + 1, j])
+                    # else:
+                    acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = utils.e2e_asm2(acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j])
+                    # acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = utils.ex2_emulation_2(
+                        # acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j]
+                    # )
             if cutlass.const_expr(acc_S_row_converted is not None):
                 acc_S_row_converted_frg = cute.logical_divide(
                     acc_S_row_converted, cute.make_layout(frg_tile)

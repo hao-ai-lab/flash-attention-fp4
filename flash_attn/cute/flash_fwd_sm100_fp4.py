@@ -2695,13 +2695,13 @@ class FlashAttentionForwardSm100:
             mask_fn(tSrS_t2r, n_block=n_block) 
 
         row_max, acc_scale = softmax.update_row_max(tSrS_t2r.load(), is_first)
-        tSrPSF_f32 = None
-        tSrPSF = None
-        if const_expr(self.quant_pv):
-            # Compute grouped scores max (will be converted to sp2 of SageAttention3)
-            # little speed diff
-            tSrPSF_f32 = softmax.compute_group_max(tSrS_t2r, sf_size=self.sf_vec_size)
-            tSrPSF = cute.make_rmem_tensor(tSrPSF_f32.layout, cute.Float8E4M3FN)
+        # tSrPSF_f32 = None
+        # tSrPSF = None
+        # if const_expr(self.quant_pv):
+        #     # Compute grouped scores max (will be converted to sp2 of SageAttention3)
+        #     # little speed diff
+        #     tSrPSF_f32 = softmax.compute_group_max(tSrS_t2r, sf_size=self.sf_vec_size)
+        #     tSrPSF = cute.make_rmem_tensor(tSrPSF_f32.layout, cute.Float8E4M3FN)
 
         if const_expr(not is_first):
             # tSrScale_r2t = cute.make_fragment(thr_tmem_store_scale.partition_S(tScScale).shape, Float32)
@@ -2717,7 +2717,7 @@ class FlashAttentionForwardSm100:
         # if thread_idx == 0 and stage == 0: cute.print_tensor(tSrS_t2r)
         # print(tSrS_t2r)
         # little speed diff
-        softmax.scale_subtract_rowmax(tSrS_t2r, row_max, tSrPSF_f32)
+        softmax.scale_subtract_rowmax(tSrS_t2r, row_max, None)
         # Sequence barrier wait
         if const_expr(self.s0_s1_barrier):
             cute.arch.mbarrier_wait(
@@ -2739,11 +2739,11 @@ class FlashAttentionForwardSm100:
                 e2e_freq=self.e2e_freq,
             )
             # little speed diff
-            softmax.apply_exp2_convert(
-                tSrPSF_f32, 
-                e2e=mask_fn is None and self.head_dim_padded <= 128,
-                e2e_freq=self.e2e_freq,
-            )
+            # softmax.apply_exp2_convert(
+            #     tSrPSF_f32, 
+            #     e2e=mask_fn is None and self.head_dim_padded <= 128,
+            #     e2e_freq=self.e2e_freq,
+            # )
             # self._quant_fp4(tSrS_t2r, tSrPSF_f32, tSrP_r2t, tSrPSF)
             # TODO(wenxuan) tcgen05.st
         else:
