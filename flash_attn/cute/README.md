@@ -2,6 +2,10 @@
 
 Flash Attention CuTe-DSL implementation.
 
+## NOTE
+This branch is for debugging the performance of FP4.
+See [debug notes](fp4_flash_attention_optimization_notes.md) for more details.
+
 ## Installation
 
 ### Editable Install
