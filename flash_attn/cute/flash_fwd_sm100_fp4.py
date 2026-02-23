@@ -27,7 +27,6 @@ from cutlass.cute.nvgpu import cpasync
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
 from flash_attn.cute.modified_utils.block_scaled_layout_test import make_smem_layout_sfa, make_smem_layout_sfb
-from flash_attn.cute.modified_utils.helpers import make_tiled_tma_atom_A
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from flash_attn.cute.paged_kv import PagedKVManager
 import flash_attn.cute.utils as utils
@@ -1078,7 +1077,7 @@ class FlashAttentionForwardSm100:
                 self.cluster_shape_mn, tiled_mma_qk.thr_id
             )
             mSFQ = cute.make_tensor(mSFQ.iterator, sfq_layout)
-            tma_atom_sfq, tma_tensor_sfq = make_tiled_tma_atom_A(
+            tma_atom_sfq, tma_tensor_sfq = cute.nvgpu.make_tiled_tma_atom_A(
                 sfq_op,
                 mSFQ,
                 cute.select(sfq_smem_layout_staged, mode=[0, 1, 2]),
@@ -1277,7 +1276,7 @@ class FlashAttentionForwardSm100:
         self.mbar_sfpv_load_offset = self.mbar_sfqk_load_offset + self.q_stage
         self.mbar_total = self.mbar_sfpv_load_offset + self.q_stage
         # self.mbar_total = self.mbar_P_full_2_offset + self.q_stage
-        self.mbar_p_split = lambda k: k // 4 * 3 if cutlass.const_expr(self.v_dtype.width >= 8) else k // 2 
+        self.mbar_p_split = lambda k: (k // 4 * 3 if cutlass.const_expr(self.v_dtype.width >= 8) else k // 2 )
         sO_size = cute.cosize(sO_layout) if const_expr(not self.overlap_sO_sQ) else 1
         sQ_size = (
             cute.cosize(sQ_layout) if const_expr(not self.overlap_sO_sQ) else
