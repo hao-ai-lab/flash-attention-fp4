@@ -1320,22 +1320,45 @@ class FlashAttentionForwardSm100:
             # Scale factor shared memory (if block-scaled quantization is used)
             sSFQ: cute.struct.Align[
                 cute.struct.MemRange[cute.Float8E4M3FN, sfq_smem_size],
-                1,
+                self.buffer_align_bytes,
             ]
             sSFK: cute.struct.Align[
                 cute.struct.MemRange[cute.Float8E4M3FN, sfk_smem_size],
-                1,
+                self.buffer_align_bytes,
             ]
             sSFP: cute.struct.Align[
                 cute.struct.MemRange[cute.Float8E4M3FN, sfp_smem_size],
-                1,
+                self.buffer_align_bytes,
             ]
             sSFV: cute.struct.Align[
                 cute.struct.MemRange[cute.Float8E4M3FN, sfv_smem_size],
-                1,
+                self.buffer_align_bytes,
             ]
-
-        self.shared_storage = SharedStorage
+        
+        # Remove scale factors to avoid OOM. Seems I can't set their size to 0
+        @cute.struct
+        class SharedStorageBF16:
+            # m_barriers for pipelines
+            mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.mbar_total]
+            # Tmem holding buffer
+            tmem_holding_buf: Int32
+            # Smem tensors
+            # store row max and row sum
+            sScale: cute.struct.Align[cute.struct.MemRange[Float32, self.q_stage * self.m_block_size * 2], self.buffer_align_bytes]
+            sO: cute.struct.Align[
+                cute.struct.MemRange[self.o_dtype, sO_size],
+                self.buffer_align_bytes,
+            ]
+            sQ: cute.struct.Align[
+                cute.struct.MemRange[self.q_dtype, sQ_size],
+                self.buffer_align_bytes,
+            ]
+            sK: cute.struct.Align[
+                # cute.cosize(sK_layout) is correct even in the case of self.uneven_kv_smem
+                cute.struct.MemRange[self.k_dtype, cute.cosize(sK_layout)],
+                self.buffer_align_bytes,
+            ]
+        self.shared_storage = SharedStorage if const_expr(self.quant_qk) or const_expr(self.quant_pv) else SharedStorageBF16
         
         # Print total shared memory size
         total_smem_bytes = self.shared_storage.size_in_bytes()
