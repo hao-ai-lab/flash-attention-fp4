@@ -1320,19 +1320,19 @@ class FlashAttentionForwardSm100:
             # Scale factor shared memory (if block-scaled quantization is used)
             sSFQ: cute.struct.Align[
                 cute.struct.MemRange[cute.Float8E4M3FN, sfq_smem_size],
-                self.buffer_align_bytes,
+                1,
             ]
             sSFK: cute.struct.Align[
                 cute.struct.MemRange[cute.Float8E4M3FN, sfk_smem_size],
-                self.buffer_align_bytes,
+                1,
             ]
             sSFP: cute.struct.Align[
                 cute.struct.MemRange[cute.Float8E4M3FN, sfp_smem_size],
-                self.buffer_align_bytes,
+                1,
             ]
             sSFV: cute.struct.Align[
                 cute.struct.MemRange[cute.Float8E4M3FN, sfv_smem_size],
-                self.buffer_align_bytes,
+                1,
             ]
 
         self.shared_storage = SharedStorage
