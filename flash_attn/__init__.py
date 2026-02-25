@@ -1,11 +1,14 @@
 __version__ = "2.8.3"
 
-from flash_attn.flash_attn_interface import (
-    flash_attn_func,
-    flash_attn_kvpacked_func,
-    flash_attn_qkvpacked_func,
-    flash_attn_varlen_func,
-    flash_attn_varlen_kvpacked_func,
-    flash_attn_varlen_qkvpacked_func,
-    flash_attn_with_kvcache,
-)
+try:
+    from flash_attn.flash_attn_interface import (
+        flash_attn_func,
+        flash_attn_kvpacked_func,
+        flash_attn_qkvpacked_func,
+        flash_attn_varlen_func,
+        flash_attn_varlen_kvpacked_func,
+        flash_attn_varlen_qkvpacked_func,
+        flash_attn_with_kvcache,
+    )
+except ImportError:
+    pass  # flash_attn_2_cuda (FA2 C++ ext) not built; CuTe DSL paths still work
