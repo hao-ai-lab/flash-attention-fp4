@@ -3187,7 +3187,7 @@ class FlashAttentionForwardSm100:
                 e2e=mask_fn is None and self.head_dim_padded <= 128,
                 e2e_freq=self.e2e_freq,
             )
-            softmax.update_row_sum_sage(tSrS_t2r, tSrPSF_f32, tSrPSF_f32.layout, acc_scale, is_first)
+            # softmax.update_row_sum_sage(tSrS_t2r, None, tSrPSF_f32.layout, acc_scale, is_first)
             # softmax.update_row_sum(tSrS_t2r.load(), acc_scale, is_first)
             self._quant_fp4(tSrS_t2r, tSrPSF_f32, tSrP_r2t, tSrPSF)
             # TODO(wenxuan) tcgen05.st
@@ -3221,6 +3221,8 @@ class FlashAttentionForwardSm100:
         )
         if const_expr(not self.quant_pv): # quant_pv already updated row sum
             softmax.update_row_sum(tSrS_t2r.load(), acc_scale, is_first)
+        else:
+            softmax.update_row_sum_sage(tSrS_t2r, None, tSrPSF_f32.layout, acc_scale, is_first)
         # acc_scale = cute.arch.exp2(acc_scale_)
         return mma_si_consumer_phase ^ 1, si_corr_producer_phase ^ 1, s0_s1_sequence_phase ^ 1
 
