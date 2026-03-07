@@ -208,6 +208,29 @@ Not register pressure: GPR at P_full arrive: C=155, B=154 (both well below
 | `+0x138` | mbar_P_full_2 | softmax warp (line 3215) | MMA warp (line 2566) |
 | `+0x148` | sfqk_load_full | load warp | softmax warp (line 3118) |
 
+## scale_subtract_rowmax has the same MUFU front-load problem
+
+After moving `update_row_sum_sage` to after barriers (line 3226, with `None`),
+`scale_subtract_rowmax` (line 3167) causes the same symptom:
+- With `tSrPSF_f32`: 1769 TFLOPS (fast)
+- With `None`: 1383 TFLOPS (slow, -22%)
+
+Same root cause — passing `tSrPSF_f32` adds per-group FMA ops (lines 367-377)
+that interleave with MUFU.EX2 before sfqk_load_full arrive, preventing the
+compiler from front-loading all MUFU.EX2 between sfqk→P_full.
+
+| MUFU.EX2 placement | FAST (with PSF) | SLOW (no PSF) |
+|---|---|---|
+| Before sfqk_load_full | 35 | 17 |
+| sfqk→P_full | **4** | **90** |
+| P_full→P_full_2 | 90 | 22 |
+| Total | 129 | 129 |
+
+Cubins: `sass_analysis/fast_with_psf.cubin`, `sass_analysis/slow_no_psf.cubin`
+Key PCs (second iteration):
+- FAST: sfqk_load_full=8d60, P_full=8df0, P_full_2=9880
+- SLOW: sfqk_load_full=8190, P_full=8800, P_full_2=8de0
+
 ## Resource Comparison: FP4 vs Reference
 
 - FP4: REG:128, STACK:32, 3541 insns, 169 max live GPR

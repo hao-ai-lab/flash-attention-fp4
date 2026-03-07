@@ -3165,6 +3165,7 @@ class FlashAttentionForwardSm100:
         # if thread_idx == 0 and stage == 0: cute.print_tensor(tSrS_t2r)
         # print(tSrS_t2r)
         softmax.scale_subtract_rowmax(tSrS_t2r, row_max, tSrPSF_f32)
+        # softmax.scale_subtract_rowmax(tSrS_t2r, row_max)
         # Sequence barrier wait
         if const_expr(self.s0_s1_barrier):
             cute.arch.mbarrier_wait(
@@ -3182,11 +3183,11 @@ class FlashAttentionForwardSm100:
                 e2e=mask_fn is None and self.head_dim_padded <= 128,
                 e2e_freq=self.e2e_freq,
             )
-            softmax.apply_exp2_convert(
-                tSrPSF_f32, 
-                e2e=mask_fn is None and self.head_dim_padded <= 128,
-                e2e_freq=self.e2e_freq,
-            )
+            # softmax.apply_exp2_convert(
+            #     tSrPSF_f32, 
+            #     e2e=mask_fn is None and self.head_dim_padded <= 128,
+            #     e2e_freq=self.e2e_freq,
+            # )
             # softmax.update_row_sum_sage(tSrS_t2r, None, tSrPSF_f32.layout, acc_scale, is_first)
             # softmax.update_row_sum(tSrS_t2r.load(), acc_scale, is_first)
             self._quant_fp4(tSrS_t2r, tSrPSF_f32, tSrP_r2t, tSrPSF)
