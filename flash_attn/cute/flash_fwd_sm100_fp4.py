@@ -1864,6 +1864,7 @@ class FlashAttentionForwardSm100:
                 sSFQ,
                 sSFK,
                 sSFV,
+                sSFP,
                 tCtSFQs,
                 tCtSFKs,
                 tCtSFPs,
@@ -1924,6 +1925,7 @@ class FlashAttentionForwardSm100:
                 aux_tensors=aux_tensors,
                 fastdiv_mods=fastdiv_mods,
                 blocksparse_tensors=blocksparse_tensors,
+                sSFP=sSFP,
             )
 
             if const_expr(not self.s0_s1_barrier):
@@ -2276,6 +2278,7 @@ class FlashAttentionForwardSm100:
         sSFQ: Optional[cute.Tensor],
         sSFK: Optional[cute.Tensor],
         sSFV: Optional[cute.Tensor],
+        sSFP: Optional[cute.Tensor],
         # In tmem - per-stage scale factors
         tCtSFQs: Tuple[cute.Tensor, ...],
         tCtSFKs: Tuple[cute.Tensor, ...],
@@ -2364,12 +2367,21 @@ class FlashAttentionForwardSm100:
             tiled_copy_s2t_sfv_staged = [
                 self.mainloop_s2t_copy_and_partition(sSFV, tCtSFVs[stage])
                 for stage in range(self.q_stage)
-            ] 
+            ]
             tiled_copy_s2t_sfv, tCsSFV_compact_s2t, _ = tiled_copy_s2t_sfv_staged[0]
+            # S2T copy setup for SFP (P scale factors, computed by softmax warp via R2S)
+            tiled_copy_s2t_sfp_staged = [
+                self.mainloop_s2t_copy_and_partition(sSFP, tCtSFPs[stage])
+                for stage in range(self.q_stage)
+            ]
+            tiled_copy_s2t_sfp, tCsSFP_compact_s2t, _ = tiled_copy_s2t_sfp_staged[0]
         else:
             tiled_copy_s2t_sfv_staged = []
             tiled_copy_s2t_sfv = None
             tCsSFV_compact_s2t = None
+            tiled_copy_s2t_sfp_staged = []
+            tiled_copy_s2t_sfp = None
+            tCsSFP_compact_s2t = None
 
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
@@ -2537,6 +2549,15 @@ class FlashAttentionForwardSm100:
                         
                         # No need for mbar.wait because it depends on the same Si as the prev qk mma
                         if const_expr(self.quant_pv):
+                            # S2T copy SFP: sSFP (smem) -> tCtSFPs (tmem)
+                            _, _, tCtSFP_compact_s2t = tiled_copy_s2t_sfp_staged[stage]
+                            tCsSFP_compact_s2t_cur = tCsSFP_compact_s2t[None, None, None, None, stage]
+                            cute.copy(
+                                tiled_copy_s2t_sfp,
+                                tCsSFP_compact_s2t_cur,
+                                tCtSFP_compact_s2t,
+                            )
+                            # S2T copy SFV: sSFV (smem) -> tCtSFVs (tmem)
                             _, _, tCtSFV_compact_s2t = tiled_copy_s2t_sfv_staged[stage]
                             tCsSFV_compact_s2t_staged = tCsSFV_compact_s2t[None, None, None, None, Vi_index]
                             cute.copy(
@@ -2671,6 +2692,15 @@ class FlashAttentionForwardSm100:
                     # gemm_Pi[stage](tCrB=tOrVi, sB=sV[None, None, None, Vi_index], zero_init=not O_should_accumulate)
 
                     if const_expr(self.quant_pv):
+                        # S2T copy SFP: sSFP (smem) -> tCtSFPs (tmem)
+                        _, _, tCtSFP_compact_s2t = tiled_copy_s2t_sfp_staged[stage]
+                        tCsSFP_compact_s2t_cur = tCsSFP_compact_s2t[None, None, None, None, stage]
+                        cute.copy(
+                            tiled_copy_s2t_sfp,
+                            tCsSFP_compact_s2t_cur,
+                            tCtSFP_compact_s2t,
+                        )
+                        # S2T copy SFV: sSFV (smem) -> tCtSFVs (tmem)
                         _, _, tCtSFV_compact_s2t = tiled_copy_s2t_sfv_staged[stage]
                         tCsSFV_compact_s2t_staged = tCsSFV_compact_s2t[None, None, None, None, Vi_index]
                         cute.copy(
@@ -2755,6 +2785,7 @@ class FlashAttentionForwardSm100:
         fastdiv_mods=(None, None),
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         tCtSFP: Optional[Tuple[cute.Tensor, ...]] = None,
+        sSFP: Optional[cute.Tensor] = None,
     ):
         """Compute softmax on attention scores from QK matrix multiplication.
 
@@ -2891,6 +2922,7 @@ class FlashAttentionForwardSm100:
                 fastdiv_mods=fastdiv_mods,
                 mask_fn=partial(mask_fn, mask_seqlen=False),
                 tCtSFP=tCtSFP,
+                sSFP=sSFP,
             )
 
             if has_work:
@@ -3046,7 +3078,7 @@ class FlashAttentionForwardSm100:
                 tSrPSF_f32[i * 4 + 2],
                 tSrPSF_f32[i * 4 + 3]
             )
-            tSrPSF_u32_view[i // 4] = packed_ue4m3
+            tSrPSF_u32_view[i] = packed_ue4m3
     
         # Quantize main tensor to E2M1 format (8 values per uint32_t)
         # Process in groups of 8 for E2M1 conversion
@@ -3093,6 +3125,7 @@ class FlashAttentionForwardSm100:
         mask_fn: Optional[Callable] = None,
         is_first: bool = False,
         tCtSFP: Optional[cute.Tensor] = None,
+        sSFP: Optional[cute.Tensor] = None,
     ) -> Tuple[cute.Int32, cute.Int32, cute.Int32]:
         """Perform a single step of the softmax computation on a block of attention scores.
 
@@ -3193,7 +3226,18 @@ class FlashAttentionForwardSm100:
             # softmax.update_row_sum_sage(tSrS_t2r, None, tSrPSF_f32.layout, acc_scale, is_first)
             # softmax.update_row_sum(tSrS_t2r.load(), acc_scale, is_first)
             self._quant_fp4(tSrS_t2r, tSrPSF_f32, tSrP_r2t, tSrPSF)
-            # TODO(wenxuan) tcgen05.st
+            # R2S: Copy tSrPSF (registers) to sSFP (shared memory)
+            if const_expr(sSFP is not None):
+                thread_idx = thr_tmem_load.thr_idx
+                # sSFP atom layout: ((32,4),(16,4)) strides ((16,4),(0,1))
+                # Thread t -> M=t: base = (t//4)*16 + (t%4)*4
+                # MMA_K tile stride = 512, 4 values per tile, 2 tiles = 8 values
+                base_offset = (thread_idx // 4) * 16 + (thread_idx % 4) * 4
+                sfp_thread_layout = cute.make_layout((4, 2), stride=(1, 512))
+                sSFP_stage_ptr = sSFP[None, None, None, stage].iterator
+                sSFP_thread = cute.make_tensor(sSFP_stage_ptr + base_offset, sfp_thread_layout)
+                tSrPSF_2d = cute.logical_divide(tSrPSF, cute.make_layout(4))
+                cute.autovec_copy(tSrPSF_2d, sSFP_thread)
         else:
             # softmax.scale_apply_exp2_convert(tSrS_t2r, row_max, tSrP_r2t)
             softmax.apply_exp2_convert(
@@ -3210,7 +3254,13 @@ class FlashAttentionForwardSm100:
         for i in cutlass.range_constexpr(self.mbar_p_split(cute.size(tStP_r2t.shape[2]))):
             cute.copy(thr_tmem_store, tSrP_r2t_f32[None, None, i], tStP_r2t[None, None, i])
         cute.arch.fence_view_async_tmem_store()
-        # Notify mma warp that P is ready
+        # SMEM fence: ensure R2S writes to sSFP are visible to the MMA warp's S2T copy
+        if const_expr(self.quant_pv and sSFP is not None):
+            cute.arch.fence_proxy(
+                cute.arch.ProxyKind.async_shared,
+                space=cute.arch.SharedSpace.shared_cta,
+            )
+        # Notify mma warp that P is ready (and SFP is in SMEM)
         cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_O_rescaled_offset + stage)
         for i in cutlass.range_constexpr(
             self.mbar_p_split(cute.size(tStP_r2t.shape[2])), cute.size(tStP_r2t.shape[2])
@@ -3617,7 +3667,6 @@ class FlashAttentionForwardSm100:
             self.o_layout, self.o_dtype, self.pv_acc_dtype, tiled_tmem_load
         )
         tiled_smem_store = cute.make_tiled_copy_D(smem_copy_atom, tiled_tmem_load)
-
         tOtO_t2r = thr_tmem_load.partition_S(tOtO_i[(None, None), None])
         tOsO_s2r = thr_tmem_load.partition_D(tOsO_i[(None, None), None])
         tOcO_t2r = thr_tmem_load.partition_D(tOcO_i[(None, None), None])
