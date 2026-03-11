@@ -2570,40 +2570,13 @@ class FlashAttentionForwardSm100:
                         if const_expr(self.uneven_kv_smem):
                             sV_cur = self.offset_kv_smem(sV_cur, Vi_index, Vi_phase)
                         
-                        # The PTX version sometimes throws "Warp out of range address"
-                        tiled_mma_pv.set(tcgen05.Field.ACCUMULATE, False)
-                        for k_tile in cutlass.range_constexpr(self.mbar_p_split(self.mma_inst_tile_k)):
-                            if const_expr(self.quant_pv):
-                                tiled_mma_pv.set(tcgen05.Field.SFA, tCtSFPs[stage][None, None, k_tile].iterator)
-                                tiled_mma_pv.set(tcgen05.Field.SFB, tCtSFVs[stage][None, None, k_tile].iterator)
-                            cute.gemm(
-                                tiled_mma_pv,
-                                tOtOs[stage],
-                                tOrPs[stage][None, None, k_tile],
-                                tOrVi[None, None, k_tile],
-                                tOtOs[stage],
-                            )
-                            tiled_mma_pv.set(tcgen05.Field.ACCUMULATE, True)
-                        cute.arch.mbarrier_wait(mbar_ptr + self.mbar_P_full_2_offset + stage, P_full_O_rescaled_phase)
-                        for k_tile in cutlass.range_constexpr(self.mbar_p_split(self.mma_inst_tile_k), self.mma_inst_tile_k):
-                            if const_expr(self.quant_pv):
-                                tiled_mma_pv.set(tcgen05.Field.SFA, tCtSFPs[stage][None, None, k_tile].iterator)
-                                tiled_mma_pv.set(tcgen05.Field.SFB, tCtSFVs[stage][None, None, k_tile].iterator)
-                            cute.gemm(
-                                tiled_mma_pv,
-                                tOtOs[stage],
-                                tOrPs[stage][None, None, k_tile],
-                                tOrVi[None, None, k_tile],
-                                tOtOs[stage],
-                            )
-
-                        # gemm_Pi[stage](
-                        #     tCrB=tOrVi,
-                        #     sB=sV_cur,
-                        #     zero_init=not O_should_accumulate,
-                        #     mbar_ptr=mbar_ptr + self.mbar_P_full_2_offset + stage,
-                        #     mbar_phase=P_full_O_rescaled_phase,
-                        # )
+                        gemm_Pi[stage](
+                            tCrB=tOrVi,
+                            sB=sV_cur,
+                            zero_init=not O_should_accumulate,
+                            mbar_ptr=mbar_ptr + self.mbar_P_full_2_offset + stage,
+                            mbar_phase=P_full_O_rescaled_phase,
+                        )
 
                         # 4. release accumulated O0_partial / O1_partial
                         # Don't need to signal O_full to the correction warps anymore since the
@@ -2711,38 +2684,13 @@ class FlashAttentionForwardSm100:
                     sV_cur = sV[None, None, None, Vi_index]
                     if const_expr(self.uneven_kv_smem):
                         sV_cur = self.offset_kv_smem(sV_cur, Vi_index, Vi_phase)
-                    # gemm_Pi[stage](
-                    #     tCrB=tOrVi,
-                    #     sB=sV_cur,
-                    #     zero_init=not O_should_accumulate,
-                    #     mbar_ptr=mbar_ptr + self.mbar_P_full_2_offset + stage,
-                    #     mbar_phase=P_full_O_rescaled_phase,
-                    # )
-                    
-                    # Just for debugging
-                    for k_tile in cutlass.range_constexpr(self.mbar_p_split(self.mma_inst_tile_k)):
-                        if const_expr(self.quant_pv):
-                            tiled_mma_pv.set(tcgen05.Field.SFA, tCtSFPs[stage][None, None, k_tile].iterator)
-                            tiled_mma_pv.set(tcgen05.Field.SFB, tCtSFVs[stage][None, None, k_tile].iterator)
-                        cute.gemm(
-                            tiled_mma_pv,
-                            tOtOs[stage],
-                            tOrPs[stage][None, None, k_tile],
-                            tOrVi[None, None, k_tile],
-                            tOtOs[stage],
-                        )
-                    cute.arch.mbarrier_wait(mbar_ptr + self.mbar_P_full_2_offset + stage, P_full_O_rescaled_phase)
-                    for k_tile in cutlass.range_constexpr(self.mbar_p_split(self.mma_inst_tile_k), self.mma_inst_tile_k):
-                        if const_expr(self.quant_pv):
-                            tiled_mma_pv.set(tcgen05.Field.SFA, tCtSFPs[stage][None, None, k_tile].iterator)
-                            tiled_mma_pv.set(tcgen05.Field.SFB, tCtSFVs[stage][None, None, k_tile].iterator)
-                        cute.gemm(
-                            tiled_mma_pv,
-                            tOtOs[stage],
-                            tOrPs[stage][None, None, k_tile],
-                            tOrVi[None, None, k_tile],
-                            tOtOs[stage],
-                        )
+                    gemm_Pi[stage](
+                        tCrB=tOrVi,
+                        sB=sV_cur,
+                        zero_init=not O_should_accumulate,
+                        mbar_ptr=mbar_ptr + self.mbar_P_full_2_offset + stage,
+                        mbar_phase=P_full_O_rescaled_phase,
+                    )
                     # 4. release accumulated O0_partial
                     # We do need O_full here since for the last tile, by the time the softmax warp
                     # has signaled to the correction warps, the softmax warp has just finished compute
