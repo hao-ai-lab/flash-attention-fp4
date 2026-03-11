@@ -373,6 +373,7 @@ def gemm_ptx_partial(
     # sA_offset: Int32 = 0,
     # acc_offset: Int32 = 0,
     tA_addr: Optional[Int32] = None,
+    pre_mbar_tiles: Optional[cutlass.Constexpr[int]] = None,
 ) -> None:
     # acc_tmem_addr += acc_offset
     is_ts = op.a_src == cute.nvgpu.tcgen05.OperandSource.TMEM
@@ -545,18 +546,18 @@ def gemm_ptx_partial(
                     1,
                     cute.size(tCrA.shape[2])
                     if const_expr(mbar_ptr is None)
-                    else cute.size(tCrA.shape[2]) // 4 * 3,
+                    else (pre_mbar_tiles if const_expr(pre_mbar_tiles is not None) else cute.size(tCrA.shape[2]) // 4 * 3),
                 )
             )
             + mbar_wait_str
             + (
                 "".join(
                     (
-                        f"add.u32 smem_desc_b_lo, smem_desc_b_lo, {hex(offset_b_diff[k - 1])};\n\t"
+                        f"add.u32 smem_desc_b_lo, smem_desc_b_lo_start, {hex(offset_b[k])};\n\t"
                         f"mov.b64 smem_desc_b, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
                         f"@leader_thread tcgen05.mma.cta_group::1.kind::f16 [tmem_acc], [tmem_a + {hex(offset_a[k])}], smem_desc_b, idesc, 1;\n\t"
                     )
-                    for k in range(cute.size(tCrA.shape[2]) // 4 * 3, cute.size(tCrA.shape[2]))
+                    for k in range(max(1, pre_mbar_tiles if const_expr(pre_mbar_tiles is not None) else cute.size(tCrA.shape[2]) // 4 * 3), cute.size(tCrA.shape[2]))
                 )
                 if const_expr(mbar_ptr is not None)
                 else ""
@@ -585,6 +586,7 @@ def gemm_ptx_partial_fp4(
     # sA_offset: Int32 = 0,
     # acc_offset: Int32 = 0,
     tA_addr: Optional[Int32] = None,
+    pre_mbar_tiles: Optional[cutlass.Constexpr[int]] = None,
 ) -> None:
     # acc_tmem_addr += acc_offset
     is_ts = op.a_src == cute.nvgpu.tcgen05.OperandSource.TMEM
@@ -738,7 +740,7 @@ def gemm_ptx_partial_fp4(
             )
         else:
             mbar_wait_str = ""
-        
+
         llvm.inline_asm(
             None,
             input_args,
@@ -768,29 +770,26 @@ def gemm_ptx_partial_fp4(
             f"@leader_thread {mma_inst_str} [tmem_acc], [tmem_a], smem_desc_b, idesc, [tmem_scale_a], [tmem_scale_b], {pred_str};\n\t"
             + "".join(
                 (
-                    # f"add.u32 tmem_a, tmem_a, {hex(offset_a_diff[k - 1])};\n\t"
-                    # f"add.u32 smem_desc_b_lo, smem_desc_b_lo, {hex(offset_b_diff[k - 1])};\n\t"
                     f"add.u32 smem_desc_b_lo, smem_desc_b_lo_start, {hex(offset_b[k])};\n\t"
                     f"mov.b64 smem_desc_b, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
-                    # f"@leader_thread tcgen05.mma.cta_group::1.kind::f16 [tmem_acc], [tmem_a], smem_desc_b, idesc, 1;\n\t"
                     f"@leader_thread {mma_inst_str} [tmem_acc], [tmem_a + {hex(offset_a[k])}], smem_desc_b, idesc, [tmem_scale_a + {hex(offset_sfa[k])}], [tmem_scale_b + {hex(offset_sfb[k])}], 1;\n\t"
                 )
                 for k in range(
                     1,
                     cute.size(tCrA.shape[2])
                     if const_expr(mbar_ptr is None)
-                    else cute.size(tCrA.shape[2]) // 4 * 3,
+                    else (pre_mbar_tiles if const_expr(pre_mbar_tiles is not None) else cute.size(tCrA.shape[2]) // 4 * 3),
                 )
             )
             + mbar_wait_str
             + (
                 "".join(
                     (
-                        f"add.u32 smem_desc_b_lo, smem_desc_b_lo, {hex(offset_b_diff[k - 1])};\n\t"
+                        f"add.u32 smem_desc_b_lo, smem_desc_b_lo_start, {hex(offset_b[k])};\n\t"
                         f"mov.b64 smem_desc_b, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
                         f"@leader_thread {mma_inst_str} [tmem_acc], [tmem_a + {hex(offset_a[k])}], smem_desc_b, idesc, [tmem_scale_a + {hex(offset_sfa[k])}], [tmem_scale_b + {hex(offset_sfb[k])}], 1;\n\t"
                     )
-                    for k in range(cute.size(tCrA.shape[2]) // 4 * 3, cute.size(tCrA.shape[2]))
+                    for k in range(max(1, pre_mbar_tiles if const_expr(pre_mbar_tiles is not None) else cute.size(tCrA.shape[2]) // 4 * 3), cute.size(tCrA.shape[2]))
                 )
                 if const_expr(mbar_ptr is not None)
                 else ""
