@@ -1687,7 +1687,6 @@ class FlashAttentionForwardSm100:
             )
             for stage in range(2)
         ]
-
         # Setup scale factor TMEM tensors and S2T copy operations
         # Use the TMEM region immediately following the accumulator (O tensor)
 
@@ -1750,6 +1749,9 @@ class FlashAttentionForwardSm100:
                 cute.slice_(sfv_smem_layout_staged, (None, None, None, 0)),
             )
             tCtSFVs = [cute.make_tensor(sfv_tmem_ptrs[stage], tCtSFV_layout) for stage in range(self.q_stage)]
+            # print(f"DEBUG SFP tmem_layout: {tCtSFP_layout}")
+            # print(f"DEBUG SFV tmem_layout: {tCtSFV_layout}")
+            # print(f"DEBUG sfp_offset: {sfp_offset}")
 
         block_info = BlockInfo(
             # This is cta_tiler, not mma_tiler_qk, since we move by block by (2 * mma_tiler[0], mma_tiler[1])
@@ -2325,6 +2327,7 @@ class FlashAttentionForwardSm100:
                 sA=None,
                 tScaleA=tCtSFPs[stage],
                 tScaleB=tCtSFVs[stage],
+                pre_mbar_tiles=self.mbar_p_split(cute.size(tOrPs[stage].shape[2])),
             ) if const_expr(self.quant_pv) else
             partial(
                 sm100_utils.gemm_ptx_partial,
@@ -2332,6 +2335,7 @@ class FlashAttentionForwardSm100:
                 self.tmem_o_offset[stage if self.q_stage == 2 else 0],
                 tOrPs[stage],
                 sA=None,
+                pre_mbar_tiles=self.mbar_p_split(cute.size(tOrPs[stage].shape[2])),
             )
             for stage in range(self.q_stage)
         ]
@@ -3175,17 +3179,17 @@ class FlashAttentionForwardSm100:
             # softmax.update_row_sum(tSrS_t2r.load(), acc_scale, is_first)
             self._quant_fp4(tSrS_t2r, tSrPSF_f32, tSrP_r2t, tSrPSF)
             # R2S: Copy tSrPSF (registers) to sSFP (shared memory)
-            if const_expr(sSFP is not None):
-                thread_idx = thr_tmem_load.thr_idx
-                # sSFP atom layout: ((32,4),(16,4)) strides ((16,4),(0,1))
-                # Thread t -> M=t: base = (t//4)*16 + (t%4)*4
-                # MMA_K tile stride = 512, 4 values per tile, 2 tiles = 8 values
-                base_offset = (thread_idx // 4) * 16 + (thread_idx % 4) * 4
-                sfp_thread_layout = cute.make_layout((4, 2), stride=(1, 512))
-                sSFP_stage_ptr = sSFP[None, None, None, stage].iterator
-                sSFP_thread = cute.make_tensor(sSFP_stage_ptr + base_offset, sfp_thread_layout)
-                tSrPSF_2d = cute.logical_divide(tSrPSF, cute.make_layout(4))
-                cute.autovec_copy(tSrPSF_2d, sSFP_thread)
+            # if const_expr(sSFP is not None):
+            #     thread_idx = thr_tmem_load.thr_idx
+            #     # sSFP atom layout: ((32,4),(16,4)) strides ((16,4),(0,1))
+            #     # Thread t -> M=t: base = (t//4)*16 + (t%4)*4
+            #     # MMA_K tile stride = 512, 4 values per tile, 2 tiles = 8 values
+            #     base_offset = (thread_idx // 4) * 16 + (thread_idx % 4) * 4
+            #     sfp_thread_layout = cute.make_layout((4, 2), stride=(1, 512))
+            #     sSFP_stage_ptr = sSFP[None, None, None, stage].iterator
+            #     sSFP_thread = cute.make_tensor(sSFP_stage_ptr + base_offset, sfp_thread_layout)
+            #     tSrPSF_2d = cute.logical_divide(tSrPSF, cute.make_layout(4))
+            #     cute.autovec_copy(tSrPSF_2d, sSFP_thread)
         else:
             # softmax.scale_apply_exp2_convert(tSrS_t2r, row_max, tSrP_r2t)
             softmax.apply_exp2_convert(
@@ -3203,6 +3207,7 @@ class FlashAttentionForwardSm100:
             cute.copy(thr_tmem_store, tSrP_r2t_f32[None, None, i], tStP_r2t[None, None, i])
         cute.arch.fence_view_async_tmem_store()
         # SMEM fence: ensure R2S writes to sSFP are visible to the MMA warp's S2T copy
+        # NOTE: without this, perf drops from 1.15x to 0.87x...don't know why yet
         if const_expr(self.quant_pv and sSFP is not None):
             cute.arch.fence_proxy(
                 cute.arch.ProxyKind.async_shared,
