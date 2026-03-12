@@ -637,6 +637,20 @@ def gemm_ptx_partial_fp4(
     offset_b_diff = [offset_b[k] - offset_b[k - 1] for k in range(1, cute.size(tCrB.shape[2]))]
     offset_sfa = [cute.crd2idx((0, 0, k), tScaleA.layout) for k in range(cute.size(tCrA.shape[2]))]
     offset_sfb = [cute.crd2idx((0, 0, k), tScaleB.layout) for k in range(cute.size(tCrB.shape[2]))]
+    # if const_expr(is_ts):
+    #     print(f"[FP4 TS GEMM] idesc=0x{idesc:x}, offset_a={offset_a}, offset_b={offset_b}, "
+    #           f"offset_sfa={offset_sfa}, offset_sfb={offset_sfb}, "
+    #           f"n_k={cute.size(tCrA.shape[2])}, smem_desc_b_hi=0x{smem_desc_b_hi:x}, "
+    #           f"smem_desc_base_b_lo=0x{smem_desc_base_b_lo:x}, "
+    #           f"tCrA.layout={tCrA.layout}, tCrB.layout={tCrB.layout}, "
+    #           f"tScaleA.layout={tScaleA.layout}, tScaleB.layout={tScaleB.layout}")
+    # else:
+    #     print(f"[FP4 SS GEMM] idesc=0x{idesc:x}, offset_a={offset_a}, offset_b={offset_b}, "
+    #           f"offset_sfa={offset_sfa}, offset_sfb={offset_sfb}, "
+    #           f"n_k={cute.size(tCrA.shape[2])}, smem_desc_b_hi=0x{smem_desc_b_hi:x}, "
+    #           f"smem_desc_base_b_lo=0x{smem_desc_base_b_lo:x}, "
+    #           f"smem_desc_a_hi=0x{smem_desc_a_hi:x}, "
+    #           f"smem_desc_base_a_lo=0x{smem_desc_base_a_lo:x}")
     if const_expr(not is_ts):
         smem_desc_start_a_lo = Int32(
             smem_desc_base_a_lo | sm100_desc.make_smem_desc_start_addr(sA[None, None, 0].iterator)
@@ -647,6 +661,7 @@ def gemm_ptx_partial_fp4(
     smem_desc_start_b_lo = Int32(
         smem_desc_base_b_lo | sm100_desc.make_smem_desc_start_addr(sB[None, None, 0].iterator)
     )
+    # smem_desc_start_b_lo = 0x10000 | (runtime_smem_ptr & 0x3FFFF) >> 4
     pred_str = "p" if isinstance(zero_init, Boolean) else "0" if zero_init else "1"
     if const_expr(not is_ts):
         assert mbar_ptr is None, "mbar_ptr must be None when a_src is not TMEM"
