@@ -1698,8 +1698,14 @@ class FlashAttentionForwardSm100:
         tCtSFQs = [None] * self.q_stage
         tCtSFKs = [None] * self.q_stage
         if const_expr(self.quant_qk):
-            sfq_tmem_ptrs = [cute.make_ptr(self.sf_dtype, self.tmem_s_offset[self.q_stage - 1 - stage], # shuffle to minimize dependency
-                            mem_space=cute.AddressSpace.tmem, assumed_align=align) for stage in range(self.q_stage)
+            # Use recast_ptr to correctly convert Float32 column offsets to sf_dtype pointers.
+            # tmem_s_offset values are in TMEM column units (= Float32 element units).
+            # Directly using make_ptr(sf_dtype, offset) would interpret offset as sf_dtype elements,
+            # placing the pointer at column offset/4 instead of column offset.
+            sfq_tmem_ptrs = [cute.recast_ptr(
+                            cute.make_ptr(Float32, self.tmem_s_offset[self.q_stage - 1 - stage], # shuffle to minimize dependency
+                            mem_space=cute.AddressSpace.tmem, assumed_align=align),
+                            dtype=self.sf_dtype) for stage in range(self.q_stage)
                             ]
 
             # (MMA, MMA_M, MMA_K)
@@ -1712,7 +1718,8 @@ class FlashAttentionForwardSm100:
             tCtSFQs = [cute.make_tensor(sfq_tmem_ptrs[stage], tCtSFQ_layout) for stage in range(self.q_stage)]
 
             # Make SFK tmem tensor
-            sfq_offset = math.ceil(tcgen05.find_tmem_tensor_col_offset(tCtSFQs[0]) * sf_dtype_per_u32 / align) * align
+            sfq_col_offset = tcgen05.find_tmem_tensor_col_offset(tCtSFQs[0])
+            sfq_offset = math.ceil(sfq_col_offset * sf_dtype_per_u32 / align) * align
             sfk_tmem_ptrs = [sfq_tmem_ptrs[stage] + sfq_offset for stage in range(self.q_stage)]
 
             # (MMA, MMA_N, MMA_K)
@@ -1729,7 +1736,10 @@ class FlashAttentionForwardSm100:
         tCtSFPs = [None] * self.q_stage
         tCtSFVs = [None] * self.q_stage
         if const_expr(self.quant_pv):
-            sfp_tmem_ptrs = [cute.make_ptr(self.sf_dtype, self.tmem_s_offset[stage], mem_space=cute.AddressSpace.tmem, assumed_align=align) for stage in range(self.q_stage)]
+            sfp_tmem_ptrs = [cute.recast_ptr(
+                            cute.make_ptr(Float32, self.tmem_s_offset[stage],
+                            mem_space=cute.AddressSpace.tmem, assumed_align=align),
+                            dtype=self.sf_dtype) for stage in range(self.q_stage)]
             # (MMA, MMA_M, MMA_K) 
             tCtSFP_layout = blockscaled_utils.make_tmem_layout_sfa(
                 tiled_mma_pv,
@@ -2391,40 +2401,6 @@ class FlashAttentionForwardSm100:
         work_tile = tile_scheduler.initial_work_tile_info()
         
         
-        # NOTE Debug
-        tidx = cute.arch.thread_idx()[0] % cute.arch.WARP_SIZE
-        # Copy sSFQ from smem to reg fragment for debugging
-        # if const_expr(self.quant_qk) and sSFQ is not None:
-        #     # Filter zeros to get compact layout and get stage 0
-        #     sSFQ_compact = cute.filter_zeros(sSFQ[None, None, 0, 1])
-        #     # sSFQ_compact = cute.filter_zeros(sSFK[None, None, 0, 1])
-        #     sSFQ_slice = cute.logical_divide(sSFQ_compact, cute.make_layout(16))[None, 1]
-        #     # Create register fragment with matching shape
-        #     tSrSFQ = cute.make_fragment_like(sSFQ_slice, Float8E4M3FN)
-        #     # Copy from smem to rmem using autovec_copy
-        #     cute.autovec_copy(sSFQ_slice, tSrSFQ)
-        #     tSrSFQ_f32 = cute.make_fragment_like(tSrSFQ, Float32)
-        #     # Print to check for NaN
-        #     if tidx == 0:
-        #         tSrSFQ_f32.store(tSrSFQ.load().to(cute.Float32))
-        #         cute.print_tensor(tSrSFQ_f32)
-    
-        # Copy tSrQ from smem to reg fragment for debugging
-        # if const_expr(self.quant_qk) and sQ is not None:
-        #     # Filter zeros to get compact layout and get stage 0
-        #     sQ_compact = cute.filter_zeros(sQ[None, None, 0, 1])
-        #     # sSFQ_compact = cute.filter_zeros(sSFK[None, None, 0, 1])
-        #     sQ_slice = cute.logical_divide(sQ_compact, cute.make_layout(16))[None, 1]
-        #     # Create register fragment with matching shape
-        #     tSrQ_frag = cute.make_fragment_like(sQ_slice, Float4E2M1FN)
-        #     # Copy from smem to rmem using autovec_copy
-        #     cute.autovec_copy(sQ_slice, tSrQ_frag)
-        #     tSrQ_f32 = cute.make_fragment_like(tSrQ_frag, Float32)
-        #     # Print to check for NaN
-        #     if tidx == 0:
-        #         tSrQ_f32.store(tSrQ_frag.load().to(cute.Float32))
-        #         cute.print_tensor(tSrQ_f32)
-    
         mma_sfqk_producer_phase = Int32(0)
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
@@ -2484,24 +2460,6 @@ class FlashAttentionForwardSm100:
                             tCtSFK_compact_s2t,
                         )
 
-                    # # NOTE Debug
-                    # # make tmem to reg store atom for debugging
-                    # if m_block == 0 and head_idx == 0 and batch_idx == 0 and split_idx == 0:
-                    #     tidx = cute.arch.thread_idx()[0] % cute.arch.WARP_SIZE
-                    #     tmem_load_atom = cute.make_copy_atom(
-                    #         tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(8)), 
-                    #         Float8E4M3FN,
-                    #     )
-                        # thr_tmem_load = tcgen05.make_tmem_copy(tmem_load_atom, tCtSFQs[0]).get_slice(tidx)
-                        # tCtSFQs0_t2r = thr_tmem_load.partition_S(tCtSFQs[stage])
-                        # tCrSFQs0_t2r_shape = thr_tmem_load.partition_D(tCtSFQs[stage]).shape
-                        # tCrSFQs0_t2r = cute.make_fragment(tCrSFQs0_t2r_shape, Float8E4M3FN)
-                        # cute.copy(thr_tmem_load, tCtSFQs0_t2r, tCrSFQs0_t2r)
-                        # if tidx == 0:
-                        #     cute.print_tensor(tCrSFQs0_t2r.load().to(Float32))
-    
-
-                    
                     # 3. gemm
                     # tiled_mma_qk = sm100_utils.gemm(tiled_mma_qk, tStSs[stage], tSrQs[stage], tSrKi, zero_init=True)
                     sK_cur = sK[None, None, None, mma_kv_consumer_state.index]
@@ -3130,10 +3088,6 @@ class FlashAttentionForwardSm100:
         row_max, acc_scale = softmax.update_row_max(tSrS_t2r.load(), is_first)
         tSrPSF_f32 = None
         tSrPSF = None
-        # if const_expr(self.quant_pv):
-            # Compute grouped scores max (will be converted to sp2 of SageAttention3)
-            # tSrPSF_f32 = softmax.compute_group_max(tSrS_t2r, sf_size=self.sf_vec_size)
-            # tSrPSF = cute.make_rmem_tensor(tSrPSF_f32.layout, cute.Float8E4M3FN)
 
         if const_expr(not is_first):
             # tSrScale_r2t = cute.make_fragment(thr_tmem_store_scale.partition_S(tScScale).shape, Float32)

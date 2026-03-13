@@ -1,6 +1,6 @@
 # FP4 quant_v debug -- SFP/SFV TMEM overlap + all-zeros output
 
-## Status: TMEM overlap fix applied. Output is now all-zeros (was 2.890625). PV GEMM O accumulator reads back as 0. Investigating.
+## Status: QK GEMM NaN FIXED (Bug 3). Non-quant_v FP4 output correct (max_diff=0.27@256, 0.06@4096). quant_v PV GEMM all-zeros still under investigation.
 
 ## FORBIDDEN: Do not use for loop for R2S copy
 
@@ -228,32 +228,166 @@ This is handled correctly because SFQ/SFK are reloaded before each QK GEMM.
         #         cute.print_tensor(tSrSFQ_f32)
 ```
 
-## Investigation timeline
+## Wild S values are NOT a bug (false alarm)
 
-### Session 1 (previous)
-1. Identified R2S copy being commented out as a quant_v bug — uncommented it
-2. Fixed `_quant_fp4` indexing: `tSrPSF_u32_view[i // 4]` → `tSrPSF_u32_view[i]`
+Both FP4 and BF16 (force_fp4_impl) paths produce wildly varying S values per K block
+(e.g. 128, 1327353, 272, 409872...) even with uniform Q=K=1.0. Despite this,
+`force_fp4_impl` matches the BF16 baseline exactly (verified with `torch.randn` V data).
+Softmax normalization handles the varying S values correctly.
 
-### Session 2 (current)
-8. Base FP4 NaN issue no longer reproduces (env fixed). Non-quant_v output=2.0 ✓
-9. quant_v output was 2.890625 (wrong, expected 2.0) for s=128 debug case
-10. Identified SFP/SFV TMEM overlap: `find_tmem_tensor_col_offset` returns u32 cols but
-    was used as sf_dtype element offset → sfp_offset=16 sf elements (4 u32 cols) instead
-    of 32 sf elements (8 u32 cols)
-11. Confirmed with debug override experiments: set SFP=0 in registers, observed SFV
-    overwriting SFP K-tile 1 data in TMEM (stage 0 O_tmem nonzero despite SFP=0)
-12. Applied TMEM offset fix: `sfp_offset = ceil(col_offset * sf_dtype_per_u32 / align) * align`
-    for both QK (sfq_offset) and PV (sfp_offset) paths
-13. Removed all debug overrides and prints
-14. **Result: output changed from 2.890625 to ALL ZEROS** — regression, not improvement
-15. Verified quantization values are correct: P=0x22222222 (1.0 E2M1), SFP=0x38383838 (1.0 UE4M3) ✓
-16. Verified row_sum ≈ 128 per work tile, scale ≈ 0.0078 — softmax warp is correct ✓
-17. **Found: correction_epilogue reads O_tmem = 0.0** — PV GEMM produces zero accumulator
-18. Active debug prints in code: QUANT printf (softmax_step), CORR printf (correction_loop),
-    EPI printf (correction_epilogue)
+The cause of wild S values is unknown but does not affect correctness.
 
-### Next steps
-- Verify P TMEM store address matches TS GEMM's A operand address
-- Check if TS GEMM descriptor (idesc, offsets) is consistent with new TMEM layout
-- Print P values in TMEM from MMA warp to confirm they were stored correctly
-- Check O accumulator TMEM address vs where correction_epilogue reads
+## QK GEMM: WORKS
+
+- Non-quant_v FP4 output matches BF16 baseline with random V data
+- `force_fp4_impl` (BF16 data through FP4 kernel code) matches baseline exactly
+- Run: `CUTE_DSL_ENABLE_TVM_FFI=1 python benchmarks/bench_fp4.py` (without `--debug`)
+- With `--debug` (V = block_index 0-15): FP4 gives 7.0, BF16 gives 7.5. The 0.5 gap is
+  FP4 quantization error on V values exceeding FP4 representable range, not a kernel bug.
+
+## quant_v path: PV GEMM all-zeros — ROOT CAUSE FOUND
+
+### Root cause
+
+Two bugs compound to produce all-zeros:
+
+1. **exp2 underflow**: Wild S values (e.g. S=409K while rowmax=1.6M) cause
+   `exp2((S - rowmax) * scale_log2)` to underflow to 0 for most positions.
+   Only the group containing the global max has P > 0.
+
+2. **Missing normalization in `_quant_fp4`**: The block-scaled MMA computes
+   `P_fp4 * SFP * V_fp4 * SFV`. For this to reconstruct `P * V`, we need
+   `P_fp4 * SFP ≈ P`. But `_quant_fp4` stores `P_fp4 = FP4(P_raw)` and
+   `SFP = group_max(P)` without dividing P by group_max first.
+   Result: `P_effective = FP4(P) * group_max(P) ≠ P`.
+
+### Fix: post-exp2 groupwise scaling (`scale_groupwise`)
+
+Approach: keep global rowmax subtraction + exp2 unchanged, then normalize P
+per-group AFTER exp2 so that `P_fp4 * SFP ≈ P`.
+
+```
+Flow in softmax_step (quant_pv path):
+
+1. scale_subtract_rowmax(S, rowmax)          — global rowmax, same as BF16
+2. apply_exp2_convert(S) → P                 — exp2((S-rowmax)*scale)
+3. compute_group_max(P) → gmax[g]            — per-group max of exp2 output
+4. scale_groupwise(P, gmax) → P_norm[i] = P[i] / gmax[g]
+   - if gmax[g] == 0: P_norm = 0 (group contributes nothing)
+   - optional SP1: P_norm *= 6.0 (use full FP4 range), gmax /= 6.0
+5. _quant_fp4(P_norm, gmax) → FP4(P_norm) + UE4M3(gmax)
+6. update_row_sum(P_original, ...) — uses P BEFORE normalization, unchanged
+```
+
+MMA reconstructs: `P_fp4 * SFP ≈ P_norm * gmax = (P/gmax) * gmax = P` ✓
+
+**Why this approach (not pre-exp2 group scaling):**
+- No need to exp2 the scale factors (they're already in exp domain)
+- No need for `update_row_sum_sage` (row_sum uses original P, not normalized)
+- `scale_subtract_rowmax` stays unchanged (no group_max argument needed)
+- Simpler: just divide + handle zero after exp2
+
+**Precision concern:** Without SP1, P_norm ∈ [0, 1] → FP4 levels {0, 0.5, 1.0}.
+With SP1 (P_norm *= 6): [0, 6] → all 8 FP4 levels. Enable later.
+
+**Ordering concern:** `update_row_sum` must use the ORIGINAL P (before division).
+Currently `update_row_sum` is called AFTER the P→TMEM store (line ~3270).
+`scale_groupwise` must happen between exp2 and `_quant_fp4`, and the original P
+values must be preserved for `update_row_sum`. Two options:
+  a) Call `update_row_sum` before `scale_groupwise` (move it earlier)
+  b) Save a copy of P before normalization
+Option (a) is cleaner but requires moving `update_row_sum` before the TMEM store
+and mbarrier wait. Check if this breaks the pipeline synchronization.
+
+### TODO
+- [x] Implement `scale_groupwise` in SoftmaxSm100
+- [x] Wire into softmax_step quant_pv path (between exp2 and _quant_fp4)
+- [x] Handle update_row_sum ordering (must use original P, not normalized)
+- [x] Handle division by zero (group_max == 0)
+- [x] Fix Bug 3: QK GEMM NaN — scale factor PTX offset units mismatch (`recast_layout` fix in `gemm_ptx_partial_fp4`)
+- [x] Clean up debug prints from flash_fwd_sm100_fp4.py and blackwell_helpers.py
+- [ ] Debug Bug 2: PV GEMM TS block-scaled MMA all-zeros output
+- [ ] Test with --quant_v --debug
+- [ ] After quant_v works: final cleanup pass
+
+### Implementation issues / log
+
+**Issue 1 (FIXED): scale_groupwise works, but output still all zeros**
+`scale_groupwise` correctly normalizes P: dominant group p_norm=1.0, sfp≈1.0.
+Zero groups stay 0. But PV GEMM O accumulator is still all-zero.
+This is the pre-existing Bug 2: FP4 TS GEMM with block_scale doesn't produce output.
+`force_fp4_impl` (BF16 TS GEMM) works fine. The issue is specific to `mxf4nvf4.block_scale`.
+
+Root cause of Bug 2 is NOT the quantization (now fixed). Remaining suspects:
+- P TMEM store address vs MMA tA_addr mismatch
+- SFP/SFV S2T copy target address wrong
+- Block-scale MMA idesc encoding
+- V SMEM descriptor for FP4 (different layout than BF16)
+
+**Issue 2: NaN with random V data**
+FP4 V with `torch.randn` produces values outside FP4 range → NaN propagates.
+This is expected and not a kernel bug. Use `--debug` for deterministic testing.
+
+**Issue 3: update_row_sum moved earlier (before TMEM store)**
+Moved `update_row_sum` to right after `apply_exp2_convert` (before `scale_groupwise`),
+so it sees original P values. This is safe because `row_sum` is purely in softmax warp
+registers — the correction warp doesn't read it. The `mbar_softmax_corr_empty` wait
+is about correction finishing O rescaling, not about row_sum.
+
+**Issue 4 (RETRACTED): TS block-scaled MMA IS supported for FP4**
+
+Initial investigation wrongly concluded TS block-scaled MMA was unsupported. PTX ISA 9.7.16.10.9.1
+explicitly shows both SS and TS forms for `.kind::mxf4nvf4.block_scale`. CUTLASS C++ lacking a
+`SM100_MMA_MXF4_TS` wrapper does NOT mean the hardware doesn't support it.
+
+The TS instruction is correct. Focus on the scale factor data path instead:
+- SFP R2S (softmax registers → sSFP in SMEM)
+- SFP S2T (sSFP in SMEM → tCtSFPs in TMEM)
+- SFV S2T (sSFV in SMEM → tCtSFVs in TMEM)
+- idesc `a_sf_id` / `b_sf_id` encoding
+- V data validity in SMEM
+
+## Bug 3 (FIXED): QK GEMM NaN — scale factor PTX offset units mismatch
+
+### Symptom
+QK GEMM output contained NaN that grew across work tiles:
+- CTA 0: nan_count=0, S[0]=6.5
+- CTA 1: nan_count=1, S[0]=40.3
+- CTA 2: nan_count=5, S[0]=127
+- CTA N: nan_count=128, S[0]=NaN
+
+Only appeared with random data, seqlen >= 256 (2+ n-blocks).
+
+### Root cause
+In `gemm_ptx_partial_fp4` (blackwell_helpers.py), the scale factor k-tile offsets
+were computed from FP8-typed TMEM tensor layouts:
+```python
+# BUG: offset_sfa in FP8 element units, but PTX expects u32 column units
+offset_sfa = [cute.crd2idx((0, 0, k), tScaleA.layout) ...]  # [0, 16] in FP8 elements
+```
+
+PTX `[tmem_scale_a + 16]` means column 16 offset, but the correct value is 4
+(16 FP8 / 4 per column). The second k-tile read scale factors from column+16
+instead of column+4 — 12 columns off into garbage TMEM.
+
+Note: `offset_a` for TS mode correctly uses `cute.recast_layout(32, width, layout)`
+to convert to column units (line 632), but the scale factor offsets lacked this.
+
+### Fix
+```python
+# FIX: recast to 32-bit layout for column units
+sfa_layout_u32 = cute.recast_layout(32, tScaleA.element_type.width, tScaleA.layout)
+offset_sfa = [cute.crd2idx((0, 0, k), sfa_layout_u32) ...]  # [0, 4] in columns ✓
+```
+
+### Why it wasn't caught earlier
+- With 1 n-block: wrong values but no NaN (wrong scale only affects magnitude)
+- With `--debug` (uniform data, SF=1.0): second k-tile SF garbage happened to
+  produce finite results; wrong magnitude was within acceptable range
+- The `force_fp4_impl` (BF16 data through non-block-scaled MMA) is unaffected
+- Previous sessions focused on PV GEMM bugs, not QK GEMM
+
+### Debug prints (all removed after fix)
+- `[QK-CHK]`: NaN scan loop in softmax_step (removed — heavy 128-iteration unrolled loop)
+- `[TMEM-FIX]`: Compile-time TMEM pointer values (removed)
+- `[SS-FP4]` / `[TS-FP4]`: Compile-time MMA offsets (removed)
