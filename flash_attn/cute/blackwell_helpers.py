@@ -145,9 +145,6 @@ def gemm_ptx(
         smem_desc_b_lo = smem_desc_start_b_lo + (
             (cute.crd2idx((0, 0, k), sB_layout) * sB.element_type.width // 8) >> 4
         )
-        # with cute.arch.elect_one():
-        #     cute.printf("smem_desc_a_lo = {}, smem_desc_b_lo = {}", smem_desc_a_lo, smem_desc_b_lo)
-        #     cute.printf("smem_desc_a_lo_correct = {}, smem_desc_b_lo_correct = {}", smem_desc_a_lo_correct, smem_desc_b_lo_correct)
         with cute.arch.elect_one():
             if const_expr(not is_ts):
                 llvm.inline_asm(
@@ -625,7 +622,6 @@ def gemm_ptx_partial_fp4(
     smem_desc_base_b_lo, smem_desc_b_hi = i64_to_i32x2(smem_desc_base_b)
     smem_desc_base_b_lo = const_expr(smem_desc_base_b_lo)
     smem_desc_b_hi = const_expr(smem_desc_b_hi)
-
     tCrA_layout = (
         tCrA.layout
         if const_expr(not is_ts)

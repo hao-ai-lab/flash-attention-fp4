@@ -285,13 +285,13 @@ def create_fp4_attention_tensors(batch, seqlen_q, seqlen_k, nheads, nheads_kv, h
     if debug:
         q_ref = torch.full((batch, seqlen_q, nheads, headdim), fill_value=1.0, device=device, dtype=torch.float32)
         k_ref = torch.full((batch, seqlen_k, nheads_kv, headdim), fill_value=1.0, device=device, dtype=torch.float32)
-        # Test: V = 1.0 for each block individually, to trace per-block contributions
-        # V = block_index for full test. Expected output = 7.5 (mean of 0-15)
+        # V = block_index mod 4, keeping values in FP4 range (max 6.0)
+        # With uniform attention, expected output = mean of V values
         n_block_size = 128
         n_blocks = seqlen_k // n_block_size
         v_ref = torch.zeros((batch, seqlen_k, nheads_kv, headdim_v), device=device, dtype=torch.float32)
         for s in range(seqlen_k):
-            v_ref[:, s, :, :] = s // n_block_size
+            v_ref[:, s, :, :] = (s // n_block_size) % 4
         # breakpoint()
     else:
         q_ref = torch.randn(batch, seqlen_q, nheads, headdim, device=device, dtype=torch.float32)
@@ -342,20 +342,26 @@ def create_fp4_attention_tensors(batch, seqlen_q, seqlen_k, nheads, nheads_kv, h
     
     # Handle V: quantize to FP4 if quant_v=True, otherwise use regular dtype
     if quant_v:
+        # FP4 block-scaled MMA requires V to be K-major (seqlen contiguous in SMEM).
+        # Create V with seqlen as the contiguous dimension by physically transposing.
+        # v_ref: (batch, seqlen, nheads, headdim) with headdim contiguous
+        # After permute+contiguous+permute: same shape but seqlen has stride 1
+        v_ref_kmajor = v_ref.permute(0, 3, 2, 1).contiguous().permute(0, 3, 2, 1)
+        print(f"  V layout for FP4: shape={v_ref_kmajor.shape}, strides={v_ref_kmajor.stride()}")
         v_tensor, v_torch_underlying = cutlass_torch.cute_tensor_like(
-            v_ref, ab_dtype, is_dynamic_layout=True, assumed_align=16
+            v_ref_kmajor, ab_dtype, is_dynamic_layout=True, assumed_align=16
         )
-        # Get the correct stride_order from the reference tensor
-        v_stride_order = tuple(v_ref.dim_order())
+        # Get the correct stride_order from the transposed reference tensor
+        v_stride_order = tuple(v_ref_kmajor.dim_order())
         v_tensor.mark_compact_shape_dynamic(
-            mode=1,  # headdim_v dimension needs divisibility for FP4
+            mode=1,  # headdim dimension needs divisibility for FP4
             stride_order=v_stride_order,
             divisibility=32,
         )
         v_tensor = cutlass_torch.convert_cute_tensor(
-            v_ref, v_tensor, ab_dtype, is_dynamic_layout=True
+            v_ref_kmajor, v_tensor, ab_dtype, is_dynamic_layout=True
         )
-        # Note: no compaction needed for V FP4 data either
+        # V is (batch, seqlen, nheads, headdim) with seqlen contiguous
     else:
         # V stays as regular dtype (not FP4 quantized) - create CUTE tensor
         # Convert torch dtype to CUTE dtype
@@ -441,7 +447,7 @@ def main(ab_dtype, sf_dtype, sf_vec_size, quant_v=False, debug=False):
     
     # Benchmark configurations
     # bs_seqlen_vals = [(32, 1024), (16, 2048), (2, 4096), (1, 8192), (2, 16384), (1, 32768), (4, 32768 * 8)]
-    bs_seqlen_vals = [(1, 256), (1, 1024), (1, 4096)]
+    bs_seqlen_vals = [(1, 256), (1, 1024), (4, 4096)]
     # bs_seqlen_vals = [(32, 1024)]
     # bs_seqlen_vals = [(4, 300 * 1000)]
     headdim = 128
@@ -497,13 +503,13 @@ def main(ab_dtype, sf_dtype, sf_vec_size, quant_v=False, debug=False):
                 window_size=window_size,
                 mSFQ=q_sf,
                 mSFK=k_sf,
-                mSFV=v_sf, 
+                mSFV=v_sf,
                 repeats=repeats,
                 verbose=verbose,
                 desc=desc_str
             )
             print(f'FP4 Attention fwd: {m_fp4.mean * 1e3:.3f}ms, {(nFLOPS / m_fp4.mean * 1e-12):.1f} TFLOPS')
-            
+
             torch.cuda.synchronize()  # flush GPU printf buffer
             fp4_out = flash_attn_func_python(
                 q_fp4, k_fp4, v_tensor,
