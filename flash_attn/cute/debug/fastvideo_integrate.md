@@ -12,12 +12,16 @@
   - seq=4096 nheads=24 hdim=128: 1.13x
 - **Attention precision**: cos=0.99, SNR=7.25 per-call
 - **Video quality**: Step 49 latent cos=0.96 vs BF16 after 50 denoising steps. Visually recognizable but accumulated FP4 error visible.
-- **E2E timing**: NVFP4=53s vs BF16=83s (1.56x), but the faster time is due to flash_attn v3 BF16 being slower than FA4 BF16. Fair kernel-only speedup is 1.09x.
+- **E2E timing** (both using FA4 backend, vacant GPUs): NVFP4=53.7s vs BF16=57.3s (**1.07x**). Fair kernel-only speedup is 1.06-1.22x depending on shape.
 
 ## Setup
-- Activate FastVideo venv: `source /sgl-workspace/FastVideo-Quantization/.venv/bin/activate`
-- Install FA4: create `.pth` file in venv site-packages pointing to flash-attention dir
-- Fix CUBLAS: `uv pip uninstall nvidia-cublas-cu12` (system-level)
+```bash
+cd /sgl-workspace/FastVideo-Quantization
+uv venv .venv --python 3.11
+source .venv/bin/activate
+uv pip install -e .
+bash setup_fp4_fa4.sh   # clones fp4_quant branch, installs FA4 + cutlass-dsl + flashinfer
+```
 - Env vars: `FASTVIDEO_NVFP4_FA4=1`, `CUTE_DSL_ENABLE_TVM_FFI=1`
 
 ## Architecture
