@@ -321,7 +321,7 @@ class SoftmaxSm100(Softmax):
         """
         acc_S_row_frag = cute.logical_divide(acc_S_row, cute.make_layout(sf_size))
         for g in cutlass.range_constexpr(cute.size(group_max)):
-            inv_gmax = Float32(1.0) / cute.arch.fmax(group_max[g], 1e-20)
+            inv_gmax = Float32(1.0) / group_max[g]
             for j in cutlass.range(0, sf_size, 2, unroll_full=True):
                 acc_S_row_frag[j, g], acc_S_row_frag[j + 1, g] = mul_packed_f32x2(
                     (acc_S_row_frag[j, g], acc_S_row_frag[j + 1, g]),
@@ -3106,14 +3106,6 @@ class FlashAttentionForwardSm100:
         row_max, acc_scale = softmax.update_row_max(tSrS_t2r.load(), is_first)
         tSrPSF_f32 = None
         tSrPSF = None
-<<<<<<< HEAD
-        if const_expr(self.quant_pv):
-            # Compute grouped scores max (will be converted to sp2 of SageAttention3)
-            # little speed diff
-            tSrPSF_f32 = softmax.compute_group_max(tSrS_t2r, sf_size=self.sf_vec_size)
-            tSrPSF = cute.make_rmem_tensor(tSrPSF_f32.layout, cute.Float8E4M3FN)
-=======
->>>>>>> fp4_quant
 
         if const_expr(not is_first):
             # tSrScale_r2t = cute.make_fragment(thr_tmem_store_scale.partition_S(tScScale).shape, Float32)
