@@ -686,7 +686,7 @@ class FlashAttentionForwardSm100:
         - Configures pipeline stages for softmax, correction, and epilogue operations
         """
         # do not increase if only testing quant qk
-        self.kv_stage = 6 if self.q_dtype.width < 8 and self.v_dtype.width < 8 else 3 
+        self.kv_stage = 10 if self.q_dtype.width < 8 and self.v_dtype.width < 8 else 3 
         self.acc_stage = 1
         self.epi_stage = 2
         # For hdim 192,128, we don't have enough smem to store all 3 stages of KV:
