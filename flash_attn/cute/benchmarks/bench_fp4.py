@@ -445,30 +445,37 @@ def main(ab_dtype, sf_dtype, sf_vec_size, quant_v=False, debug=False):
     causal = False
     dtype_gen = torch.bfloat16
     
-    # Benchmark configurations
-    # bs_seqlen_vals = [(32, 1024), (16, 2048), (2, 4096), (1, 8192), (2, 16384), (1, 32768), (4, 32768 * 8)]
-    bs_seqlen_vals = [(1, 256), (1, 1024), (4, 4096)]
-    # bs_seqlen_vals = [(32, 1024)]
-    # bs_seqlen_vals = [(4, 300 * 1000)]
-    headdim = 128
-    nheads = 16
-    nheads_kv = nheads
-    headdim_v = headdim
-    
+    # Benchmark configurations: (batch, seqlen, nheads, headdim)
+    # Covers bench_fp4 defaults, video-gen (Wan2.1-1.3B: nheads=12, hdim=128), and larger models
+    configs = [
+        # bench_fp4 defaults (nheads=16, headdim=128)
+        (1, 256, 16, 128),
+        (1, 1024, 16, 128),
+        (4, 4096, 16, 128),
+        # Video gen shapes (Wan2.1-T2V-1.3B: nheads=12, headdim=128)
+        (1, 4096, 12, 128),
+        (1, 32768, 12, 128),
+        # Larger models (nheads=24)
+        (1, 4096, 24, 128),
+        (1, 32768, 24, 128),
+        # headdim=64 comparison
+        (1, 32768, 24, 64),
+    ]
     print("=" * 80)
     print("FP4 Flash Attention Benchmark")
     print("=" * 80)
     print(f"Device: {device}")
-    print(f"Headdim: {headdim}, Nheads: {nheads}, NheadsKV: {nheads_kv}, HeaddimV: {headdim_v}")
     print(f"Causal: {causal}")
     print(f"Quantize V: {quant_v}")
     print("=" * 80)
     
-    for batch_size, seqlen in bs_seqlen_vals:
+    for batch_size, seqlen, nheads, headdim in configs:
+        nheads_kv = nheads
+        headdim_v = headdim
         seqlen_q = seqlen
         window_size = (None, None)
-        
-        print(f"\n### Batch={batch_size}, SeqLen={seqlen} ###")
+
+        print(f"\n### Batch={batch_size}, SeqLen={seqlen}, Nheads={nheads}, Headdim={headdim} ###")
         
         # Create FP4 tensors (V quantization is optional)
         (q_fp4, k_fp4, v_tensor, q_sf, k_sf, v_sf, 

@@ -709,10 +709,10 @@ class FlashAttentionForwardSm100:
     @cute.jit
     def __call__(
         self,
-        mQ: cute.Tensor,  # (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
-        mK: cute.Tensor,  # (b_k, s_k, h_k, d) or (total_k, h_k, d) if there is cu_seqlens_k or (num_pages, page_size, h_k, d) if there is page_table
-        mV: cute.Tensor,  # (b_k, s_k, h_k, dv) or (total_k, h_k, dv) if there is cu_seqlens_k or (num_pages, page_size, h_k, dv) if there is page_table
-        mO: cute.Tensor,  # (b, s_q, h, dv) or (total_q, h, dv) if there is cu_seqlens_q
+        mQ,  # cute.Tensor or cute.Pointer (b, s_q, h, d)
+        mK,  # cute.Tensor or cute.Pointer (b_k, s_k, h_k, d)
+        mV: cute.Tensor,  # (b_k, s_k, h_k, dv)
+        mO: cute.Tensor,  # (b, s_q, h, dv)
         mLSE: Optional[cute.Tensor],
         softmax_scale: Float32,
         stream: cuda.CUstream,
@@ -720,32 +720,36 @@ class FlashAttentionForwardSm100:
         mCuSeqlensK: Optional[cute.Tensor] = None,
         mSeqUsedQ: Optional[cute.Tensor] = None,
         mSeqUsedK: Optional[cute.Tensor] = None,
-        mPageTable: Optional[cute.Tensor] = None,  # (b_k, max_num_pages_per_seq)
+        mPageTable: Optional[cute.Tensor] = None,
         window_size_left: Int32 | int | None = None,
         window_size_right: Int32 | int | None = None,
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_tensors: Optional[list] = None,
-        mSFQ: Optional[cute.Tensor] = None,  # Scale factor for Q
-        mSFK: Optional[cute.Tensor] = None,  # Scale factor for K
-        mSFV: Optional[cute.Tensor] = None,  # Scale factor for V
+        mSFQ: Optional[cute.Tensor] = None,
+        mSFK: Optional[cute.Tensor] = None,
+        mSFV: Optional[cute.Tensor] = None,
+        # For pointer-based Q/K: separate shapes to handle cross-attention (seqlen_q != seqlen_k)
+        q_ptr_shape: tuple = (),
+        k_ptr_shape: tuple = (),
         compute_sp1: cutlass.Constexpr[bool] = False,
-        
     ):
         """Execute the Fused Multi-Head Attention operation on the provided tensors.
 
-        This method prepares the input tensors for processing, validates their shapes and types,
-        configures the computation parameters, and launches the CUDA kernel.
-
-        The method handles:
-        1. Tensor layout transformations for specific memory access patterns
-        2. Validation of tensor shapes and data types
-        3. Initialization of hardware-specific parameters and memory layouts
-        4. Configuration of TMA (Tensor Memory Access) operations
-        5. Grid and work scheduling computation
-        6. Kernel launch with appropriate parameters
+        For FP4, mQ/mK can be cute.Pointer with q/k_ptr_shape providing (b, s, h, d).
+        The kernel builds tensors from the pointer using make_ordered_layout.
         """
-        # setup static attributes before smem/grid/tma computation
+        # Build Q/K tensors from pointer/tensor + shape
+        # For pointers: mQ is a Pointer, .iterator not needed
+        # For tensors: mQ is a Tensor, use .iterator to extract pointer
+        q_iter = mQ.iterator if hasattr(mQ, 'iterator') else mQ
+        k_iter = mK.iterator if hasattr(mK, 'iterator') else mK
+        mQ = cute.make_tensor(q_iter, cute.make_ordered_layout(
+            q_ptr_shape, order=tuple(range(len(q_ptr_shape) - 1, -1, -1))
+        ))
+        mK = cute.make_tensor(k_iter, cute.make_ordered_layout(
+            k_ptr_shape, order=tuple(range(len(k_ptr_shape) - 1, -1, -1))
+        ))
         self.q_dtype = mQ.element_type
         self.k_dtype = mK.element_type
         self.v_dtype = mV.element_type
@@ -765,10 +769,9 @@ class FlashAttentionForwardSm100:
                 s if isinstance(s, int) else cute.assume(s, divby=divby)
                 for s in t.stride[:-1]
             ) + (t.stride[-1],)
-        new_stride = _assume_strides
-        mQ, mK, mV, mO = [
-            cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=new_stride(t)))
-            for t in (mQ, mK, mV, mO)
+        mV, mO = [
+            cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=_assume_strides(t)))
+            for t in (mV, mO)
         ]
         Q_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
         mQ = cute.make_tensor(mQ.iterator, cute.select(mQ.layout, mode=Q_layout_transpose)) # (s_q, d, h, b)

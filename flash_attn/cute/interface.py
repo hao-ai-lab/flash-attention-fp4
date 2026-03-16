@@ -128,9 +128,9 @@ cute2torch_dtype_map = {
 def is_nvfp4_dtype(dtype):
     """Check if a torch dtype is nvfp4 (FP4)"""
     # Check by dtype name or string representation
-    dtype_str = str(dtype)
+    dtype_str = str(dtype).lower()
     # NOTE: cutlass uses int8 for nvfp4 for now, change later.
-    return 'nvfp4' in dtype_str.lower() or 'fp4' in dtype_str.lower() or hasattr(dtype, 'nvfp4') or dtype == torch.int8 
+    return 'nvfp4' in dtype_str or 'fp4' in dtype_str or 'e2m1' in dtype_str or hasattr(dtype, 'nvfp4') or dtype == torch.int8
 
 
 def is_valid_dtypes_and_scale_factor_vec_size(
@@ -241,6 +241,10 @@ def _flash_attn_fwd(
     if not isinstance(q, cute.Tensor):
         q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
     num_head, head_dim = q.shape[-2:]
+    # For FP4 packed dtypes (float4_e2m1fn_x2), the last dim is headdim/2.
+    # For int8 FP4 buffers (from cute_tensor_like), shape already has full headdim — no correction needed.
+    if not isinstance(q, cute.Tensor) and hasattr(torch, 'float4_e2m1fn_x2') and q.dtype == torch.float4_e2m1fn_x2:
+        head_dim = head_dim * 2
     if cu_seqlens_q is None:
         batch_size, seqlen_q = q.shape[:2]
         total_q = batch_size * seqlen_q
@@ -261,15 +265,17 @@ def _flash_attn_fwd(
         seqlen_k = k.shape[-3]
     num_head_kv = k.shape[-2]
     head_dim_v = v.shape[-1]
+    # For shape assertions, use the packed dim (what's actually in the tensor)
+    head_dim_packed = q.shape[-1]
     if cu_seqlens_k is None:
         if page_table is None:
-            assert k.shape == (batch_size, seqlen_k, num_head_kv, head_dim)
+            assert k.shape == (batch_size, seqlen_k, num_head_kv, head_dim_packed), f"k shape {k.shape} != expected {(batch_size, seqlen_k, num_head_kv, head_dim_packed)}"
             assert v.shape == (batch_size, seqlen_k, num_head_kv, head_dim_v)
         else:
-            assert k.shape == (num_pages, page_size, num_head_kv, head_dim)
+            assert k.shape == (num_pages, page_size, num_head_kv, head_dim_packed)
             assert v.shape == (num_pages, page_size, num_head_kv, head_dim_v)
     else:
-        assert k.shape == (seqlen_k, num_head_kv, head_dim)
+        assert k.shape == (seqlen_k, num_head_kv, head_dim_packed)
         assert v.shape == (seqlen_k, num_head_kv, head_dim_v)
         assert cu_seqlens_k.shape == (batch_size + 1,), (
             "cu_seqlens_k must have shape (batch_size + 1,)"
@@ -299,7 +305,7 @@ def _flash_attn_fwd(
     else:
         use_fp4 = is_nvfp4_dtype(q.dtype)
         if not use_fp4:
-            assert q.dtype in [torch.float16, torch.bfloat16, torch.float4_e2m1fn_x2], "inputs must be float16, bfloat16, or float4_e2m1fn_x2"
+            assert q.dtype in [torch.float16, torch.bfloat16], "inputs must be float16 or bfloat16"
             assert q.dtype == k.dtype == v.dtype, "inputs must have the same dtype"
     
     # Store is_cute_q for later use
@@ -362,7 +368,7 @@ def _flash_attn_fwd(
             out_torch_dtype = cute2torch_dtype_map[q_dtype]
         device = torch.device('cuda')  # CUTE tensors are always on CUDA
     else:
-        out_torch_dtype = q.dtype
+        out_torch_dtype = torch.bfloat16 if use_fp4 else q.dtype
         device = q.device
     q_batch_seqlen_shape = (batch_size, seqlen_q) if cu_seqlens_q is None else (total_q,)
     lse_shape = (batch_size, num_head, seqlen_q) if cu_seqlens_q is None else (num_head, total_q)
@@ -552,6 +558,20 @@ def _flash_attn_fwd(
         mSFV is not None,
         force_fp4_impl,
     )
+    fp4_qk = use_fp4 and not is_cute_q
+    # Compute q_shape, k_shape and qk_ab_dtype for pointer-based Q/K path (used by FP4 kernel)
+    if fp4_qk:
+        q_ptr_shape = tuple(int(s) for s in (*q.shape[:-1], q.shape[-1] * 2))
+        k_ptr_shape = tuple(int(s) for s in (*k.shape[:-1], k.shape[-1] * 2))
+        qk_ab_dtype = cutlass.Float4E2M1FN
+    elif is_cute_q:
+        q_ptr_shape = tuple(int(s) for s in q.shape)
+        k_ptr_shape = tuple(int(s) for s in k.shape)
+        qk_ab_dtype = q.element_type
+    else:
+        q_ptr_shape = tuple(int(s) for s in q.shape)
+        k_ptr_shape = tuple(int(s) for s in k.shape)
+        qk_ab_dtype = torch2cute_dtype_map.get(q.dtype, cutlass.BFloat16)
     if compile_key not in _flash_attn_fwd.compile_cache:
         (
             cu_seqlens_q_tensor,
@@ -587,9 +607,17 @@ def _flash_attn_fwd(
             else:
                 raise ValueError(f"Invalid scale factor dtype: {sf_dtype}")
         
-        q_tensor, k_tensor, v_tensor, o_tensor = [
-            to_cute_tensor(t) for t in (q, k, v, out if not is_split_kv else out_partial)
-        ]
+        # For torch FP4 tensors: use make_ptr path (kernel builds tensor from pointer + shape)
+        # For cute tensors or non-FP4 torch tensors: use to_cute_tensor as before
+        if fp4_qk:
+            from cutlass.cute.runtime import make_ptr
+            q_tensor = make_ptr(qk_ab_dtype, 0, cute.AddressSpace.gmem, assumed_align=16)
+            k_tensor = make_ptr(qk_ab_dtype, 0, cute.AddressSpace.gmem, assumed_align=16)
+        else:
+            q_tensor = to_cute_tensor(q)
+            k_tensor = to_cute_tensor(k)
+        v_tensor = to_cute_tensor(v)
+        o_tensor = to_cute_tensor(out if not is_split_kv else out_partial)
         # Pass through scale factor tensors if using FP4 (tvm-ffi handles conversion)
         mSFQ_tensor = mSFK_tensor = mSFV_tensor = None
         if use_fp4:
@@ -653,7 +681,7 @@ def _flash_attn_fwd(
                 if sf_dtype is None:
                     sf_dtype = cutlass.Float8E4M3FN  # Default scale factor dtype for FP4
                 # Validate dtype and scale factor combinations
-                ab_dtype = q_tensor.element_type  # MXFP4 and NVFP4 use Float4E2M1FN for Q/K/V
+                ab_dtype = q_tensor.value_type if fp4_qk else q_tensor.element_type
                 if not force_fp4_impl and not is_valid_dtypes_and_scale_factor_vec_size(ab_dtype, sf_dtype, sf_vec_size):
                     raise ValueError(
                         f"Invalid dtype combination: ab_dtype={ab_dtype}, "
@@ -736,6 +764,15 @@ def _flash_attn_fwd(
         # Add scale factor tensors if using FP4
         if use_fp4 or force_fp4_impl:
             compile_args.extend([mSFQ_tensor, mSFK_tensor, mSFV_tensor])
+        # Add q/k shapes for FP4 kernel (it always builds tensors from pointer + shape)
+        if use_fp4 or force_fp4_impl:
+            if fp4_qk:
+                sym_q_shape = tuple(cutlass.Int32(0) for _ in q_ptr_shape)
+                sym_k_shape = tuple(cutlass.Int32(0) for _ in k_ptr_shape)
+            else:
+                sym_q_shape = tuple(cutlass.Int32(0) for _ in range(len(q_tensor.shape)))
+                sym_k_shape = tuple(cutlass.Int32(0) for _ in range(len(k_tensor.shape)))
+            compile_args.extend([sym_q_shape, sym_k_shape])
         _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
             *compile_args,
             options="--enable-tvm-ffi",
@@ -755,9 +792,18 @@ def _flash_attn_fwd(
             expected_count_shape=expected_count_shape,
             expected_index_shape=expected_index_shape,
         )
+    if fp4_qk:
+        from cutlass.cute.runtime import make_ptr as _make_ptr
+        q_data_ptr = q.data_ptr() if hasattr(q, 'data_ptr') else q.iterator.data_ptr
+        k_data_ptr = k.data_ptr() if hasattr(k, 'data_ptr') else k.iterator.data_ptr
+        q_call = _make_ptr(qk_ab_dtype, q_data_ptr, cute.AddressSpace.gmem, assumed_align=16)
+        k_call = _make_ptr(qk_ab_dtype, k_data_ptr, cute.AddressSpace.gmem, assumed_align=16)
+    else:
+        q_call = q
+        k_call = k
     call_args = [
-        q,
-        k,
+        q_call,
+        k_call,
         v,
         out if not is_split_kv else out_partial,
         lse_partial if is_split_kv else lse,
@@ -778,6 +824,9 @@ def _flash_attn_fwd(
     # Add scale factor tensors if using FP4
     if use_fp4 or force_fp4_impl:
         call_args.extend([mSFQ, mSFK, mSFV])
+    # Add q/k shapes for FP4 kernel
+    if use_fp4 or force_fp4_impl:
+        call_args.extend([q_ptr_shape, k_ptr_shape])
 
     _flash_attn_fwd.compile_cache[compile_key](*call_args)
 
