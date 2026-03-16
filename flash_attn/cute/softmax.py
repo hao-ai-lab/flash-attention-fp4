@@ -227,7 +227,24 @@ class SoftmaxSm100(Softmax):
         # self.row_sum[0] = self._compute_row_sum(acc_S_row_exp, init_val=self.row_sum[0] * row_scale)
         self.row_sum[0] = self._compute_row_sum(acc_S_row_exp, init_val=init_val)
         # tmp = self._compute_row_sum(acc_S_row_exp)
-        # self.row_sum[0] = self.row_sum[0] * row_scale + tmp
+
+    @cute.jit
+    def update_row_sum_sage(
+        self, acc_S_row_exp: cute.Tensor, acc_S_row_group_max_exp: cute.Tensor, row_scale: Float32, is_first: int = False
+    ) -> None:
+        init_val = self.row_sum[0] * row_scale if cutlass.const_expr(not is_first) else None
+        vec_size = const_expr(cute.size(acc_S_row_exp) // cute.size(acc_S_row_group_max_exp))
+        acc_S_row_exp_frag = cute.logical_divide(acc_S_row_exp, cute.make_layout(vec_size))
+        acc_S_group_sum = cute.make_rmem_tensor(acc_S_row_group_max_exp.layout, dtype=Float32)
+
+        num_groups = cute.size(acc_S_row_exp_frag, mode=[1])
+        assert num_groups % 2 == 0
+        for i in cutlass.range_constexpr(0, num_groups, 2):
+            acc_S_group_sum[i], acc_S_group_sum[i + 1] = utils.mul_packed_f32x2(
+                (self._compute_row_sum(acc_S_row_exp_frag[None, i].load()), self._compute_row_sum(acc_S_row_exp_frag[None, i + 1].load())),
+                (acc_S_row_group_max_exp[i], acc_S_row_group_max_exp[i + 1]),
+            )
+        self.row_sum[0]= self._compute_row_sum(acc_S_group_sum.load(), init_val=init_val)
 
     @cute.jit
     def scale_subtract_rowmax(
@@ -244,13 +261,6 @@ class SoftmaxSm100(Softmax):
         else:
             row_max_scaled = row_max * self.scale_log2
 
-        for i in cutlass.range(0, cute.size(acc_S_row.shape), 2, unroll_full=True):
-            acc_S_row[i], acc_S_row[i + 1] = utils.fma_packed_f32x2(
-                (acc_S_row[i], acc_S_row[i + 1]),
-                (self.scale_log2, self.scale_log2),
-                (-row_max_scaled, -row_max_scaled),
-            )
-        
         if const_expr(acc_S_row_group_max is not None):
             if const_expr(self.compute_sp1) and const_expr(self.quant_pv):
                 row_max_scaled += self.fp4_scale_log2 # / 6 to scale to fp4 max
@@ -260,7 +270,23 @@ class SoftmaxSm100(Softmax):
                     (self.scale_log2, self.scale_log2),
                     (-row_max_scaled, -row_max_scaled),
                 )
-
+            vec_size = cute.size(acc_S_row) // cute.size(acc_S_row_group_max)
+            acc_S_row_frag = cute.logical_divide(acc_S_row, cute.make_layout(vec_size))
+            for j in cutlass.range_constexpr(0, cute.size(acc_S_row_frag, mode=[1])):
+                for i in cutlass.range(0, cute.size(acc_S_row_frag, mode=[0]), 2, unroll_full=True):
+                    bias = -row_max_scaled - acc_S_row_group_max[j]
+                    acc_S_row_frag[i, j], acc_S_row_frag[i + 1, j] = utils.fma_packed_f32x2(
+                        (acc_S_row_frag[i, j], acc_S_row_frag[i + 1, j]),
+                        (self.scale_log2, self.scale_log2),
+                        (bias, bias),
+                    )
+        else:
+            for i in cutlass.range(0, cute.size(acc_S_row.shape), 2, unroll_full=True):
+                acc_S_row[i], acc_S_row[i + 1] = utils.fma_packed_f32x2(
+                    (acc_S_row[i], acc_S_row[i + 1]),
+                    (self.scale_log2, self.scale_log2),
+                    (-row_max_scaled, -row_max_scaled),
+                )
 
     @cute.jit
     def apply_exp2_convert(

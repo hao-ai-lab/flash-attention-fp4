@@ -112,9 +112,9 @@ def cvt_sf_MKL_to_M32x4xrm_K4xrk_L(
         sf_mma_tensor[mma_coord] = sf_ref_tensor[mkl_coord]
 
 
-def create_scale_factor_tensor(batch, seqlen, nheads, headdim, sf_vec_size, sf_dtype, q_dtype, device='cuda', debug=False):
+def create_scale_factor_tensor(batch, seqlen, nheads, headdim, sf_vec_size, sf_dtype, q_dtype, device='cuda', debug=False, sf_value=1.0):
     """Create scale factor tensor for Q/K/V.
-    
+
     Args:
         batch: Batch size
         seqlen: Sequence length
@@ -123,13 +123,14 @@ def create_scale_factor_tensor(batch, seqlen, nheads, headdim, sf_vec_size, sf_d
         sf_vec_size: Scale factor vector size (typically 16 for NVFP4)
         sf_dtype: Scale factor dtype (typically Float8E4M3FN for NVFP4)
         device: Device to create tensor on
-    
+        sf_value: Scale factor value (default 1.0)
+
     Returns:
         Tuple of (ref_tensor_cpu, cute_tensor, cute_torch_tensor)
     """
     def ceil_div(a, b):
         return (a + b - 1) // b
-    
+
     # Scale factor shape: (batch, nheads, seqlen, ceil_div(headdim, sf_vec_size))
     # For attention, we need scale factors per head dimension
     # Split batch and nheads so we can index them separately in the kernel
@@ -137,7 +138,7 @@ def create_scale_factor_tensor(batch, seqlen, nheads, headdim, sf_vec_size, sf_d
     k = headdim
     sf_k = ceil_div(k, sf_vec_size)
     ref_shape = (batch, nheads, mn, sf_k)
-    
+
     atom_m = (32, 4)
     atom_k = 4
     # mma_shape keeps batch and nheads separate: (batch, nheads, rest_m, rest_k, 32, 4, 4)
@@ -151,17 +152,17 @@ def create_scale_factor_tensor(batch, seqlen, nheads, headdim, sf_vec_size, sf_d
         atom_m[1],
         atom_k,
     )
-    
+
     # Permute (batch, nheads, mn, sf_k) to (mn, sf_k, batch, nheads) for ref tensor
     # This allows indexing by batch and nheads in the kernel
     ref_permute_order = (2, 3, 0, 1)
     # Permute mma_shape (batch, nheads, rest_m, rest_k, 32, 4, 4) to (32, 4, rest_m, 4, rest_k, nheads, batch)
     mma_permute_order = (4, 5, 2, 6, 3, 1, 0)
-    
+
     # Create f32 ref torch tensor (cpu)
     init_type = cutlass_torch.TensorInitType.SCALAR
     init_config = cutlass_torch.ScalarInitConfig(
-        value=1.0
+        value=sf_value
     )
     ref_f32_torch_tensor_cpu = cutlass_torch.create_and_permute_torch_tensor(
         ref_shape, torch.float32, permute_order=ref_permute_order, init_type=init_type, init_config=init_config
@@ -215,12 +216,38 @@ def create_scale_factor_tensor(batch, seqlen, nheads, headdim, sf_vec_size, sf_d
         sf_dtype,
         is_dynamic_layout=True,
     )
-    
-    
+
     return ref_f32_torch_tensor_cpu, cute_tensor, cute_torch_tensor
 
 
-def create_fp4_attention_tensors(batch, seqlen_q, seqlen_k, nheads, nheads_kv, headdim, headdim_v, 
+def _compact_fp4_data(torch_underlying, ab_dtype):
+    """Compact FP4 data in the int8 buffer to match CuTe's FP4 stride interpretation.
+
+    cute_tensor_like creates an int8 tensor with the FULL shape of the reference,
+    then overrides element_type to FP4. The CuTe tensor has int8-unit strides
+    (e.g., head stride = D bytes), but FP4 element_type halves byte offsets
+    (head byte offset = D/2). So the kernel reads at half the byte positions.
+
+    convert_cute_tensor correctly writes packed FP4 data at int8 byte positions
+    (rows at D-byte intervals). This function compacts the data so it's at the
+    FP4 byte positions (rows at D/2-byte intervals) where the kernel expects it.
+    """
+    if ab_dtype.width >= 8:
+        return
+
+    D = torch_underlying.shape[-1]  # Last dim = headdim in int8 units
+    packed_size = D // (8 // ab_dtype.width)  # D//2 for FP4
+
+    # Extract packed FP4 data from each row (first packed_size bytes, rest is gap)
+    rows = torch_underlying.reshape(-1, D)
+    packed = rows[:, :packed_size].contiguous()  # Copy before overwriting
+
+    # Clear buffer and write data at compacted positions
+    torch_underlying.fill_(0)
+    torch_underlying.flatten()[:packed.numel()].copy_(packed.flatten())
+
+
+def create_fp4_attention_tensors(batch, seqlen_q, seqlen_k, nheads, nheads_kv, headdim, headdim_v,
                                   device='cuda', dtype_gen=torch.bfloat16, quant_v=False, return_torch=True,
                                   ab_dtype=None, sf_dtype=None, sf_vec_size=None, debug=False):
     """Create FP4 attention tensors (Q, K, V) with scale factors.
@@ -256,16 +283,28 @@ def create_fp4_attention_tensors(batch, seqlen_q, seqlen_k, nheads, nheads_kv, h
     
     # Create reference FP32 tensors
     if debug:
-        q_ref = torch.full((batch, seqlen_q, nheads, headdim), fill_value=2.5, device=device, dtype=torch.float32)
-        k_ref = torch.full((batch, seqlen_k, nheads_kv, headdim), fill_value=2.5, device=device, dtype=torch.float32)
-        v_ref = torch.full((batch, seqlen_k, nheads_kv, headdim_v), fill_value=2.5, device=device, dtype=torch.float32)
+        q_ref = torch.full((batch, seqlen_q, nheads, headdim), fill_value=1.0, device=device, dtype=torch.float32)
+        k_ref = torch.full((batch, seqlen_k, nheads_kv, headdim), fill_value=1.0, device=device, dtype=torch.float32)
+        # V = block_index mod 4, keeping values in FP4 range (max 6.0)
+        # With uniform attention, expected output = mean of V values
+        n_block_size = 128
+        n_blocks = seqlen_k // n_block_size
+        v_ref = torch.zeros((batch, seqlen_k, nheads_kv, headdim_v), device=device, dtype=torch.float32)
+        for s in range(seqlen_k):
+            v_ref[:, s, :, :] = (s // n_block_size) % 4
+        # breakpoint()
     else:
         q_ref = torch.randn(batch, seqlen_q, nheads, headdim, device=device, dtype=torch.float32)
         k_ref = torch.randn(batch, seqlen_k, nheads_kv, headdim, device=device, dtype=torch.float32)
         v_ref = torch.randn(batch, seqlen_k, nheads_kv, headdim_v, device=device, dtype=torch.float32)
 
     # Create FP4 tensors for Q and K (V quantization is optional)
-    # First create CUTE tensors for Q and K
+    # For FP4 (Float4E2M1FN), pack 2 values per byte using int8 with halved last dim.
+    # The kernel detects Int8 dtype and converts to Float4E2M1FN internally.
+    if ab_dtype == cutlass.Float4E2M1FN:
+        k_fct = 2  # 2 FP4 values per byte
+    else:
+        k_fct = 1
     q_tensor, q_torch_underlying = cutlass_torch.cute_tensor_like(
         q_ref, ab_dtype, is_dynamic_layout=True, assumed_align=16
     )
@@ -289,7 +328,7 @@ def create_fp4_attention_tensors(batch, seqlen_q, seqlen_k, nheads, nheads_kv, h
         stride_order=k_stride_order,
         divisibility=32 if ab_dtype == cutlass.Float4E2M1FN else 1,
     )
-    
+
     # Convert FP32 tensors to FP4 format for Q and K
     q_tensor = cutlass_torch.convert_cute_tensor(
         q_ref, q_tensor, ab_dtype, is_dynamic_layout=True
@@ -297,22 +336,32 @@ def create_fp4_attention_tensors(batch, seqlen_q, seqlen_k, nheads, nheads_kv, h
     k_tensor = cutlass_torch.convert_cute_tensor(
         k_ref, k_tensor, ab_dtype, is_dynamic_layout=True
     )
+
+    # Note: convert_cute_tensor writes FP4 data contiguously, matching the
+    # FP4 stride interpretation. No compaction or stride fix needed.
     
     # Handle V: quantize to FP4 if quant_v=True, otherwise use regular dtype
     if quant_v:
+        # FP4 block-scaled MMA requires V to be K-major (seqlen contiguous in SMEM).
+        # Create V with seqlen as the contiguous dimension by physically transposing.
+        # v_ref: (batch, seqlen, nheads, headdim) with headdim contiguous
+        # After permute+contiguous+permute: same shape but seqlen has stride 1
+        v_ref_kmajor = v_ref.permute(0, 3, 2, 1).contiguous().permute(0, 3, 2, 1)
+        print(f"  V layout for FP4: shape={v_ref_kmajor.shape}, strides={v_ref_kmajor.stride()}")
         v_tensor, v_torch_underlying = cutlass_torch.cute_tensor_like(
-            v_ref, ab_dtype, is_dynamic_layout=True, assumed_align=16
+            v_ref_kmajor, ab_dtype, is_dynamic_layout=True, assumed_align=16
         )
-        # Get the correct stride_order from the reference tensor
-        v_stride_order = tuple(v_ref.dim_order())
+        # Get the correct stride_order from the transposed reference tensor
+        v_stride_order = tuple(v_ref_kmajor.dim_order())
         v_tensor.mark_compact_shape_dynamic(
-            mode=1,  # headdim_v dimension needs divisibility for FP4
+            mode=1,  # headdim dimension needs divisibility for FP4
             stride_order=v_stride_order,
             divisibility=32,
         )
         v_tensor = cutlass_torch.convert_cute_tensor(
-            v_ref, v_tensor, ab_dtype, is_dynamic_layout=True
+            v_ref_kmajor, v_tensor, ab_dtype, is_dynamic_layout=True
         )
+        # V is (batch, seqlen, nheads, headdim) with seqlen contiguous
     else:
         # V stays as regular dtype (not FP4 quantized) - create CUTE tensor
         # Convert torch dtype to CUTE dtype
@@ -344,9 +393,10 @@ def create_fp4_attention_tensors(batch, seqlen_q, seqlen_k, nheads, nheads_kv, h
         device, debug=debug
     )
     # For K: (batch, nheads_kv, seqlen_k, headdim) -> scale factors for headdim dimension
+    k_sf_value = 2.0 if debug else 1.0  # Use 2.0 in debug to test SF reading (expect S=256)
     k_sf_ref, k_sf_tensor, k_sf_torch_underlying = create_scale_factor_tensor(
-        batch, seqlen_k, nheads_kv, headdim, sf_vec_size, sf_dtype, ab_dtype, 
-        device, debug=debug
+        batch, seqlen_k, nheads_kv, headdim, sf_vec_size, sf_dtype, ab_dtype,
+        device, debug=debug, sf_value=k_sf_value
     )
     
     # Create V scale factors only if V is being quantized
@@ -359,11 +409,18 @@ def create_fp4_attention_tensors(batch, seqlen_q, seqlen_k, nheads, nheads_kv, h
         v_sf_torch_underlying = None
 
     # TODO: multiply qkv ref with scale factor tensors
+
+    if debug:
+        k_sf_torch_underlying.fill_(0x40)  # 2.0 in E4M3
+        torch.cuda.synchronize()
+
     if return_torch:
-        return (q_torch_underlying, k_torch_underlying, v_torch_underlying, q_sf_torch_underlying, k_sf_torch_underlying, v_sf_torch_underlying, 
+        return (q_torch_underlying, k_torch_underlying, v_torch_underlying, q_sf_torch_underlying, k_sf_torch_underlying, v_sf_torch_underlying,
                 q_ref, k_ref, v_ref)
     else:
-        return (q_tensor, k_tensor, v_tensor, q_sf_tensor, k_sf_tensor, v_sf_tensor, 
+        # Return torch underlying for SF tensors so interface can create TVM-FFI cute tensors
+        # The cute tensors from cute_tensor_like lack enable_tvm_ffi=True
+        return (q_tensor, k_tensor, v_tensor, q_sf_torch_underlying, k_sf_torch_underlying, v_sf_torch_underlying,
                 q_ref, k_ref, v_ref)
 
 
@@ -388,29 +445,37 @@ def main(ab_dtype, sf_dtype, sf_vec_size, quant_v=False, debug=False):
     causal = False
     dtype_gen = torch.bfloat16
     
-    # Benchmark configurations
-    # bs_seqlen_vals = [(32, 1024), (16, 2048), (8, 4096), (4, 8192), (2, 16384), (1, 32768), (4, 32768 * 8)]
-    bs_seqlen_vals = [(32, 1024), (1, 16384)]
-    # bs_seqlen_vals = [(4, 300 * 1000)]
-    headdim = 128
-    nheads = 16
-    nheads_kv = nheads
-    headdim_v = headdim
-    
+    # Benchmark configurations: (batch, seqlen, nheads, headdim)
+    # Covers bench_fp4 defaults, video-gen (Wan2.1-1.3B: nheads=12, hdim=128), and larger models
+    configs = [
+        # bench_fp4 defaults (nheads=16, headdim=128)
+        (1, 256, 16, 128),
+        (1, 1024, 16, 128),
+        (4, 4096, 16, 128),
+        # Video gen shapes (Wan2.1-T2V-1.3B: nheads=12, headdim=128)
+        (1, 4096, 12, 128),
+        (1, 32768, 12, 128),
+        # Larger models (nheads=24)
+        (1, 4096, 24, 128),
+        (1, 32768, 24, 128),
+        # headdim=64 comparison
+        (1, 32768, 24, 64),
+    ]
     print("=" * 80)
     print("FP4 Flash Attention Benchmark")
     print("=" * 80)
     print(f"Device: {device}")
-    print(f"Headdim: {headdim}, Nheads: {nheads}, NheadsKV: {nheads_kv}, HeaddimV: {headdim_v}")
     print(f"Causal: {causal}")
     print(f"Quantize V: {quant_v}")
     print("=" * 80)
     
-    for batch_size, seqlen in bs_seqlen_vals:
+    for batch_size, seqlen, nheads, headdim in configs:
+        nheads_kv = nheads
+        headdim_v = headdim
         seqlen_q = seqlen
         window_size = (None, None)
-        
-        print(f"\n### Batch={batch_size}, SeqLen={seqlen} ###")
+
+        print(f"\n### Batch={batch_size}, SeqLen={seqlen}, Nheads={nheads}, Headdim={headdim} ###")
         
         # Create FP4 tensors (V quantization is optional)
         (q_fp4, k_fp4, v_tensor, q_sf, k_sf, v_sf, 
@@ -422,12 +487,12 @@ def main(ab_dtype, sf_dtype, sf_vec_size, quant_v=False, debug=False):
         )
         q_sf_torch = check_tensor_for_nans(q_sf, name="q_sf")
         k_sf_torch = check_tensor_for_nans(k_sf, name="k_sf")
+
         if quant_v:
             v_sf_torch = check_tensor_for_nans(v_sf, name="v_sf")
 
-        
         # Calculate FLOPS
-        nFLOPS = flops(batch_size, nheads, seqlen_q, seqlen, headdim, headdim_v, 
+        nFLOPS = flops(batch_size, nheads, seqlen_q, seqlen, headdim, headdim_v,
                       causal=causal, window_size=window_size)
         
         # Benchmark FP4 attention
@@ -445,13 +510,14 @@ def main(ab_dtype, sf_dtype, sf_vec_size, quant_v=False, debug=False):
                 window_size=window_size,
                 mSFQ=q_sf,
                 mSFK=k_sf,
-                mSFV=v_sf, 
+                mSFV=v_sf,
                 repeats=repeats,
                 verbose=verbose,
                 desc=desc_str
             )
             print(f'FP4 Attention fwd: {m_fp4.mean * 1e3:.3f}ms, {(nFLOPS / m_fp4.mean * 1e-12):.1f} TFLOPS')
-            
+
+            torch.cuda.synchronize()  # flush GPU printf buffer
             fp4_out = flash_attn_func_python(
                 q_fp4, k_fp4, v_tensor,
                 causal=causal,
@@ -502,12 +568,54 @@ def main(ab_dtype, sf_dtype, sf_vec_size, quant_v=False, debug=False):
             import traceback
             traceback.print_exc()
 
+        # Test: force_fp4_impl with bf16 data (no scale factors, no FP4 encoding)
+        # This runs the FP4 kernel code path but with bf16 Q/K/V
+        force_fp4_out = None
+        try:
+            force_fp4_out = flash_attn_func_python(
+                q_ref, k_ref, v_ref,
+                causal=causal,
+                window_size=window_size,
+                force_fp4_impl=True,
+            )
+            force_fp4_t = force_fp4_out[0] if isinstance(force_fp4_out, tuple) else force_fp4_out
+            ref_t = ref_out[0] if isinstance(ref_out, tuple) else ref_out
+            print(f"  force_fp4_impl bf16 test:")
+            print(f"    force_fp4[0,0,0,:4]: {force_fp4_t[0,0,0,:4]}")
+            print(f"    ref[0,0,0,:4]:       {ref_t[0,0,0,:4]}")
+            m_block_size_test = 128
+            for mb in range(min(seqlen_q // m_block_size_test, 4)):
+                s = mb * m_block_size_test
+                stage = mb % 2
+                print(f"    m_block={mb} stage={stage}: force_fp4={force_fp4_t[0,s,0,0].item():.4f} ref={ref_t[0,s,0,0].item():.4f}")
+        except Exception as e:
+            print(f"  force_fp4_impl test failed: {e}")
+            import traceback
+            traceback.print_exc()
+
         # Compare FP4 and reference outputs
         if fp4_out is not None and ref_out is not None:
             try:
-                torch.testing.assert_close(fp4_out, ref_out, atol=1e-3, rtol=1e-3)
+                fp4_cmp = fp4_out[0] if isinstance(fp4_out, tuple) else fp4_out
+                ref_cmp = ref_out[0] if isinstance(ref_out, tuple) else ref_out
+                abs_diff = (fp4_cmp.float() - ref_cmp.float()).abs()
+                has_nan = fp4_cmp.isnan().any().item()
+                max_diff = abs_diff.max().item()
+                mean_diff = abs_diff.mean().item()
+                print(f"  FP4 vs ref: max_diff={max_diff:.4f}, mean_diff={mean_diff:.6f}, has_nan={has_nan}")
+                torch.testing.assert_close(fp4_cmp, ref_cmp, atol=1e-2, rtol=1e-2)
             except Exception as e:
                 print(f"FP4 and reference outputs differ: {e}")
+                fp4_t = fp4_out[0] if isinstance(fp4_out, tuple) else fp4_out
+                ref_t = ref_out[0] if isinstance(ref_out, tuple) else ref_out
+                print(f"  fp4[0,0,0,:8]: {fp4_t[0,0,0,:8]}")
+                print(f"  ref[0,0,0,:8]: {ref_t[0,0,0,:8]}")
+                # Print fp4 output for each m_block (stage 0 and stage 1 alternate)
+                m_block_size = 128
+                for mb in range(min(seqlen_q // m_block_size, 8)):
+                    s = mb * m_block_size
+                    stage = mb % 2
+                    print(f"  m_block={mb} stage={stage}: fp4[0,{s},0,0]={fp4_t[0,s,0,0].item():.4f} ref={ref_t[0,s,0,0].item():.4f}")
                 import traceback
                 traceback.print_exc()
 

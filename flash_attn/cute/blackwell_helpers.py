@@ -145,9 +145,6 @@ def gemm_ptx(
         smem_desc_b_lo = smem_desc_start_b_lo + (
             (cute.crd2idx((0, 0, k), sB_layout) * sB.element_type.width // 8) >> 4
         )
-        # with cute.arch.elect_one():
-        #     cute.printf("smem_desc_a_lo = {}, smem_desc_b_lo = {}", smem_desc_a_lo, smem_desc_b_lo)
-        #     cute.printf("smem_desc_a_lo_correct = {}, smem_desc_b_lo_correct = {}", smem_desc_a_lo_correct, smem_desc_b_lo_correct)
         with cute.arch.elect_one():
             if const_expr(not is_ts):
                 llvm.inline_asm(
@@ -373,6 +370,7 @@ def gemm_ptx_partial(
     # sA_offset: Int32 = 0,
     # acc_offset: Int32 = 0,
     tA_addr: Optional[Int32] = None,
+    pre_mbar_tiles: Optional[cutlass.Constexpr[int]] = None,
 ) -> None:
     # acc_tmem_addr += acc_offset
     is_ts = op.a_src == cute.nvgpu.tcgen05.OperandSource.TMEM
@@ -545,18 +543,18 @@ def gemm_ptx_partial(
                     1,
                     cute.size(tCrA.shape[2])
                     if const_expr(mbar_ptr is None)
-                    else cute.size(tCrA.shape[2]) // 4 * 3,
+                    else (pre_mbar_tiles if const_expr(pre_mbar_tiles is not None) else cute.size(tCrA.shape[2]) // 4 * 3),
                 )
             )
             + mbar_wait_str
             + (
                 "".join(
                     (
-                        f"add.u32 smem_desc_b_lo, smem_desc_b_lo, {hex(offset_b_diff[k - 1])};\n\t"
+                        f"add.u32 smem_desc_b_lo, smem_desc_b_lo_start, {hex(offset_b[k])};\n\t"
                         f"mov.b64 smem_desc_b, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
                         f"@leader_thread tcgen05.mma.cta_group::1.kind::f16 [tmem_acc], [tmem_a + {hex(offset_a[k])}], smem_desc_b, idesc, 1;\n\t"
                     )
-                    for k in range(cute.size(tCrA.shape[2]) // 4 * 3, cute.size(tCrA.shape[2]))
+                    for k in range(max(1, pre_mbar_tiles if const_expr(pre_mbar_tiles is not None) else cute.size(tCrA.shape[2]) // 4 * 3), cute.size(tCrA.shape[2]))
                 )
                 if const_expr(mbar_ptr is not None)
                 else ""
@@ -585,6 +583,7 @@ def gemm_ptx_partial_fp4(
     # sA_offset: Int32 = 0,
     # acc_offset: Int32 = 0,
     tA_addr: Optional[Int32] = None,
+    pre_mbar_tiles: Optional[cutlass.Constexpr[int]] = None,
 ) -> None:
     # acc_tmem_addr += acc_offset
     is_ts = op.a_src == cute.nvgpu.tcgen05.OperandSource.TMEM
@@ -623,7 +622,6 @@ def gemm_ptx_partial_fp4(
     smem_desc_base_b_lo, smem_desc_b_hi = i64_to_i32x2(smem_desc_base_b)
     smem_desc_base_b_lo = const_expr(smem_desc_base_b_lo)
     smem_desc_b_hi = const_expr(smem_desc_b_hi)
-
     tCrA_layout = (
         tCrA.layout
         if const_expr(not is_ts)
@@ -633,8 +631,13 @@ def gemm_ptx_partial_fp4(
     offset_a_diff = [offset_a[k] - offset_a[k - 1] for k in range(1, cute.size(tCrA.shape[2]))]
     offset_b = [cute.crd2idx((0, 0, k), tCrB.layout) for k in range(cute.size(tCrB.shape[2]))]
     offset_b_diff = [offset_b[k] - offset_b[k - 1] for k in range(1, cute.size(tCrB.shape[2]))]
-    offset_sfa = [cute.crd2idx((0, 0, k), tScaleA.layout) for k in range(cute.size(tCrA.shape[2]))]
-    offset_sfb = [cute.crd2idx((0, 0, k), tScaleB.layout) for k in range(cute.size(tCrB.shape[2]))]
+    # Recast scale factor layouts to 32-bit (u32 column units) since PTX [tmem_addr + offset]
+    # expects column offsets, not element offsets. Without recast, FP8 element offsets (e.g. 16)
+    # would be used as column offsets instead of the correct value (e.g. 4 = 16/4).
+    sfa_layout_u32 = cute.recast_layout(32, tScaleA.element_type.width, tScaleA.layout)
+    sfb_layout_u32 = cute.recast_layout(32, tScaleB.element_type.width, tScaleB.layout)
+    offset_sfa = [cute.crd2idx((0, 0, k), sfa_layout_u32) for k in range(cute.size(tCrA.shape[2]))]
+    offset_sfb = [cute.crd2idx((0, 0, k), sfb_layout_u32) for k in range(cute.size(tCrB.shape[2]))]
     if const_expr(not is_ts):
         smem_desc_start_a_lo = Int32(
             smem_desc_base_a_lo | sm100_desc.make_smem_desc_start_addr(sA[None, None, 0].iterator)
@@ -738,7 +741,7 @@ def gemm_ptx_partial_fp4(
             )
         else:
             mbar_wait_str = ""
-        
+
         llvm.inline_asm(
             None,
             input_args,
@@ -768,29 +771,26 @@ def gemm_ptx_partial_fp4(
             f"@leader_thread {mma_inst_str} [tmem_acc], [tmem_a], smem_desc_b, idesc, [tmem_scale_a], [tmem_scale_b], {pred_str};\n\t"
             + "".join(
                 (
-                    # f"add.u32 tmem_a, tmem_a, {hex(offset_a_diff[k - 1])};\n\t"
-                    # f"add.u32 smem_desc_b_lo, smem_desc_b_lo, {hex(offset_b_diff[k - 1])};\n\t"
                     f"add.u32 smem_desc_b_lo, smem_desc_b_lo_start, {hex(offset_b[k])};\n\t"
                     f"mov.b64 smem_desc_b, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
-                    # f"@leader_thread tcgen05.mma.cta_group::1.kind::f16 [tmem_acc], [tmem_a], smem_desc_b, idesc, 1;\n\t"
                     f"@leader_thread {mma_inst_str} [tmem_acc], [tmem_a + {hex(offset_a[k])}], smem_desc_b, idesc, [tmem_scale_a + {hex(offset_sfa[k])}], [tmem_scale_b + {hex(offset_sfb[k])}], 1;\n\t"
                 )
                 for k in range(
                     1,
                     cute.size(tCrA.shape[2])
                     if const_expr(mbar_ptr is None)
-                    else cute.size(tCrA.shape[2]) // 4 * 3,
+                    else (pre_mbar_tiles if const_expr(pre_mbar_tiles is not None) else cute.size(tCrA.shape[2]) // 4 * 3),
                 )
             )
             + mbar_wait_str
             + (
                 "".join(
                     (
-                        f"add.u32 smem_desc_b_lo, smem_desc_b_lo, {hex(offset_b_diff[k - 1])};\n\t"
+                        f"add.u32 smem_desc_b_lo, smem_desc_b_lo_start, {hex(offset_b[k])};\n\t"
                         f"mov.b64 smem_desc_b, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
                         f"@leader_thread {mma_inst_str} [tmem_acc], [tmem_a + {hex(offset_a[k])}], smem_desc_b, idesc, [tmem_scale_a + {hex(offset_sfa[k])}], [tmem_scale_b + {hex(offset_sfb[k])}], 1;\n\t"
                     )
-                    for k in range(cute.size(tCrA.shape[2]) // 4 * 3, cute.size(tCrA.shape[2]))
+                    for k in range(max(1, pre_mbar_tiles if const_expr(pre_mbar_tiles is not None) else cute.size(tCrA.shape[2]) // 4 * 3), cute.size(tCrA.shape[2]))
                 )
                 if const_expr(mbar_ptr is not None)
                 else ""

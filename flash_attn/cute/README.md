@@ -1,6 +1,6 @@
-# Flash Attention CUTE
-
-Flash Attention CuTe-DSL implementation.
+## NOTE
+This branch is for debugging the performance of FP4.
+See [debug notes](fp4_flash_attention_optimization_notes.md) for more details.
 
 ## Installation
 
@@ -29,10 +29,7 @@ This script patches the editable finder to take precedence over the regular pack
 ```bash
 python -c "import flash_attn.cute.interface; print(flash_attn.cute.interface.__file__)"
 ```
-
 This should show your local path (e.g., `/sgl-workspace/cutlass/examples/python/CuTeDSL/blackwell/flash-attention/flash_attn/cute/interface.py`), not the installed package path.
-
-**Note:** The `__init__.py` also includes code to move the editable finder to the front of `sys.meta_path` as a backup, but running the fix script is recommended for a permanent solution.
 
 ## Benchmarking FP4 attn
 
@@ -40,6 +37,13 @@ This should show your local path (e.g., `/sgl-workspace/cutlass/examples/python/
 cd examples/python/CuTeDSL/blackwell/flash-attention/flash_attn/cute
 CUTE_DSL_ENABLE_TVM_FFI=1 python benchmarks/bench_fp4.py
 ```
+
+## Debugging 
+This uses cuda coredump and nvdisasm to locate the error ptx segment
+```
+./benchmarks/analyze_coredump.sh --run benchmarks/bench_fp4.py --quant_v --output my_analysis.txt
+```
+
 ## Current pipeline graph
 ![pipeline graph](figures/pipeline.png)
 
