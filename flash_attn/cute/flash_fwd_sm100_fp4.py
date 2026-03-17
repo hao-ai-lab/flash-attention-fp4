@@ -407,10 +407,9 @@ class SoftmaxSm100(Softmax):
         self,
         acc_S_row: cute.Tensor,
         acc_S_row_converted: Optional[cute.Tensor] = None,
-        e2e: cutlass.Constexpr[bool] = False,
-        e2e_freq: cutlass.Constexpr[int] = 16,
-        e2e_res: cutlass.Constexpr[int] = 4,
-        e2e_frg_limit: cutlass.Constexpr[int] = 1,
+        ex2_emu_freq: cutlass.Constexpr[int] = 0,
+        ex2_emu_res: cutlass.Constexpr[int] = 4,
+        ex2_emu_start_frg: cutlass.Constexpr[int] = 0,
     ):
         assert cute.size(acc_S_row.shape) % 2 == 0, "acc_S_row must have an even number of elements"
         frg_tile = min(32, cute.size(acc_S_row))
@@ -420,19 +419,18 @@ class SoftmaxSm100(Softmax):
         acc_S_row_frg = cute.logical_divide(acc_S_row, cute.make_layout(frg_tile))
         for j in cutlass.range_constexpr(frg_cnt):
             for k in cutlass.range_constexpr(0, cute.size(acc_S_row_frg, mode=[0]), 2):
-                # acc_S_row_frg[k, j] = utils.exp2f(acc_S_row_frg[k, j])
-                # acc_S_row_frg[k + 1, j] = utils.exp2f(acc_S_row_frg[k + 1, j])
-                if cutlass.const_expr(not e2e):
+                if cutlass.const_expr(ex2_emu_freq == 0):
                     acc_S_row_frg[k, j] = cute.arch.exp2(acc_S_row_frg[k, j])
                     acc_S_row_frg[k + 1, j] = cute.arch.exp2(acc_S_row_frg[k + 1, j])
                 else:
                     if cutlass.const_expr(
-                        k % e2e_freq < e2e_freq - e2e_res or j >= frg_cnt - e2e_frg_limit
+                        k % ex2_emu_freq < ex2_emu_freq - ex2_emu_res
+                        or j >= frg_cnt - 1
+                        or j < ex2_emu_start_frg
                     ):
                         acc_S_row_frg[k, j] = cute.arch.exp2(acc_S_row_frg[k, j])
                         acc_S_row_frg[k + 1, j] = cute.arch.exp2(acc_S_row_frg[k + 1, j])
                     else:
-                        # acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = utils.e2e_asm2(acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j])
                         acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = utils.ex2_emulation_2(
                             acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j]
                         )
@@ -834,12 +832,16 @@ class FlashAttentionForwardSm100:
             raise TypeError(f"Type mismatch: {self.q_dtype} != {self.v_dtype} (V quantization requires matching dtype)")
         self._setup_attributes()
         self.use_tma_O = self.arch >= 90 and mCuSeqlensQ is None and mSeqUsedQ is None
-        # This can be tuned
-        self.e2e_freq = 16
+        # Exp2 emulation tuning: replace some hardware exp2 with emulated exp2
+        # to free up SFU units for other work (throughput vs precision tradeoff)
+        self.ex2_emu_start_frg = 0
+        self.ex2_emu_freq = 16
         if const_expr(
             self.head_dim_padded > 64 and not self.is_causal and not self.is_local and self.pack_gqa
         ):
-            self.e2e_freq = 32 if mCuSeqlensQ is not None or mSeqUsedQ is not None else 10
+            self.ex2_emu_freq = 32 if mCuSeqlensQ is not None or mSeqUsedQ is not None else 10
+        if const_expr(self.head_dim_padded > 64 and self.is_causal):
+            self.ex2_emu_freq = 10
 
         use_2cta_instrs = self.mma_tiler_qk[0] == 256
         assert use_2cta_instrs == False, "Two-CTA instructions not supported yet"
@@ -3131,8 +3133,8 @@ class FlashAttentionForwardSm100:
             # Exp2 with softmax scale and sp1 scaling
             softmax.apply_exp2_convert(
                 tSrS_t2r,
-                e2e=mask_fn is None and self.head_dim_padded <= 128,
-                e2e_freq=self.e2e_freq,
+                ex2_emu_freq=self.ex2_emu_freq if mask_fn is None else 0,
+                ex2_emu_start_frg=self.ex2_emu_start_frg,
             )
             # update_row_sum BEFORE scale_groupwise so it uses original P values
             softmax.update_row_sum(tSrS_t2r.load(), acc_scale, is_first)
@@ -3141,6 +3143,8 @@ class FlashAttentionForwardSm100:
             softmax.scale_groupwise(tSrS_t2r, tSrPSF_f32, sf_size=self.sf_vec_size)
             self._quant_fp4(tSrS_t2r, tSrPSF_f32, tSrP_r2t, tSrPSF)
             # R2S: Copy tSrPSF (registers) to sSFP (shared memory)
+            # 128 threads × 8 E4M3 bytes = 1024 bytes. Each thread writes 2×4B (STS.32).
+            # Layout: thread t → base = t*4, two groups of 4 bytes at offset 0 and 512.
             if const_expr(sSFP is not None):
                 thread_idx = thr_tmem_load.thr_idx
                 base_offset = thread_idx << 2
@@ -3154,14 +3158,15 @@ class FlashAttentionForwardSm100:
             softmax.apply_exp2_convert(
                 tSrS_t2r,
                 tSrP_r2t,
-                e2e=mask_fn is None and self.head_dim_padded <= 128,
-                e2e_freq=self.e2e_freq,
+                ex2_emu_freq=self.ex2_emu_freq if mask_fn is None else 0,
+                ex2_emu_start_frg=self.ex2_emu_start_frg,
             )
         # Sequence barrier arrive
         if const_expr(self.s0_s1_barrier):
             cute.arch.mbarrier_arrive(mbar_ptr + mbar_s0_s1_sequence_offset + (1 - stage) * 4)
         for i in cutlass.range_constexpr(self.mbar_p_split(cute.size(tStP_r2t.shape[2]))):
             cute.copy(thr_tmem_store, tSrP_r2t_f32[None, None, i], tStP_r2t[None, None, i])
+
         cute.arch.fence_view_async_tmem_store()
         # Notify mma warp that P is ready (and SFP is in SMEM)
         cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_O_rescaled_offset + stage)
