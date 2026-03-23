@@ -1,12 +1,27 @@
-## NOTE
-This branch is for debugging the performance of FP4.
-See [debug notes](fp4_flash_attention_optimization_notes.md) for more details.
+# FP4 Flash Attention 4 (FA4) on Blackwell
+
+CuTe DSL implementation of FP4 block-scaled flash attention for NVIDIA Blackwell GPUs (sm100a/sm103a). Quantizes Q and K to FP4 E2M1 with per-block E4M3 scale factors, while V remains in BF16.
+
+## Results
+
+FP4 FA4 vs BF16 FA4 kernel speedup (CUPTI `bench_gpu_time`, vacant B200 GPU):
+
+| Config | FP4 (ms) | FP4 TFLOPS | BF16 (ms) | BF16 TFLOPS | Speedup |
+|--------|----------|------------|-----------|-------------|---------|
+| b=1 s=256 h=16 d=128 | 0.014 | 37 | 0.015 | 35 | 1.07x |
+| b=1 s=1024 h=16 d=128 | 0.024 | 365 | 0.026 | 336 | 1.09x |
+| b=4 s=4096 h=16 d=128 | 0.336 | 1637 | 0.390 | 1409 | 1.16x |
+| b=1 s=4096 h=12 d=128 | 0.104 | 987 | 0.118 | 871 | 1.13x |
+| **b=1 s=32768 h=12 d=128** | **3.881** | **1700** | **4.834** | **1365** | **1.25x** |
+| b=1 s=4096 h=24 d=128 | 0.152 | 1360 | 0.173 | 1194 | 1.14x |
+| b=1 s=32768 h=24 d=128 | 7.578 | 1741 | 10.102 | 1306 | 1.33x |
+| b=1 s=32768 h=24 d=64 | 7.186 | 918 | 7.276 | 907 | 1.01x |
+
+Per-call precision: cosine similarity = 0.99, SNR = 7.25 (FP4 QK quantization vs BF16 reference).
 
 ## Installation
 
 ### Editable Install
-
-To install this package in editable mode for development:
 
 ```bash
 pip install -e .
@@ -14,7 +29,7 @@ pip install -e .
 
 ### Fixing Editable Install Import Issues
 
-If you have a non-editable `flash-attn` package installed, Python may import from the installed package instead of your local editable installation. This happens because the editable finder is checked after the regular package in Python's import system.
+If you have a non-editable `flash-attn` package installed, Python may import from the installed package instead of your local editable installation.
 
 **Solution:** Run the fix script once after installation:
 
@@ -22,44 +37,24 @@ If you have a non-editable `flash-attn` package installed, Python may import fro
 python fix_editable_import.py
 ```
 
-This script patches the editable finder to take precedence over the regular package. You only need to run it **once** after `pip install -e .` - the fix is permanent until you reinstall.
-
 **Verify it's working:**
 
 ```bash
 python -c "import flash_attn.cute.interface; print(flash_attn.cute.interface.__file__)"
 ```
-This should show your local path (e.g., `/sgl-workspace/cutlass/examples/python/CuTeDSL/blackwell/flash-attention/flash_attn/cute/interface.py`), not the installed package path.
 
-## Benchmarking FP4 attn
+## Benchmarking
 
 ```bash
 cd examples/python/CuTeDSL/blackwell/flash-attention/flash_attn/cute
-CUTE_DSL_ENABLE_TVM_FFI=1 python benchmarks/bench_fp4.py
+CUTE_DSL_ENABLE_TVM_FFI=1 python benchmarks/bench_fp4.py          # QK quantized
+CUTE_DSL_ENABLE_TVM_FFI=1 python benchmarks/bench_fp4.py --quant_v # QKV quantized
+CUTE_DSL_ENABLE_TVM_FFI=1 python benchmarks/bench_fp4.py --debug   # correctness test
 ```
 
-## Debugging 
-This uses cuda coredump and nvdisasm to locate the error ptx segment
-```
-./benchmarks/analyze_coredump.sh --run benchmarks/bench_fp4.py --quant_v --output my_analysis.txt
-```
+## Integration with FastVideo
 
-## Current pipeline graph
+See [debug/fastvideo_integrate.md](debug/fastvideo_integrate.md) for integration with [FastVideo](https://github.com/hao-ai-lab/FastVideo) video diffusion framework, including `nvfp4_quantize` scale factor layout conversion and end-to-end video generation results.
+
+## Pipeline Graph
 ![pipeline graph](figures/pipeline.png)
-
-## Changes to merge from FA4 main branch
-
-### Commits after 43375aa (Nov 19, 2025)
-Some are only partially merged (like q_stage=1)
-- [ ] `052015a` - add fastdivmod for oob reads in mask_mods (#2020) - Nov 21, 2025
-- [ ] `d063b33` - don't pass mask_fn to softmax_step generically (#2026) - Nov 22, 2025
-- [ ] `92ca9da` - [Cute,Fwd] enable mask mod without blocksparsity (#2031) - Nov 25, 2025
-- [ ] `672381f` - Bump pin (#2025) - Nov 25, 2025
-- [ ] `fd8d5eb` - [Cute,Fwd] Extend score_mod to variable sequence length (#2043) - Dec 15, 2025
-- [ ] `bba578d` - Fix IMA in fwd on m boundary (#2091) - Dec 20, 2025
-- [ ] `58fe37f` - fix shuffle sync for pack gqa epilogue (#2097) - Dec 24, 2025
-- [ ] `9b6dbac` - Add pack-gqa support for blcoksparse impl w/ braodcasted H dim (#2098) - Jan 4, 2026
-- [ ] `f98d345` - [Cute,Fwd] improved block sparsity (#2100) - Jan 5, 2026
-- [ ] `3c8ca4e` - [Cute,Fwd,Sm100] Support `q_stage=1` for inference (#1993) - Jan 8, 2026
-- [ ] `68649fb` - [Cute][Flex]Add pack-gqa divmod (#2180) - Jan 15, 2026
-- [ ] `fffabc3` - [Cute,Fwd,Sm100] distributed offset calculation for paged KV (#2104) - Jan 15, 2026

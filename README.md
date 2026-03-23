@@ -1,4 +1,9 @@
-# FlashAttention
+# FlashAttention (FP4 Fork)
+
+> **This is a fork of [flash-attention](https://github.com/Dao-AILab/flash-attention) with the addition of a CuTe DSL FP4 implementation of Flash Attention 4 on B200.** The FP4 kernel quantizes Q and K to FP4 E2M1 with block-scaled MMA, achieving up to **1.33x speedup** over BF16 FA4 on Blackwell GPUs. See **[flash_attn/cute/README.md](flash_attn/cute/README.md)** for results and usage.
+
+---
+
 This repository provides the official implementation of FlashAttention and
 FlashAttention-2 from the
 following papers.
