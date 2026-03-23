@@ -16,7 +16,14 @@
 
 - **Attention precision**: cos=0.99, SNR=7.25 per-call
 - **Video quality**: Step 49 latent cos=0.96 vs BF16 after 50 denoising steps. Visually recognizable but accumulated FP4 error visible.
-- **E2E timing** (both using FA4 backend, vacant GPUs): NVFP4=53.7s vs BF16=57.3s (**1.07x**).
+- **DIT profiling** (nsys, Wan2.1-T2V-1.3B, 480x832x81 video):
+  - Attention (`flash_fwd_kernel`) = **70.1%** of total GPU time (1993ms / 2843ms)
+  - Linear layers (nvjet GEMM) = 6.5%, elementwise = 14.5%, layernorm = 2.3%
+  - Expected e2e speedup from 1.25x attention: 2843 / (1993/1.25 + 850) = **1.16x**
+- **E2E timing** (both using FA4 backend, vacant GPUs):
+  - Per-step: NVFP4=0.833s (1.20 it/s) vs BF16=0.877s (1.14 it/s) = **1.05x**
+  - Total: NVFP4=51.9s vs BF16=51.2s (similar — FSDP overhead difference)
+  - Gap vs expected 1.16x due to nvfp4_quantize + SF layout conversion overhead per call
 
 ## Setup
 ```bash
