@@ -17,7 +17,8 @@ from cutlass.cute.runtime import from_dlpack
 from flash_attn.cute.interface import flash_attn_func as flash_attn_func_python
 from flash_attn.cute.interface import flash_attn_varlen_func as flash_attn_varlen_func_python
 
-from triton.testing import do_bench
+import numpy as np
+from flashinfer.testing.utils import bench_gpu_time
 
 Timing = NamedTuple('timing', [('mean', float)])
 
@@ -425,8 +426,15 @@ def create_fp4_attention_tensors(batch, seqlen_q, seqlen_k, nheads, nheads_kv, h
 
 
 def time_fwd(func, *args, repeats=30, verbose=True, desc="", **kwargs):
-    """Time forward pass execution."""
-    return Timing(do_bench(lambda: func(*args, **kwargs), warmup=5, rep=repeats) * 1e-3)
+    """Time forward pass execution using CUPTI-based GPU timing."""
+    times = bench_gpu_time(
+        fn=lambda: func(*args, **kwargs),
+        dry_run_iters=5,
+        repeat_iters=repeats,
+        enable_cupti=True,
+        use_cuda_graph=False,
+    )
+    return Timing(np.median(times) * 1e-3)  # bench_gpu_time returns ms, Timing expects seconds
 
 
 def main(ab_dtype, sf_dtype, sf_vec_size, quant_v=False, debug=False):
