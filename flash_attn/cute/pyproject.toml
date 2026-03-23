@@ -28,6 +28,7 @@ dependencies = [
     "typing_extensions",
     "apache-tvm-ffi==0.1.6",
     "torch-c-dlpack-ext",
+    "flashinfer-python",
 ]
 
 [project.optional-dependencies]

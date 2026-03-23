@@ -1,18 +1,29 @@
 # FastVideo FP4 Flash Attention Integration
 
 ## Result
-- **Attention kernel speedup** (FP4 FA4 vs BF16 FA4, vacant GPU, CUDA events):
-  - seq=256 nheads=16: 1.00x (too small to benefit)
-  - seq=1024 nheads=16: 1.09x
-  - seq=4096 nheads=16: 1.16x (batch=4)
-  - seq=4096 nheads=12: 1.13x
-  - seq=32768 nheads=12: 1.06-1.09x (video-gen shape)
-  - seq=32768 nheads=24 hdim=128: 1.30x
-  - seq=32768 nheads=24 hdim=64: 1.02x (FP4 benefit is headdim-dependent)
-  - seq=4096 nheads=24 hdim=128: 1.13x
+- **Attention kernel speedup** (FP4 FA4 vs BF16 FA4, vacant GPU, CUPTI bench_gpu_time):
+
+  | Config | FP4 (ms) | FP4 TFLOPS | BF16 (ms) | BF16 TFLOPS | Speedup |
+  |--------|----------|------------|-----------|-------------|---------|
+  | b=1 s=256 h=16 d=128 | 0.014 | 37 | 0.015 | 35 | 1.07x |
+  | b=1 s=1024 h=16 d=128 | 0.024 | 365 | 0.026 | 336 | 1.09x |
+  | b=4 s=4096 h=16 d=128 | 0.336 | 1637 | 0.390 | 1409 | 1.16x |
+  | b=1 s=4096 h=12 d=128 | 0.104 | 987 | 0.118 | 871 | 1.13x |
+  | **b=1 s=32768 h=12 d=128** | **3.881** | **1700** | **4.834** | **1365** | **1.25x** |
+  | b=1 s=4096 h=24 d=128 | 0.152 | 1360 | 0.173 | 1194 | 1.14x |
+  | b=1 s=32768 h=24 d=128 | 7.578 | 1741 | 10.102 | 1306 | 1.33x |
+  | b=1 s=32768 h=24 d=64 | 7.186 | 918 | 7.276 | 907 | 1.01x |
+
 - **Attention precision**: cos=0.99, SNR=7.25 per-call
 - **Video quality**: Step 49 latent cos=0.96 vs BF16 after 50 denoising steps. Visually recognizable but accumulated FP4 error visible.
-- **E2E timing** (both using FA4 backend, vacant GPUs): NVFP4=53.7s vs BF16=57.3s (**1.07x**). Fair kernel-only speedup is 1.06-1.22x depending on shape.
+- **DIT profiling** (nsys, Wan2.1-T2V-1.3B, 480x832x81 video):
+  - Attention (`flash_fwd_kernel`) = **70.1%** of total GPU time (1993ms / 2843ms)
+  - Linear layers (nvjet GEMM) = 6.5%, elementwise = 14.5%, layernorm = 2.3%
+  - Expected e2e speedup from 1.25x attention: 2843 / (1993/1.25 + 850) = **1.16x**
+- **E2E timing** (both using FA4 backend, vacant GPUs):
+  - Per-step: NVFP4=0.833s (1.20 it/s) vs BF16=0.877s (1.14 it/s) = **1.05x**
+  - Total: NVFP4=51.9s vs BF16=51.2s (similar — FSDP overhead difference)
+  - Gap vs expected 1.16x due to nvfp4_quantize + SF layout conversion overhead per call
 
 ## Setup
 ```bash

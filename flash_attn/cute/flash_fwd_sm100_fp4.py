@@ -321,7 +321,7 @@ class SoftmaxSm100(Softmax):
         """
         acc_S_row_frag = cute.logical_divide(acc_S_row, cute.make_layout(sf_size))
         for g in cutlass.range_constexpr(cute.size(group_max)):
-            inv_gmax = Float32(1.0) / group_max[g]
+            inv_gmax = Float32(1.0) / cute.arch.fmax(group_max[g], 1e-20)
             for j in cutlass.range(0, sf_size, 2, unroll_full=True):
                 acc_S_row_frag[j, g], acc_S_row_frag[j + 1, g] = mul_packed_f32x2(
                     (acc_S_row_frag[j, g], acc_S_row_frag[j + 1, g]),
