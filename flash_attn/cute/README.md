@@ -73,7 +73,7 @@ CUTE_DSL_ENABLE_TVM_FFI=1 python benchmarks/bench_fp4.py --quant_v # QKV quantiz
 CUTE_DSL_ENABLE_TVM_FFI=1 python benchmarks/bench_fp4.py --debug   # correctness test
 ```
 
-## Pipeline Graph
+## Pipeline Graph (scale factor TMEM overlap schedule)
 ![pipeline graph](figures/pipeline.png)
 
 ## Citation
