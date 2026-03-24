@@ -75,3 +75,17 @@ CUTE_DSL_ENABLE_TVM_FFI=1 python benchmarks/bench_fp4.py --debug   # correctness
 
 ## Pipeline Graph
 ![pipeline graph](figures/pipeline.png)
+
+## Citation
+If you find our FP4 kernel useful, please cite:
+```
+@misc{zhang2026attnqat4bitattentionquantizationaware,
+      title={Attn-QAT: 4-Bit Attention With Quantization-Aware Training}, 
+      author={Peiyuan Zhang and Matthew Noto and Wenxuan Tan and Chengquan Jiang and Will Lin and Wei Zhou and Hao Zhang},
+      year={2026},
+      eprint={2603.00040},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2603.00040}, 
+}
+```
