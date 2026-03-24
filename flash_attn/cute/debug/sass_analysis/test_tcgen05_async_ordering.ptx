@@ -1,0 +1,49 @@
+.version 8.8
+.target sm_100a
+.address_size 64
+
+// Minimal reproducer to determine SASS encoding of:
+// 1. tcgen05.cp (async SMEM->TMEM copy)
+// 2. tcgen05.fence::after_thread_sync (ordering directive)
+// 3. mbarrier.try_wait (cross-warp sync)
+// 4. tcgen05.commit (bind async ops to mbarrier)
+// 5. mbarrier.arrive.release (immediate arrive)
+//
+// Compile: ptxas -arch=sm_100a -o tcgen05_fence_commit.cubin tcgen05_fence_commit.ptx
+// Disasm:  nvdisasm -c tcgen05_fence_commit.cubin
+
+.visible .entry test_fence(
+    .param .u64 smem_mbar_addr
+)
+{
+    .reg .u64 %rd1, %rd_desc;
+    .reg .u32 %r_mbar, %r_tmem;
+    .reg .pred %p0;
+
+    ld.param.u64 %rd1, [smem_mbar_addr];
+    cvta.shared.u64 %rd1, %rd1;
+    cvt.u32.u64 %r_mbar, %rd1;
+
+    mov.u64 %rd_desc, 0;
+    mov.u32 %r_tmem, 0;
+
+    // 1. async tcgen05.cp
+    tcgen05.cp.cta_group::1.32x128b.warpx4 [%r_tmem], %rd_desc;
+
+    // 2. tcgen05.fence::after_thread_sync
+    tcgen05.fence::after_thread_sync;
+
+    // 3. mbarrier wait (cross-warp sync)
+    mbarrier.try_wait.parity.shared::cta.b64 %p0, [%r_mbar], 0;
+
+    // 4. another cp after fence+wait
+    tcgen05.cp.cta_group::1.32x128b.warpx4 [%r_tmem], %rd_desc;
+
+    // 5. tcgen05.commit
+    tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%r_mbar];
+
+    // 6. regular mbarrier arrive for comparison
+    mbarrier.arrive.release.cta.shared::cta.b64 _, [%r_mbar], 1;
+
+    ret;
+}
