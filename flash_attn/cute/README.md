@@ -40,8 +40,6 @@ Additionally quantizes softmax output P and V to FP4. The PV GEMM uses block-sca
 
 ² Small shapes are faster due to reduced memory traffic, but the slowdown at large shapes reflects the softmax bottleneck.
 
-Precision (debug mode, constant data within FP4 range): max_diff = 0.0 (exact match). Random data: max_diff = 0.9–2.9, mean_diff = 0.01–0.09 (expected for FP4 E2M1 with SF=1.0).
-
 ## Installation
 
 ### Editable Install
