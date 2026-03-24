@@ -425,7 +425,7 @@ def create_fp4_attention_tensors(batch, seqlen_q, seqlen_k, nheads, nheads_kv, h
                 q_ref, k_ref, v_ref)
 
 
-def time_fwd(func, *args, repeats=30, verbose=True, desc="", **kwargs):
+def time_fwd(func, *args, repeats=40, verbose=True, desc="", **kwargs):
     """Time forward pass execution using CUPTI-based GPU timing."""
     times = bench_gpu_time(
         fn=lambda: func(*args, **kwargs),
