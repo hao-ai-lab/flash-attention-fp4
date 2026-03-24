@@ -1,6 +1,6 @@
 # FlashAttention (FP4 Fork)
 
-> ## <img src="https://em-content.zobj.net/source/apple/391/star-struck_1f929.png" width="32"> FP4 Flash Attention 4 on B200
+ ## <img src="https://em-content.zobj.net/source/apple/391/star-struck_1f929.png" width="32"> FP4 Flash Attention 4 on B200
 > **This is a fork of [flash-attention](https://github.com/Dao-AILab/flash-attention) with the addition of a CuTe DSL FP4 implementation of Flash Attention 4 on B200.** The FP4 kernel implements NVFP4 block-scaled MMA for Q, K, V, and on-the-fly softmax score (P) quantization, achieving up to **1.33x speedup** over BF16 FA4 on B200. See **[flash_attn/cute/README.md](flash_attn/cute/README.md)** for results and usage.
 
 ---
