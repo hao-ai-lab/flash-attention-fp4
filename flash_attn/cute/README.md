@@ -2,7 +2,8 @@
 
 CuTe DSL implementation of FP4 block-scaled flash attention for NVIDIA Blackwell GPUs (sm100a/sm103a). Supports two modes:
 - **QK quantization** (`--quant_qk`, default): Q and K quantized to NVFP4 E2M1 with per-block E4M3 scale factors, V remains BF16. **1.09–1.33x speedup** over BF16 FA4.
-- **QKV quantization** (`--quant_v`): additionally quantizes the softmax output P and V to FP4 with on-the-fly P quantization via `scale_groupwise`. Currently **slower than BF16** (0.84–0.95x) because the softmax warp is the bottleneck and the added P quantization + scale factor R2S copy increases critical-path latency.
+- **QKVP quantization** (`--quant_v`): additionally quantizes the softmax output P and V to NVFP4 with on-the-fly group-wise P quantization. Currently **slower than BF16** (0.84–0.95x) due to hardware limitations: the softmax exp (MUFU instruction) has the same throughput as on H100, but B200 MMA throughput doubles, making softmax warp the bottleneck (See [FA4 paper](https://arxiv.org/abs/2603.05451)). The added P quantization + scale factor R->SMEM->TMEM copy increases critical-path latency.
+We speculate that on B300 and Rubin (w/ FP16 softmax) the QKVP quantization will be faster than BF16.
 
 ## Results — QK Quantization
 
