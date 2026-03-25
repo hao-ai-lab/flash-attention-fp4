@@ -685,10 +685,51 @@ class FlashAttentionForwardSm100:
         - Sets up staging parameters for Q, K, V inputs and accumulator data
         - Configures pipeline stages for softmax, correction, and epilogue operations
         """
-        # do not increase if only testing quant qk
-        self.kv_stage = 10 if self.q_dtype.width < 8 and self.v_dtype.width < 8 else 3 
         self.acc_stage = 1
         self.epi_stage = 2
+        # Compute kv_stage from SMEM budget.
+        # Blackwell: 228KB per SM, 227KB optin per block.
+        # K and V alias when same dtype or when K is smaller (FP4 K in BF16 V).
+        smem_budget = 227 * 1024
+        align = self.buffer_align_bytes  # 128B struct field alignment
+        def align_up(x, a): return (x + a - 1) // a * a
+        # Fixed fields (not scaled by kv_stage): mbar, tmem_holding_buf, sScale, sO, sQ, SFQ, SFP
+        # mbar_total depends on kv_stage but is small (~40 barriers * 8B = 320B); use upper bound
+        smem_mbar = 512  # generous upper bound for mbarrier storage
+        smem_tmem = 4  # Int32
+        smem_sScale = align_up(self.q_stage * self.m_block_size * 2 * 4, align)  # Float32
+        smem_q_per_stage = self.m_block_size * self.head_dim_padded * self.q_dtype.width // 8
+        smem_o_per_stage = self.m_block_size * self.head_dim_v_padded * self.o_dtype.width // 8
+        smem_sO = align_up(smem_o_per_stage * self.epi_stage, align) if not self.overlap_sO_sQ else 0
+        smem_sQ = align_up(smem_q_per_stage * self.q_stage, align)
+        # SFQ/SFP are per q_stage, SF layout cosize: m_block * head_dim / sf_vec_size
+        sfq_per_stage = self.m_block_size * self.head_dim_padded // self.sf_vec_size
+        sfp_per_stage = self.m_block_size * self.head_dim_v_padded // self.sf_vec_size
+        smem_sSFQ = align_up(sfq_per_stage * self.q_stage, align) if self.quant_qk else 0
+        smem_sSFP = align_up(sfp_per_stage * self.q_stage, align) if self.quant_pv else 0
+        smem_fixed = smem_mbar + smem_tmem + smem_sScale + smem_sO + smem_sQ + smem_sSFQ + smem_sSFP
+        # Per-kv_stage fields: sK (or aliased), sV, SFK, SFV
+        smem_k_per_stage = self.m_block_size * self.head_dim_padded * self.k_dtype.width // 8
+        smem_v_per_stage = self.m_block_size * self.head_dim_v_padded * self.v_dtype.width // 8
+        if self.v_dtype == self.k_dtype or self.k_dtype.width < self.v_dtype.width:
+            smem_kv_per_stage = max(smem_k_per_stage, smem_v_per_stage)
+        else:
+            smem_kv_per_stage = smem_k_per_stage + smem_v_per_stage
+        # SF layout cosize per stage: n_block * head_dim / sf_vec_size (MMA-tiled)
+        sfk_per_stage = self.n_block_size * self.head_dim_padded // self.sf_vec_size
+        sfv_per_stage = self.n_block_size * self.head_dim_v_padded // self.sf_vec_size
+        if self.quant_qk:
+            smem_kv_per_stage += sfk_per_stage
+        if self.quant_pv:
+            smem_kv_per_stage += sfv_per_stage
+        # Add per-stage padding for swizzle/layout cosize inflation (~128B per staged field)
+        num_kv_staged_fields = 2  # sK + sV (or 1 if aliased, but sV still has cosize overhead)
+        if self.quant_qk:
+            num_kv_staged_fields += 1  # sSFK
+        if self.quant_pv:
+            num_kv_staged_fields += 1  # sSFV
+        smem_kv_per_stage += num_kv_staged_fields * 128
+        self.kv_stage = (smem_budget - smem_fixed) // smem_kv_per_stage
         # For hdim 192,128, we don't have enough smem to store all 3 stages of KV:
         # 128 x 192 x 2 bytes x 3 stages = 144KB, and we need 96KB for Q.
         # Instead we store smem as [smem_large, smem_small, smem_large], where smem_large is
@@ -995,6 +1036,7 @@ class FlashAttentionForwardSm100:
                     stride=(*sV_layout.outer.stride[:-1], stage_stride),
                 ),
             )
+
 
         if const_expr(self.pack_gqa):
             shape_Q_packed = (
@@ -1338,15 +1380,15 @@ class FlashAttentionForwardSm100:
                 cute.struct.MemRange[self.q_dtype, sQ_size],
                 self.buffer_align_bytes,
             ]
+            # K reuses V's buffer when K is smaller (FP4 K in BF16 V), or same dtype
+            k_aliases_v = self.k_dtype.width < self.v_dtype.width
             sK: cute.struct.Align[
-                # cute.cosize(sK_layout) is correct even in the case of self.uneven_kv_smem
-                cute.struct.MemRange[self.k_dtype, cute.cosize(sK_layout)],
-                self.buffer_align_bytes,
+                cute.struct.MemRange[self.k_dtype, 1] if const_expr(k_aliases_v) else cute.struct.MemRange[self.k_dtype, cute.cosize(sK_layout)],
+                1 if const_expr(k_aliases_v) else self.buffer_align_bytes,
             ]
-            reuse_kv = self.v_dtype == self.k_dtype
             sV: cute.struct.Align[
-                cute.struct.MemRange[self.v_dtype, cute.cosize(sV_layout)] if not const_expr(reuse_kv) else cute.struct.MemRange[self.k_dtype, 1],
-                self.buffer_align_bytes if not const_expr(reuse_kv) else 1,
+                cute.struct.MemRange[self.v_dtype, cute.cosize(sV_layout)] if not const_expr(self.v_dtype == self.k_dtype) else cute.struct.MemRange[self.k_dtype, 1],
+                self.buffer_align_bytes if not const_expr(self.v_dtype == self.k_dtype) else 1,
             ]
             # Scale factor shared memory (if block-scaled quantization is used)
             sSFQ: cute.struct.Align[
@@ -1391,8 +1433,12 @@ class FlashAttentionForwardSm100:
             ]
         self.shared_storage = SharedStorage if const_expr(self.quant_qk) or const_expr(self.quant_pv) else SharedStorageBF16
         
-        # Print total shared memory size
+        # Verify shared memory fits within budget
         total_smem_bytes = self.shared_storage.size_in_bytes()
+        assert total_smem_bytes <= 227 * 1024, (
+            f"SharedStorage {total_smem_bytes // 1024}KB exceeds 227KB limit. "
+            f"Reduce kv_stage (currently {self.kv_stage})."
+        )
         print(f"Total shared memory used: {total_smem_bytes / 1024:.2f} KB")
         sO_bytes = cute.size_in_bytes(self.o_dtype, sO_layout) if const_expr(not self.overlap_sO_sQ) else 0
         sQ_bytes = cute.size_in_bytes(self.q_dtype, sQ_layout)
@@ -1656,12 +1702,25 @@ class FlashAttentionForwardSm100:
         # (MMA, MMA_Q, MMA_D, PIPE)
         sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner)
         # (MMA, MMA_K, MMA_D, PIPE)
-        sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
-        # (MMA, MMA_K, MMA_D, PIPE)
-        # Strip swizzle info to reuse smem
+        # K and V share physical SMEM:
+        # - same dtype: V aliases K (V uses K's base pointer)
+        # - FP4 K + BF16 V: K aliases V (K uses V's base pointer, stride scaled by dtype ratio)
         if const_expr(self.v_dtype == self.k_dtype):
+            sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
             sV = cute.make_tensor(cute.recast_ptr(sK.iterator, sV_layout.inner), sV_layout.outer)
+        elif const_expr(self.k_dtype.width < self.v_dtype.width):
+            # K aliases V's buffer — K is smaller, fits inside V's stage.
+            # K's stage stride must match V's stage stride in bytes so they align.
+            sV = storage.sV.get_tensor(sV_layout.outer, swizzle=sV_layout.inner)
+            stride_sV = const_expr(max(sV_layout.outer.stride[-1], 0))
+            stride_sK_aligned = const_expr(stride_sV * self.v_dtype.width // self.k_dtype.width)
+            sK_outer_aligned = cute.make_layout(
+                sK_layout.outer.shape,
+                stride=(*sK_layout.outer.stride[:-1], stride_sK_aligned),
+            )
+            sK = storage.sV.get_tensor(sK_outer_aligned, swizzle=sK_layout.inner, dtype=self.k_dtype)
         else:
+            sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
             sV = storage.sV.get_tensor(sV_layout.outer, swizzle=sV_layout.inner)
             
         if const_expr(not self.overlap_sO_sQ):

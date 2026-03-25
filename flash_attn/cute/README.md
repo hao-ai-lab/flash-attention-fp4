@@ -1,24 +1,29 @@
 # FP4 Flash Attention 4 (FA4) on Blackwell
 
 CuTe DSL implementation of FP4 block-scaled flash attention for NVIDIA Blackwell GPUs (sm100a/sm103a). Supports two modes:
-- **QK quantization** (`--quant_qk`, default): Q and K quantized to NVFP4 E2M1 with per-block E4M3 scale factors, V remains BF16. **1.09–1.33x speedup** over BF16 FA4.
+- **QK quantization** (`--quant_qk`, default): Q and K quantized to NVFP4 E2M1 with per-block E4M3 scale factors, V remains BF16. **1.01–1.39x speedup** over BF16 FA4, peaking at **1801 TFLOPS**.
 - **QKVP quantization** (`--quant_v`): additionally quantizes the softmax output P and V to NVFP4 with on-the-fly group-wise P quantization. Currently **slower than BF16** (0.84–0.95x) due to hardware limitations: the softmax exp (MUFU instruction) has the same throughput as on H100, but B200 MMA throughput doubles, making softmax warp the bottleneck (See [FA4 paper](https://arxiv.org/abs/2603.05451)). The added P quantization + scale factor R->SMEM->TMEM copy increases critical-path latency.
 We speculate that on B300 and Rubin (w/ FP16 softmax) the QKVP quantization will be faster than BF16.
 
 ## Results — QK Quantization
 
-FP4 FA4 vs BF16 FA4 kernel speedup (CUPTI `bench_gpu_time`, vacant B200 GPU):
+FP4 FA4 vs BF16 FA4 kernel speedup (CUDA event timing, vacant B200 GPU):
 
 | Config | FP4 (ms) | FP4 TFLOPS | BF16 (ms) | BF16 TFLOPS | Speedup |
 |--------|----------|------------|-----------|-------------|---------|
-| b=1 s=256 h=16 d=128 | 0.014 | 37 | 0.015 | 35 | 1.07x |
-| b=1 s=1024 h=16 d=128 | 0.024 | 365 | 0.026 | 336 | 1.09x |
-| b=4 s=4096 h=16 d=128 | 0.336 | 1637 | 0.390 | 1409 | 1.16x |
-| b=1 s=4096 h=12 d=128 | 0.104 | 987 | 0.118 | 871 | 1.13x |
-| **b=1 s=32768 h=12 d=128** ¹ | **3.881** | **1700** | **4.834** | **1365** | **1.25x** |
-| b=1 s=4096 h=24 d=128 | 0.152 | 1360 | 0.173 | 1194 | 1.14x |
-| b=1 s=32768 h=24 d=128 | 7.578 | **1741** | 10.102 | 1306 | **1.33x** |
-| b=1 s=32768 h=24 d=64 | 7.186 | 918 | 7.276 | 907 | 1.01x |
+| b=1 s=256 h=16 d=128 | 0.015 | 37 | 0.015 | 35 | 1.01x |
+| b=1 s=1024 h=16 d=128 | 0.023 | 379 | 0.025 | 338 | 1.12x |
+| b=4 s=4096 h=16 d=128 | 0.336 | 1637 | 0.389 | 1413 | 1.16x |
+| b=4 s=8192 h=16 d=128 | 1.259 | **1747** | 1.511 | 1455 | 1.20x |
+| b=2 s=16384 h=16 d=128 | 2.467 | **1782** | 3.003 | 1464 | 1.22x |
+| **b=1 s=32768 h=16 d=128** | **4.884** | **1801** | **6.771** | **1299** | **1.39x** |
+| b=4 s=4096 h=32 d=128 | 0.655 | 1678 | 0.775 | 1418 | 1.18x |
+| b=4 s=8192 h=32 d=128 | 2.501 | **1759** | 3.027 | 1453 | 1.21x |
+| b=1 s=4096 h=12 d=128 | 0.104 | 986 | 0.117 | 882 | 1.12x |
+| **b=1 s=32768 h=12 d=128** ¹ | **3.856** | **1711** | **5.056** | **1305** | **1.31x** |
+| b=1 s=4096 h=24 d=128 | 0.152 | 1352 | 0.172 | 1198 | 1.13x |
+| b=1 s=32768 h=24 d=128 | 7.551 | **1747** | 10.061 | 1311 | **1.33x** |
+| b=1 s=32768 h=24 d=64 | 7.170 | 920 | 7.284 | 906 | 1.02x |
 
 ¹ Matches [Wan2.1-T2V-1.3B](https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B-Diffusers) inference (480×832 video, 81 frames → latent seqlen 32760, nheads=12, headdim=128).
 
