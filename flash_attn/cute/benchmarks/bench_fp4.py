@@ -425,14 +425,14 @@ def create_fp4_attention_tensors(batch, seqlen_q, seqlen_k, nheads, nheads_kv, h
                 q_ref, k_ref, v_ref)
 
 
-def time_fwd(func, *args, repeats=40, verbose=True, desc="", **kwargs):
+def time_fwd(func, *args, repeats=10, verbose=True, desc="", **kwargs):
     """Time forward pass execution using CUPTI-based GPU timing."""
     times = bench_gpu_time(
         fn=lambda: func(*args, **kwargs),
         dry_run_iters=5,
         repeat_iters=repeats,
         enable_cupti=True,
-        use_cuda_graph=False,
+        use_cuda_graph=True,
     )
     return Timing(np.median(times) * 1e-3)  # bench_gpu_time returns ms, Timing expects seconds
 
@@ -456,10 +456,17 @@ def main(ab_dtype, sf_dtype, sf_vec_size, quant_v=False, debug=False):
     # Benchmark configurations: (batch, seqlen, nheads, headdim)
     # Covers bench_fp4 defaults, video-gen (Wan2.1-1.3B: nheads=12, hdim=128), and larger models
     configs = [
-        # bench_fp4 defaults (nheads=16, headdim=128)
+        # Small shapes
         (1, 256, 16, 128),
         (1, 1024, 16, 128),
+        # Upstream FA4 benchmark shapes (total_seqlen=32k, nheads=16, headdim=128)
         (4, 4096, 16, 128),
+        (4, 8192, 16, 128),
+        (2, 16384, 16, 128),
+        (1, 32768, 16, 128),
+        # GQA: nheads=32 kv_heads=16 (bench with nheads=32 to match upstream)
+        (4, 4096, 32, 128),
+        (4, 8192, 32, 128),
         # Video gen shapes (Wan2.1-T2V-1.3B: nheads=12, headdim=128)
         (1, 4096, 12, 128),
         (1, 32768, 12, 128),
