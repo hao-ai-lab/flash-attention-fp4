@@ -220,6 +220,21 @@ class SoftmaxSm100(Softmax):
             acc_S_row_group_max[i] = self._compute_row_max(acc_S_row_frag[None, i].load())
         return acc_S_row_group_max
 
+    @cute.jit
+    def scale_groupwise(self, acc_S_row: cute.Tensor, group_max: cute.Tensor, sf_size: cutlass.Constexpr[int] = 16):
+        """Normalize P by per-group max before FP4 quantization.
+
+        After this: P_fp4 * SFP ≈ (P/gmax) * gmax = P.
+        """
+        acc_S_row_frag = cute.logical_divide(acc_S_row, cute.make_layout(sf_size))
+        for g in cutlass.range_constexpr(cute.size(group_max)):
+            inv_gmax = Float32(1.0) / cute.arch.fmax(group_max[g], 1e-20)
+            for j in cutlass.range(0, sf_size, 2, unroll_full=True):
+                acc_S_row_frag[j, g], acc_S_row_frag[j + 1, g] = utils.mul_packed_f32x2(
+                    (acc_S_row_frag[j, g], acc_S_row_frag[j + 1, g]),
+                    (inv_gmax, inv_gmax),
+                )
+
     def update_row_sum(
         self, acc_S_row_exp: cute.TensorSSA, row_scale: Float32, is_first: int = False
     ) -> None:
