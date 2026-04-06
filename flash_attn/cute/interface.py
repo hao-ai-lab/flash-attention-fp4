@@ -188,6 +188,7 @@ def num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, max_splits):
     return min(num_SMs // total_mblocks, max_splits, num_n_blocks)
 
 
+@torch.compiler.disable
 def _flash_attn_fwd(
     q: Union[torch.Tensor, cute.Tensor],
     k: Union[torch.Tensor, cute.Tensor],
@@ -845,6 +846,7 @@ def _flash_attn_fwd(
 _flash_attn_fwd.compile_cache = {}
 
 
+@torch.compiler.disable
 def _flash_attn_bwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1603,6 +1605,7 @@ def flash_attn_varlen_func(
     )
 
 
+@torch.compiler.disable
 def _flash_attn_fwd_combine(
     out_partial: torch.Tensor,
     lse_partial: torch.Tensor,
