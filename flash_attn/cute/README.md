@@ -29,7 +29,7 @@ FP4 FA4 vs BF16 FA4 kernel speedup (CUDA event timing, vacant B200 GPU):
 
 Per-call precision: cosine similarity = 0.99, SNR = 7.25 (FP4 QK quantization vs BF16 reference).
 
-> Use raw `torch.cuda.Event` timing, not CUPTI (`bench_gpu_time`) or CUDA graphs — both cause B200 throttling and report ~5% lower TFLOPS.
+> Reproduce with `python -m flash_attn.cute.benchmarks.bench_fp4`. Uses raw `torch.cuda.Event` timing — CUPTI (`bench_gpu_time`) and CUDA graphs both cause B200 throttling and report ~5% lower TFLOPS.
 
 ## Results — QKV Quantization (quant_v)
 
