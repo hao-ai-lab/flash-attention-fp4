@@ -425,24 +425,16 @@ def create_fp4_attention_tensors(batch, seqlen_q, seqlen_k, nheads, nheads_kv, h
                 q_ref, k_ref, v_ref)
 
 
-def time_fwd(func, *args, repeats=20, warmup=5, verbose=True, desc="", **kwargs):
-    """Time forward pass using raw torch.cuda.Event timing.
-
-    CUPTI (bench_gpu_time) and CUDA graphs both cause B200 throttling and
-    report ~5% lower TFLOPS — use plain CUDA events to match README numbers.
-    """
-    fn = lambda: func(*args, **kwargs)
-    for _ in range(warmup):
-        fn()
-    torch.cuda.synchronize()
-    s = torch.cuda.Event(enable_timing=True)
-    e = torch.cuda.Event(enable_timing=True)
-    s.record()
-    for _ in range(repeats):
-        fn()
-    e.record()
-    torch.cuda.synchronize()
-    return Timing(s.elapsed_time(e) / repeats * 1e-3)  # ms → seconds
+def time_fwd(func, *args, repeats=10, verbose=True, desc="", **kwargs):
+    """Time forward pass execution using CUPTI-based GPU timing."""
+    times = bench_gpu_time(
+        fn=lambda: func(*args, **kwargs),
+        dry_run_iters=5,
+        repeat_iters=repeats,
+        enable_cupti=True,
+        use_cuda_graph=False,
+    )
+    return Timing(np.median(times) * 1e-3)  # bench_gpu_time returns ms, Timing expects seconds
 
 
 def main(ab_dtype, sf_dtype, sf_vec_size, quant_v=False, debug=False):
@@ -468,11 +460,7 @@ def main(ab_dtype, sf_dtype, sf_vec_size, quant_v=False, debug=False):
         (1, 256, 16, 128),
         (1, 1024, 16, 128),
         (4, 4096, 16, 128),
-        (4, 8192, 16, 128),
-        (2, 16384, 16, 128),
-        (1, 32768, 16, 128),
         (4, 4096, 32, 128),
-        (4, 8192, 32, 128),
         # Video gen shapes (Wan2.1-T2V-1.3B: nheads=12, headdim=128)
         (1, 4096, 12, 128),
         (1, 32768, 12, 128),
