@@ -29,6 +29,8 @@ FP4 FA4 vs BF16 FA4 kernel speedup (CUDA event timing, vacant B200 GPU):
 
 Per-call precision: cosine similarity = 0.99, SNR = 7.25 (FP4 QK quantization vs BF16 reference).
 
+> Use raw `torch.cuda.Event` timing, not CUPTI (`bench_gpu_time`) or CUDA graphs — both cause B200 throttling and report ~5% lower TFLOPS.
+
 ## Results — QKV Quantization (quant_v)
 
 Additionally quantizes softmax output P and V to FP4. The PV GEMM uses block-scaled MMA with on-the-fly P quantization (`scale_groupwise`) and SFP R2S copy. **Currently slower than BF16** because the softmax warp is the pipeline bottleneck — P quantization adds to the critical path.
