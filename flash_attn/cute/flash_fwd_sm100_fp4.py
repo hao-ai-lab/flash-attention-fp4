@@ -353,15 +353,20 @@ class FlashAttentionForwardSm100:
         # buffer so that seqlen has stride 1 in the FP4 byte buffer.
         if const_expr(len(v_ptr_shape) > 0):
             v_iter = mV.iterator if hasattr(mV, 'iterator') else mV
-            # K-major V: dim 1 (seqlen) innermost (rank 0), then h, d, b.
+            # K-major V: the underlying byte buffer is laid out as (b, h, d, s/2)
+            # row-major (each int8 packs 2 FP4 from adjacent seqlen positions, so
+            # the FP4 PV MMA can read V K-major). Logical FP4 shape (b, s, h, d)
+            # has element strides (h*d*s, 1, d*s, s) → order=(3, 0, 2, 1):
+            #   dim 0 (b) rank 3 (slowest), dim 1 (s) rank 0 (innermost),
+            #   dim 2 (h) rank 2, dim 3 (d) rank 1.
             # Use Int64 shape values so make_ordered_layout produces Int64 strides
-            # (matches what cute_tensor_like + mark_compact_shape_dynamic produces;
-            # tma_partition for SFV requires Int64 strides, not Int32).
+            # (matches what bench_fp4's cute_tensor_like + mark_compact_shape_dynamic
+            # produces; tma_partition for SFV needs Int64).
             from cutlass import Int64
             v_b, v_s, v_h, v_d = v_ptr_shape
             mV = cute.make_tensor(v_iter, cute.make_ordered_layout(
                 (Int64(v_b), Int64(v_s), Int64(v_h), Int64(v_d)),
-                order=(3, 0, 1, 2),
+                order=(3, 0, 2, 1),
             ))
         self.q_dtype = mQ.element_type
         self.k_dtype = mK.element_type
