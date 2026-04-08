@@ -90,7 +90,15 @@ def dump_kernel_attributes(compiled_kernel):
     print(f"--- End Kernel Info ---")
 
 def maybe_contiguous(x):
-    return x.contiguous() if x is not None and x.stride(-1) != 1 else x
+    if x is None or x.stride(-1) == 1:
+        return x
+    # FP4 K-major V: seqlen has stride 1 instead of headdim. The block-scaled MMA
+    # consumes V along the seqlen contracting dim, so a stride-1 seqlen is valid
+    # even though stride(-1) (headdim) is not 1. .contiguous() also fails for FP4
+    # dtypes (no copy_ kernel), so we cannot fix it post-hoc anyway.
+    if hasattr(torch, "float4_e2m1fn_x2") and x.dtype == torch.float4_e2m1fn_x2:
+        return x
+    return x.contiguous()
 
 
 def _validate_tensor(t, name, expected_shape, expected_dtype, expected_device):
@@ -559,6 +567,14 @@ def _flash_attn_fwd(
         force_fp4_impl,
     )
     fp4_qk = use_fp4 and not is_cute_q
+    # FP4 V also needs the make_ptr path: dlpack reports half-headdim shape for
+    # float4_e2m1fn_x2, but the kernel needs to know the full headdim (and the
+    # K-major stride) to build SFV's TMA descriptor correctly.
+    fp4_v = (
+        use_fp4 and not isinstance(v, cute.Tensor)
+        and hasattr(torch, "float4_e2m1fn_x2")
+        and v.dtype == torch.float4_e2m1fn_x2
+    )
     # Compute q_shape, k_shape and qk_ab_dtype for pointer-based Q/K path (used by FP4 kernel)
     if fp4_qk:
         q_ptr_shape = tuple(int(s) for s in (*q.shape[:-1], q.shape[-1] * 2))
@@ -572,6 +588,13 @@ def _flash_attn_fwd(
         q_ptr_shape = tuple(int(s) for s in q.shape)
         k_ptr_shape = tuple(int(s) for s in k.shape)
         qk_ab_dtype = torch2cute_dtype_map.get(q.dtype, cutlass.BFloat16)
+    if fp4_v:
+        # K-major V: physical strides are (S*H*D, 1, S, S*H) over logical (b, s, h, d).
+        # The torch tensor reports shape (b, s, h, d/2) due to FP4 packing — restore d.
+        # Only stride[0] (batch) "spans" headdim and so doubles when D doubles.
+        v_ptr_shape = tuple(int(s) for s in (*v.shape[:-1], v.shape[-1] * 2))
+    else:
+        v_ptr_shape = ()
     if compile_key not in _flash_attn_fwd.compile_cache:
         (
             cu_seqlens_q_tensor,
@@ -616,7 +639,11 @@ def _flash_attn_fwd(
         else:
             q_tensor = to_cute_tensor(q)
             k_tensor = to_cute_tensor(k)
-        v_tensor = to_cute_tensor(v)
+        if fp4_v:
+            from cutlass.cute.runtime import make_ptr
+            v_tensor = make_ptr(cutlass.Float4E2M1FN, 0, cute.AddressSpace.gmem, assumed_align=16)
+        else:
+            v_tensor = to_cute_tensor(v)
         o_tensor = to_cute_tensor(out if not is_split_kv else out_partial)
         # Pass through scale factor tensors if using FP4 (tvm-ffi handles conversion)
         mSFQ_tensor = mSFK_tensor = mSFV_tensor = None
@@ -773,6 +800,9 @@ def _flash_attn_fwd(
                 sym_q_shape = tuple(cutlass.Int32(0) for _ in range(len(q_tensor.shape)))
                 sym_k_shape = tuple(cutlass.Int32(0) for _ in range(len(k_tensor.shape)))
             compile_args.extend([sym_q_shape, sym_k_shape])
+            if fp4_v:
+                sym_v_shape = tuple(cutlass.Int32(0) for _ in v_ptr_shape)
+                compile_args.append(sym_v_shape)
         _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
             *compile_args,
             options="--enable-tvm-ffi",
@@ -801,10 +831,16 @@ def _flash_attn_fwd(
     else:
         q_call = q
         k_call = k
+    if fp4_v:
+        from cutlass.cute.runtime import make_ptr as _make_ptr
+        v_data_ptr = v.data_ptr()
+        v_call = _make_ptr(cutlass.Float4E2M1FN, v_data_ptr, cute.AddressSpace.gmem, assumed_align=16)
+    else:
+        v_call = v
     call_args = [
         q_call,
         k_call,
-        v,
+        v_call,
         out if not is_split_kv else out_partial,
         lse_partial if is_split_kv else lse,
         softmax_scale,
@@ -827,6 +863,8 @@ def _flash_attn_fwd(
     # Add q/k shapes for FP4 kernel
     if use_fp4 or force_fp4_impl:
         call_args.extend([q_ptr_shape, k_ptr_shape])
+        if fp4_v:
+            call_args.append(v_ptr_shape)
 
     _flash_attn_fwd.compile_cache[compile_key](*call_args)
 

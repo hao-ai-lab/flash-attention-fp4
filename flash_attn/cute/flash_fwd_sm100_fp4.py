@@ -307,7 +307,7 @@ class FlashAttentionForwardSm100:
         self,
         mQ,  # cute.Tensor or cute.Pointer (b, s_q, h, d)
         mK,  # cute.Tensor or cute.Pointer (b_k, s_k, h_k, d)
-        mV: cute.Tensor,  # (b_k, s_k, h_k, dv)
+        mV,  # cute.Tensor or cute.Pointer (b_k, s_k, h_k, dv)
         mO: cute.Tensor,  # (b, s_q, h, dv)
         mLSE: Optional[cute.Tensor],
         softmax_scale: Float32,
@@ -328,6 +328,8 @@ class FlashAttentionForwardSm100:
         # For pointer-based Q/K: separate shapes to handle cross-attention (seqlen_q != seqlen_k)
         q_ptr_shape: tuple = (),
         k_ptr_shape: tuple = (),
+        # For pointer-based V (FP4 K-major): full headdim shape (b, s, h, d)
+        v_ptr_shape: tuple = (),
         compute_sp1: cutlass.Constexpr[bool] = False,
     ):
         """Execute the Fused Multi-Head Attention operation on the provided tensors.
@@ -346,6 +348,21 @@ class FlashAttentionForwardSm100:
         mK = cute.make_tensor(k_iter, cute.make_ordered_layout(
             k_ptr_shape, order=tuple(range(len(k_ptr_shape) - 1, -1, -1))
         ))
+        # FP4 K-major V: build from pointer with explicit (b, s, h, d) shape and
+        # K-major strides (S*H*D, 1, S, S*H). The host transposes V's underlying
+        # buffer so that seqlen has stride 1 in the FP4 byte buffer.
+        if const_expr(len(v_ptr_shape) > 0):
+            v_iter = mV.iterator if hasattr(mV, 'iterator') else mV
+            # K-major V: dim 1 (seqlen) innermost (rank 0), then h, d, b.
+            # Use Int64 shape values so make_ordered_layout produces Int64 strides
+            # (matches what cute_tensor_like + mark_compact_shape_dynamic produces;
+            # tma_partition for SFV requires Int64 strides, not Int32).
+            from cutlass import Int64
+            v_b, v_s, v_h, v_d = v_ptr_shape
+            mV = cute.make_tensor(v_iter, cute.make_ordered_layout(
+                (Int64(v_b), Int64(v_s), Int64(v_h), Int64(v_d)),
+                order=(3, 0, 1, 2),
+            ))
         self.q_dtype = mQ.element_type
         self.k_dtype = mK.element_type
         self.v_dtype = mV.element_type
