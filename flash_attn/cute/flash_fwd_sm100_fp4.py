@@ -2456,8 +2456,7 @@ class FlashAttentionForwardSm100:
 
             softmax = SoftmaxSm100.create(
                 softmax_scale_log2,
-                rescale_threshold=8.0,
-                # rescale_threshold=8.0 if const_expr(self.q_dtype.width == 16) else 0.0, # (Wenxuan) disable skipping rescale until FP4 precision is verified
+                rescale_threshold=0.0,  # disable rescale skip — FP4 precision sensitive
                 softmax_scale=softmax_scale,
                 quant_pv=self.quant_pv,
                 compute_sp1=self.compute_sp1,
