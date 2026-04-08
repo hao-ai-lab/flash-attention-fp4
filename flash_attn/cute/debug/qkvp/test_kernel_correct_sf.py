@@ -36,35 +36,28 @@ def quantize_v_kernel_layout(v):
        match the kernel's tile_to_shape byte order).
     """
     b, s, h, d = v.shape
-    # Per-(b, h, d, s_block_of_16) max along s. Block of 16 in K dim.
-    # Reshape v to (b, h, d, s/16, 16) and take abs().max() over last dim.
-    v_perm = v.permute(0, 2, 3, 1).contiguous().float()  # (b, h, d, s)
-    v_blocks = v_perm.reshape(b, h, d, s // 16, 16)
-    block_max = v_blocks.abs().amax(dim=-1).clamp(min=1e-6)  # (b, h, d, s/16)
-    sf_f32 = block_max / 6.0  # SF s.t. quant range is V/SF in [-6, 6]
-    # Convert to E4M3 (Float8E4M3FN). Use round-to-nearest then bit-pack.
-    sf_e4m3 = sf_f32.to(torch.float8_e4m3fn)  # torch supports this
-    # Reconstruct dequantized SF for proper scaling
-    sf_real = sf_e4m3.float()
-    # Scale V by 1/sf_real along the matching block
-    sf_real_full = sf_real.unsqueeze(-1).expand(b, h, d, s // 16, 16).reshape(b, h, d, s)
-    v_scaled = v_perm / sf_real_full  # (b, h, d, s)
-    v_scaled_kmajor = v_scaled.permute(0, 3, 1, 2).contiguous().permute(0, 2, 3, 1)  # back to (b, s, h, d) K-major
-    # Wait, simpler: just scale the original v
-    v_scaled_orig = (v.float() / sf_real.permute(0, 3, 1, 2).unsqueeze(-1).expand(-1, -1, -1, -1, 16).reshape(b, s // 16 * 16, h, d))
-    # That's getting messy. Just use v_scaled (b, h, d, s) and permute back to (b, s, h, d).
-    v_scaled_bshd = v_scaled.permute(0, 3, 1, 2).contiguous()  # (b, s, h, d)
-    # K-major bench layout
-    v_kmajor = v_scaled_bshd.to(torch.bfloat16).permute(0, 3, 2, 1).contiguous().permute(0, 3, 2, 1)
-    v_t, v_und = cute_tensor_like(v_kmajor, cutlass.Float4E2M1FN, is_dynamic_layout=True, assumed_align=16)
-    v_t.mark_compact_shape_dynamic(mode=1, stride_order=tuple(v_kmajor.dim_order()), divisibility=32)
-    v_t = convert_cute_tensor(v_kmajor.float(), v_t, cutlass.Float4E2M1FN, is_dynamic_layout=True)
+    # Allocate bench-style int8 V buffer (16 MB; cute interprets as packed FP4 in first 8 MB).
+    v_kmajor_dummy = v.permute(0, 3, 2, 1).contiguous().permute(0, 3, 2, 1)
+    v_t, v_und = cute_tensor_like(v_kmajor_dummy, cutlass.Float4E2M1FN, is_dynamic_layout=True, assumed_align=16)
+    v_t.mark_compact_shape_dynamic(mode=1, stride_order=tuple(v_kmajor_dummy.dim_order()), divisibility=32)
 
-    # Now build SF tensor matching kernel's tile_to_shape byte layout.
-    # Need byte at (d_inner=d%32, d_outer=(d//32)%4, rest_m_idx=d//128, sf_k_inner=(s//16)%4,
-    # rest_k_idx=s//64, h, b) = sf_real[b, h, d, s//16] (in E4M3 byte form)
-    sf_e4m3_bytes = sf_e4m3.view(torch.uint8)  # (b, h, d, s/16)
-    sf_data = sf_e4m3_bytes
+    # nvfp4_quantize on (b*h*d, s) → packed FP4 (b*h*d, s/2) with adjacent s in adjacent
+    # nibbles, AND SF in layout_128x4 byte order matching kernel's tile_to_shape result.
+    v_perm = v.permute(0, 2, 3, 1).contiguous()  # (b, h, d, s)
+    one = torch.ones(1, device=v.device, dtype=torch.float32)
+    fp4_packed, sf_data = nvfp4_quantize(
+        v_perm.reshape(b * h * d, s), one,
+        sfLayout=SfLayout.layout_128x4, do_shuffle=False
+    )
+    # fp4_packed shape (b*h*d, s/2). Reshape to (b, h, d, s/2), permute to (b, d, h, s/2)
+    # to match bench's int8 V buffer's underlying physical layout.
+    fp4_bhd = fp4_packed.view(torch.uint8).reshape(b, h, d, s // 2)
+    fp4_bdh = fp4_bhd.permute(0, 2, 1, 3).contiguous()  # (b, d, h, s/2)
+    # Write into the FIRST 8 MB of v_und (cute reads packed 2 FP4/byte from there).
+    v_und_flat = v_und.view(torch.int8).flatten()
+    v_und_flat.zero_()
+    v_und_flat[:fp4_bdh.numel()].copy_(fp4_bdh.flatten().to(torch.int8))
+    print(f"[v] wrote {fp4_bdh.numel()} bytes; first 16: {[hex(x & 0xFF) for x in v_und_flat[:16].cpu().tolist()]}")
 
     # 3+4) Build SF tensor in kernel layout: shape (32, 4, rest_m=ceil(d,128), 4,
     # rest_k=ceil(s,64), h, b). Strides per the tile_to_shape probe:
