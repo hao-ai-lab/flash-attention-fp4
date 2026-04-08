@@ -270,36 +270,33 @@ def _flash_attn_fwd(
         num_pages, page_size = None, None
         seqlen_k = k.shape[-3]
     num_head_kv = k.shape[-2]
-    # For FP4 V (float4_e2m1fn_x2), V is passed as the K-major-packed byte buffer
-    # with shape (b, h, d, s/2): bytes are arranged so seqlen is contiguous and
-    # each int8 packs 2 FP4 from adjacent seqlen positions. Recover (h, d) here.
+    # For FP4 V (float4_e2m1fn_x2), V is passed as the K-major-packed FP4 tensor
+    # with shape (b, s, h, d/2): each element packs 2 FP4 values along headdim.
+    # The tensor must already have K-major strides (stride[1]==1) as produced by
+    # `v.permute(0,3,2,1).contiguous().permute(0,3,2,1)`. Recover full d.
     is_fp4_v = (
         not isinstance(v, cute.Tensor)
         and hasattr(torch, "float4_e2m1fn_x2")
         and v.dtype == torch.float4_e2m1fn_x2
     )
     if is_fp4_v:
-        # v.shape = (b, h, d, s/2): num_head_kv = h, head_dim_v = d
-        assert v.shape[0] == batch_size and v.shape[3] * 2 == seqlen_k
-        num_head_kv = v.shape[1]  # override: K-major V puts h before d
-        head_dim_v = v.shape[2]
+        head_dim_v = v.shape[-1] * 2
     else:
         head_dim_v = v.shape[-1]
     # For shape assertions, use the packed dim (what's actually in the tensor)
     head_dim_packed = q.shape[-1]
+    # For FP4 V, the last dim in v.shape is head_dim_v//2 (packed); use that.
+    head_dim_v_assert = head_dim_v // 2 if is_fp4_v else head_dim_v
     if cu_seqlens_k is None:
         if page_table is None:
             assert k.shape == (batch_size, seqlen_k, num_head_kv, head_dim_packed), f"k shape {k.shape} != expected {(batch_size, seqlen_k, num_head_kv, head_dim_packed)}"
-            if not is_fp4_v:
-                assert v.shape == (batch_size, seqlen_k, num_head_kv, head_dim_v)
+            assert v.shape == (batch_size, seqlen_k, num_head_kv, head_dim_v_assert)
         else:
             assert k.shape == (num_pages, page_size, num_head_kv, head_dim_packed)
-            if not is_fp4_v:
-                assert v.shape == (num_pages, page_size, num_head_kv, head_dim_v)
+            assert v.shape == (num_pages, page_size, num_head_kv, head_dim_v_assert)
     else:
         assert k.shape == (seqlen_k, num_head_kv, head_dim_packed)
-        if not is_fp4_v:
-            assert v.shape == (seqlen_k, num_head_kv, head_dim_v)
+        assert v.shape == (seqlen_k, num_head_kv, head_dim_v_assert)
         assert cu_seqlens_k.shape == (batch_size + 1,), (
             "cu_seqlens_k must have shape (batch_size + 1,)"
         )
@@ -604,10 +601,8 @@ def _flash_attn_fwd(
         k_ptr_shape = tuple(int(s) for s in k.shape)
         qk_ab_dtype = torch2cute_dtype_map.get(q.dtype, cutlass.BFloat16)
     if fp4_v:
-        # K-major V byte buffer is (b, h, d, s/2). Logical FP4 shape is (b, s, h, d):
-        #   v.shape = (b, h, d, s/2)  →  v_ptr_shape = (b, s, h, d) = (b, s/2*2, h, d)
-        b_v, h_v, d_v, s_half = (int(x) for x in v.shape)
-        v_ptr_shape = (b_v, s_half * 2, h_v, d_v)
+        # K-major V FP4 tensor: shape (b, s, h, d/2) → restore full d.
+        v_ptr_shape = tuple(int(x) for x in (*v.shape[:-1], v.shape[-1] * 2))
     else:
         v_ptr_shape = ()
     if compile_key not in _flash_attn_fwd.compile_cache:
