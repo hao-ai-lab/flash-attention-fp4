@@ -2782,10 +2782,19 @@ class FlashAttentionForwardSm100:
             tSrPSF = cute.make_rmem_tensor(tSrPSF_f32.layout, cute.Float8E4M3FN)
             softmax.scale_groupwise(tSrS_t2r, tSrPSF_f32, sf_size=self.sf_vec_size)
             self._quant_fp4(tSrS_t2r, tSrPSF_f32, tSrP_r2t, tSrPSF)
-            # R2S: Copy tSrPSF (registers) to sSFP (shared memory)
+            # R2S: Copy tSrPSF (registers) to sSFP (shared memory).
+            # The SFP smem layout is BlockScaledBasicChunk(16) tile_to_shape((M=128, K=128)),
+            # giving byte offsets:
+            #   byte = (m%32)*16 + ((m//32)%4)*4 + (k_block%4) + (k_block//4)*512
+            # Each softmax thread holds 1 M row (lane_id within warp = row in [0,32),
+            # warp_id within softmax warpgroup = row block in [0,4)) and 8 K groups.
+            # The first 4 K groups land at +0,+1,+2,+3 within the row's atom; the
+            # next 4 land at +512,+513,+514,+515 (rest_k stride).
             if const_expr(sSFP is not None):
                 thread_idx = thr_tmem_load.thr_idx
-                base_offset = thread_idx << 2
+                lane_id = thread_idx % 32
+                warp_id = thread_idx // 32
+                base_offset = lane_id * 16 + (warp_id % 4) * 4
                 sfp_thread_layout = cute.make_layout((4, 2), stride=(1, 512))
                 sSFP_stage_ptr = sSFP[None, None, None, stage].iterator
                 sSFP_thread = cute.make_tensor(sSFP_stage_ptr + base_offset, sfp_thread_layout)
