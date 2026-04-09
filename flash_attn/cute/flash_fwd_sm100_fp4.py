@@ -353,24 +353,22 @@ class FlashAttentionForwardSm100:
         # buffer so that seqlen has stride 1 in the FP4 byte buffer.
         if const_expr(len(v_ptr_shape) > 0):
             v_iter = mV.iterator if hasattr(mV, 'iterator') else mV
-            # K-major V: bench's `v.permute(0,3,2,1).contiguous().permute(0,3,2,1)`
-            # produces shape (b, s, h, d) with strides (h*d*s, 1, h*s, s) — i.e.
-            # the underlying contiguous storage is shaped (b, d, h, s). The host
-            # must hand us the FP4 byte buffer in that same physical order so the
-            # PV MMA can read V K-major.
-            #
-            # Element strides (h*d*s, 1, h*s, s) = order=(3, 0, 1, 2):
+            # K-major V: nvfp4_quantize on `v.permute(0,2,3,1).reshape(b*h*d, s)`
+            # produces an FP4 byte buffer of physical shape (b, h, d, s/2) row-major,
+            # where each int8 byte holds two seqlen-adjacent FP4 in the high/low
+            # nibble. Logically the V tensor has FP4 shape (b, s, h, d) with element
+            # strides (h*d*s, 1, h*d, d) — order=(3, 0, 2, 1):
             #   s (dim 1) order 0 → stride 1
-            #   h (dim 2) order 1 → stride s
-            #   d (dim 3) order 2 → stride s*h
-            #   b (dim 0) order 3 → stride s*h*d
+            #   d (dim 3) order 1 → stride s
+            #   h (dim 2) order 2 → stride s*d
+            #   b (dim 0) order 3 → stride s*d*h
             # Int64 shape so make_ordered_layout produces Int64 strides
-            # (tma_partition for SFV requires Int64, like bench_fp4).
+            # (tma_partition for SFV requires Int64).
             from cutlass import Int64
             v_b, v_s, v_h, v_d = v_ptr_shape
             mV = cute.make_tensor(v_iter, cute.make_ordered_layout(
                 (Int64(v_b), Int64(v_s), Int64(v_h), Int64(v_d)),
-                order=(3, 0, 1, 2),
+                order=(3, 0, 2, 1),
             ))
         self.q_dtype = mQ.element_type
         self.k_dtype = mK.element_type
