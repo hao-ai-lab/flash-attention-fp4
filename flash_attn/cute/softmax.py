@@ -235,9 +235,10 @@ class SoftmaxSm100(Softmax):
         acc_S_row_group_max = cute.make_rmem_tensor(cute.make_layout(num_frags), Float32)
         inv6 = Float32(1.0 / 6.0)
         for i in cutlass.range_constexpr(num_frags):
-            local_max = self._compute_row_max(acc_S_row_frag[None, i].load())
-            group_max = utils.warp_reduce(local_max, cute.arch.fmax, width=32)
-            acc_S_row_group_max[i] = group_max * inv6
+            # Each thread holds the entire K group (16 elements) for one M row of
+            # the t2r tile, so per-thread fmax_reduce IS the per-group max — no
+            # cross-lane reduce needed.
+            acc_S_row_group_max[i] = self._compute_row_max(acc_S_row_frag[None, i].load()) * inv6
         return acc_S_row_group_max
 
     @cute.jit
