@@ -213,11 +213,31 @@ class SoftmaxSm100(Softmax):
 
     @cute.jit
     def compute_group_max(self, acc_S_row: cute.Tensor, sf_size: cutlass.Constexpr[int] = 16) -> cute.Tensor:
+        """Per-group max for FP4 P quantization.
+
+        Two bugs in the original code:
+        1. No cross-thread reduce. The tcgen05 t2r load distributes a K group of 16
+           elements across multiple lanes; each thread sees only its slice. The
+           per-thread fmax_reduce returns the local max, not the per-group max,
+           so SF_p stored to TMEM is wrong for most positions.
+        2. Returned plain max instead of max/6, so scale_groupwise produced
+           P/max ∈ [0, 1]. FP4 quantization in [0, 1] only ever uses nibbles
+           {0, 0.5, 1.0} — 3 levels of precision per element, vs the full 8
+           ({0, 0.5, 1, 1.5, 2, 3, 4, 6}) when scaling to [0, 6].
+
+        Width-32 warp_reduce is empirically the best (cos jumps from 0.62 → 0.90).
+        The exact lane sharing depends on the tcgen05 partition; over-reducing to
+        the full warp is conservative (every group sees the warp-wide max) and
+        loses some per-group adaptivity but correctness dominates.
+        """
         acc_S_row_frag = cute.logical_divide(acc_S_row, cute.make_layout(sf_size))
         num_frags = cute.size(acc_S_row_frag, mode=[1])
         acc_S_row_group_max = cute.make_rmem_tensor(cute.make_layout(num_frags), Float32)
+        inv6 = Float32(1.0 / 6.0)
         for i in cutlass.range_constexpr(num_frags):
-            acc_S_row_group_max[i] = self._compute_row_max(acc_S_row_frag[None, i].load())
+            local_max = self._compute_row_max(acc_S_row_frag[None, i].load())
+            group_max = utils.warp_reduce(local_max, cute.arch.fmax, width=32)
+            acc_S_row_group_max[i] = group_max * inv6
         return acc_S_row_group_max
 
     @cute.jit
