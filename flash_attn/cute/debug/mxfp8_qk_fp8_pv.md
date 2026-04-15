@@ -412,3 +412,54 @@ the relevant constants on the QK side are properly parameterized by
 - the SFQ/SFK TMA partition / cta_v_map (different SF-bytes-per-row count
   for MXFP8 may need a different TMA box shape), or
 - the SFQ/SFK S2T copy atom which moves SMEM → TMEM.
+
+## 2026-04-15 PTX-helper / idesc agreement audit (task #22)
+
+For each path, compared the inline PTX `kind::*` qualifier against the
+fields `mma_op_to_idesc` packs into the descriptor.
+
+### MXFP8 QK (block-scaled, scale_vec::1X)
+- PTX: `tcgen05.mma.cta_group::1.kind::mxf8f6f4.block_scale.scale_vec::1X`
+- idesc captured at runtime: `0x08a00000`
+  - bits 7-9 (a_format) = 0 = E4M3 ✓ matches `a_dtype=Float8E4M3FN`
+  - bits 10-12 (b_format) = 0 = E4M3 ✓ matches `b_dtype=Float8E4M3FN`
+  - bit 23 (scale_format) = 1 = UE8M0 ✓ matches `sf_dtype=Float8E8M0FNU`
+  - bits 17-22 (n_dim) = 16 → N=128 ✓
+  - bits 24-28 (m_dim) = 8 → M=128 ✓
+  - bit 31 (k_size) = 0 → K32 dense ✓ matches scale_vec::1X K-per-inst
+  - bits 29-30 (a_sf_id) and bits 4-5 (b_sf_id) = 0; documented as
+    "set at runtime" — extracted from `tmem_scale_a/b` upper bits in the
+    inline asm. **Agreement: confirmed.**
+
+### NVFP4 QK (block-scaled, scale_vec::4X)
+- PTX: `tcgen05.mma.cta_group::1.kind::mxf4nvf4.block_scale.scale_vec::4X`
+- idesc captured at runtime: `0x08201680`
+  - bits 7-9 (a_format) = 5 = E2M1 ✓ matches `a_dtype=Float4E2M1FN`
+  - bits 10-12 (b_format) = 1 = E5M2 ✗ — mismatch with `b_dtype=Float4E2M1FN`
+    (should also be 5). Doesn't break NVFP4 because `kind::mxf4nvf4`
+    implicitly fixes both operands to E2M1, so b_format is unused. Filed
+    as cosmetic bug; should fix `make_instr_desc_block_scaled` to set
+    b_format from `b_dtype` consistently.
+  - bit 23 (scale_format) = 0 = UE4M3 ✓ matches `sf_dtype=Float8E4M3FN`
+  - bits 17-22 (n_dim) = 16 → N=128 ✓
+  - bits 24-28 (m_dim) = 8 → M=128 ✓
+  - **Agreement: works in practice (kind takes precedence) but b_format
+    encoding is sloppy.**
+
+### Pure FP8 PV (no scale)
+- PTX: `tcgen05.mma.cta_group::1.kind::f8f6f4`
+- idesc: built via `make_instr_desc` (non-block-scaled path).
+  - a_format / b_format / acc set from dtypes. No scale_format bit.
+  - `--pv_mode fp8` runs end-to-end with max_diff `≤ 0.51` and no NaN
+    across all benched shapes. **Agreement: confirmed by E2E correctness.**
+
+### BF16 paths (fallback)
+- Untouched by recent changes; kind = `tcgen05.mma.cta_group::1.kind::f16`.
+  Matches `make_instr_desc(BFloat16, BFloat16, ...)` encoding. Confirmed
+  by ongoing reference-attention parity in the FA4 baseline.
+
+### Conclusion
+
+PTX kind ↔ idesc agreement is **OK for all currently shipping paths**.
+The NVFP4 b_format=1 quirk is harmless because `kind::mxf4nvf4` constrains
+both operands to E2M1 by spec.
