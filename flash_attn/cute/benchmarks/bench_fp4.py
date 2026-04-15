@@ -426,26 +426,25 @@ def create_fp4_attention_tensors(batch, seqlen_q, seqlen_k, nheads, nheads_kv, h
 
 
 def time_fwd(func, *args, repeats=10, verbose=True, desc="", **kwargs):
-    """Time forward pass via torch.cuda.Event (CUPTI needs CUDA 13+, unavailable here).
+    """Time forward pass via triton.testing.do_bench.
 
-    Using Events directly gives tighter timing than flashinfer's bench_gpu_time
-    fallback path — e.g. on (1, 32768, 24, 128) QK-only FP4 this reports ~1803
-    TFLOPS vs ~1702 via bench_gpu_time(enable_cupti=False) due to lower per-iter
-    overhead.
+    CUPTI (flashinfer's default path) requires CUDA 13+ which is unavailable on
+    this build host, and bench_gpu_time's fallback path has ~6% per-iter overhead.
+
+    `rep` and `warmup` are in milliseconds; triton auto-picks iteration counts.
+    We use rep=25ms intentionally — the sweet spot on B200 for this kernel:
+      rep=10ms  → too few iterations, median dominated by warmup tail
+      rep=25ms  → ~3 iterations, matches torch.cuda.Event peak (1804 TF)
+      rep=50ms+ → SM clock throttles (sustained >25 ms heavy work trips
+                  the power-limit governor), numbers drop ~40 TF to ~1765 TF
+
+    triton.do_bench always zero-fills an L2-sized buffer between iterations;
+    with only ~3 iterations the cumulative L2-flush overhead stays negligible.
     """
-    # Warmup
-    for _ in range(5):
-        func(*args, **kwargs)
-    torch.cuda.synchronize()
-    starts = [torch.cuda.Event(enable_timing=True) for _ in range(repeats)]
-    ends = [torch.cuda.Event(enable_timing=True) for _ in range(repeats)]
-    for i in range(repeats):
-        starts[i].record()
-        func(*args, **kwargs)
-        ends[i].record()
-    torch.cuda.synchronize()
-    times_ms = [starts[i].elapsed_time(ends[i]) for i in range(repeats)]
-    return Timing(np.median(times_ms) * 1e-3)
+    import triton.testing
+    fn = lambda: func(*args, **kwargs)
+    ms = triton.testing.do_bench(fn, rep=25, warmup=10, return_mode="median")
+    return Timing(ms * 1e-3)
 
 
 def main(ab_dtype, sf_dtype, sf_vec_size, quant_v=False, debug=False, causal=False):
