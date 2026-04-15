@@ -525,3 +525,59 @@ interleaving for long d=128 needs nsight metrics that are unavailable on
 this build host (CUPTI requires CUDA 13+ driver).
 
 ### Status: diagnosed, fix designed but not implemented.
+
+## 2026-04-15 MXFP8 QK FIXED 🎯
+
+### Root cause
+
+`flash_fwd_sm100_fp4.py:1431` was dispatching SFQ's base TMEM offset
+based on `sf_vec_size`:
+
+```python
+# BEFORE (broken for MXFP8):
+sfq_base_offsets = self.tmem_o_offset if self.sf_vec_size == 32 else self.tmem_s_offset
+sfq_stage_order  = (tuple(range(q_stage)) if sf_vec_size == 32
+                    else tuple(q_stage - 1 - stage for stage in range(q_stage)))
+```
+
+MXFP8's branch put SFQ at `tmem_o_offset[stage]` (cols 256-511), which is
+exactly where the **PV MMA writes the O accumulator**. The kernel
+pipelines QK[k+1] against PV[k], so once PV[0] fires it corrupts the
+SFQ[1] bytes sitting in cols 384+. QK[1] then reads garbage SF values,
+which as UE8M0 exponents (0x00–0xFF = 2^−127 … 2^128) overflow to 1e37.
+
+The branch was introduced "to avoid aliasing the S accumulator". That
+reasoning was wrong — `make_tmem_layout_sfa` already encodes SFA in a
+physically non-overlapping layout within the S range (via the sf_id bits
+at address bits 29:30). NVFP4 uses `tmem_s_offset` and works fine.
+
+### Fix
+
+```python
+# AFTER:
+sfq_base_offsets = self.tmem_s_offset
+sfq_stage_order  = tuple(q_stage - 1 - stage for stage in range(q_stage))
+```
+
+Both modes now share the NVFP4-proven layout.
+
+### Results — `bench_fp4 --qk_mode mxfp8` on commit at HEAD
+
+| shape | pre-fix max_diff | post-fix max_diff | TFLOPS | speedup vs BF16 ref |
+|---|---|---|---|---|
+| `(1, 256, 16, 128)`  | 6.9e37 | 0.043 | 30.4 | 0.87× (tiny shape, overhead-bound) |
+| `(1, 1024, 16, 128)` | 2.9e37 | 0.025 | 167  | 0.50× (noisy, seqlen ~1K too small) |
+| `(4, 4096, 16, 128)` | 9.9e36 | 0.016 | 1583 | 1.21× |
+| `(4, 4096, 32, 128)` | NaN    | 0.020 | 1607 | 1.13× |
+| `(1, 4096, 12, 128)` | NaN    | 0.012 | 948  | 1.07× |
+| `(1, 32768, 12, 128)`| NaN    | 0.006 | 1638 | 1.19× |
+| `(1, 4096, 24, 128)` | NaN    | 0.012 | 1307 | 1.08× |
+| `(1, 32768, 24, 128)`| NaN    | 0.004 | 1651 | 1.22× |
+
+### Verification
+
+- NVFP4 max_diff unchanged (0.02–0.27, identical pre/post).
+- `--quant_v` (FP4 PV) max_diff unchanged (0.08–1.18, identical pre/post).
+- All three modes (NVFP4, MXFP8, FP4 V) produce valid output with no NaN.
+
+Status: **#24 FIXED**. Unblocks #21 (dedicated FP8 helper perf A/B).

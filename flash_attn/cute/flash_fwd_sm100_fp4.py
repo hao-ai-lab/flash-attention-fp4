@@ -1408,11 +1408,17 @@ class FlashAttentionForwardSm100:
         tCtSFQs = [None] * self.q_stage
         tCtSFKs = [None] * self.q_stage
         if const_expr(self.quant_qk):
-            sfq_base_offsets = self.tmem_o_offset if self.sf_vec_size == 32 else self.tmem_s_offset
-            sfq_stage_order = (
-                tuple(range(self.q_stage))
-                if self.sf_vec_size == 32
-                else tuple(self.q_stage - 1 - stage for stage in range(self.q_stage))
+            # Use tmem_s_offset for both NVFP4 and MXFP8 — SFA sits in the same TMEM
+            # col range as the S accumulator, but its physical layout uses non-
+            # overlapping rows per the make_tmem_layout_sfa encoding. Previously
+            # MXFP8 was using tmem_o_offset which collides with the O accumulator
+            # once the PV pipeline stage overlaps with QK — suspected root cause
+            # of the MXFP8 NaN/inf garbage.
+            sfq_base_offsets = self.tmem_s_offset
+            # Match NVFP4's staggered stage order (stage k → offset[q_stage-1-k])
+            # for MXFP8 as well, since they now share the same base offsets.
+            sfq_stage_order = tuple(
+                self.q_stage - 1 - stage for stage in range(self.q_stage)
             )
             sfq_tmem_ptrs_f32 = [
                 cute.make_ptr(
