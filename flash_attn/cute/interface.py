@@ -583,6 +583,33 @@ def _flash_attn_fwd(
                 "Block sparsity is not yet supported with SplitKV. TODO: partition sparse block lists per split."
             )
 
+    # Block-scaled QK ab/sf dtype must be in the compile key — otherwise NVFP4 and
+    # MXFP8 share the same key and the second mode silently reuses the kernel
+    # compiled for the first (was producing NaN/inf for whichever was second).
+    # We can derive the QK ab dtype from the Q tensor's element_type here (cute.Tensor
+    # path) and from the FP4 hint (torch path); for the SF dtype, derive from mSFQ's
+    # element_type if it's already a cute.Tensor, else infer from sf_vec_size which we
+    # also derive from the SF tensor shape.
+    if isinstance(q, cute.Tensor):
+        _key_qk_ab_dtype = q.element_type
+    elif use_fp4:
+        _key_qk_ab_dtype = cutlass.Float4E2M1FN
+    else:
+        _key_qk_ab_dtype = torch2cute_dtype_map.get(q.dtype, cutlass.BFloat16)
+
+    if mSFQ is None:
+        _key_sf_dtype = None
+    elif isinstance(mSFQ, cute.Tensor):
+        _key_sf_dtype = mSFQ.element_type
+    else:
+        # The torch underlying tensor for an FP8/E4M3/E8M0 SF is plain int8 with no
+        # dtype hint — we have to infer from the AB dtype which is already known.
+        # MXFP8 (Float8E4M3FN/E5M2 ab) uses E8M0 SF; NVFP4 (Float4E2M1FN ab) uses E4M3.
+        if _key_qk_ab_dtype in (cutlass.Float8E4M3FN, cutlass.Float8E5M2):
+            _key_sf_dtype = cutlass.Float8E8M0FNU
+        else:
+            _key_sf_dtype = cutlass.Float8E4M3FN
+
     compile_key = (
         dtype,
         head_dim,
@@ -615,6 +642,10 @@ def _flash_attn_fwd(
         mSFK is not None,
         mSFV is not None,
         force_fp4_impl,
+        _key_qk_ab_dtype,  # NVFP4 (Float4E2M1FN) vs MXFP8 (Float8E4M3FN/E5M2)
+        _key_sf_dtype,     # E4M3 (NVFP4) vs E8M0 (MXFP8) — was previously not in the
+                           # key; both modes shared a slot and the second silently
+                           # reused the kernel compiled for the first.
     )
     fp4_qk = use_fp4 and not is_cute_q
     # FP4 V also needs the make_ptr path: dlpack reports half-headdim shape for

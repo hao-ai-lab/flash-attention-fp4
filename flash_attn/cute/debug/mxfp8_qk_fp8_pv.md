@@ -1,0 +1,376 @@
+# MXFP8 QK + FP8 PV — status and plan
+
+**Last merged:** 2026-04-15 (combines the checklist and the progress note)
+**Last verified commit:** `7761bf12`
+
+## Goal
+
+Extend [`flash_fwd_sm100_fp4.py`](/sgl-workspace/cutlass/examples/python/CuTeDSL/blackwell/flash-attention/flash_attn/cute/flash_fwd_sm100_fp4.py)
+so the QK GEMM can run **block-scaled MXFP8** (Float8E4M3FN / Float8E5M2 + UE8M0
+SF, `sf_vec_size=32`) while the PV GEMM runs **pure FP8** (no block-scale, no
+P-quant in softmax). Verify end-to-end via
+[`bench_fp4.py`](/sgl-workspace/cutlass/examples/python/CuTeDSL/blackwell/flash-attention/flash_attn/cute/benchmarks/bench_fp4.py).
+
+Motivation: the current `--quant_v` path puts P-quantization on the softmax
+critical path. Moving to pure FP8 PV removes that, and MXFP8 QK should be
+roughly precision-equivalent to NVFP4 QK while letting us drop block-scaled
+MMA from both GEMMs.
+
+Reference prior art:
+- [`fp4_flash_attention_optimization_notes.md`](./fp4_flash_attention_optimization_notes.md)
+- [`qkvp/QKVP_PRECISION_FIX.md`](./qkvp/QKVP_PRECISION_FIX.md)
+- Upstream FA PR for pure FP8: https://github.com/Dao-AILab/flash-attention/pull/2109
+
+## Exploration findings
+
+- `interface.py` already accepts `Float8E4M3FN` / `Float8E5M2` A/B with
+  `Float8E8M0FNU` SF and `sf_vec_size=32` for block-scaled paths.
+- `make_blockscaled_trivial_tiled_mma` emits `MmaMXF8Op` for block-scaled FP8;
+  `make_trivial_tiled_mma` emits `MmaFP8Op` for pure FP8.
+- NVFP4-only assumptions that needed relaxing:
+  - `__init__` asserted `sf_vec_size == 16` and `sf_dtype == Float8E4M3FN`
+  - scale-factor SMEM storage hardcoded to `cute.Float8E4M3FN`
+  - P-SF register path hardcoded to UE4M3 for block-scaled PV
+- Inline PTX helpers in
+  [`blackwell_helpers.py`](/sgl-workspace/cutlass/examples/python/CuTeDSL/blackwell/flash-attention/flash_attn/cute/blackwell_helpers.py)
+  hardcoded MMA `.kind::` for some paths (`.kind::f16` for BF16,
+  `.kind::mxf4nvf4.block_scale.scale_vec::4X` for NVFP4).
+
+## Implementation status
+
+- [x] Relaxed `FlashAttentionForwardSm100.__init__` dtype assumptions.
+  Block-scaled QK now supports:
+  - NVFP4: `Float4E2M1FN + Float8E4M3FN + sf_vec_size=16`
+  - MXFP8: `Float8E4M3FN` / `Float8E5M2` + `Float8E8M0FNU + sf_vec_size=32`
+- [x] Replaced hardcoded FP8-E4M3 SMEM SF storage with `self.sf_dtype`.
+- [x] Kept the existing on-the-fly P-quant path only for block-scaled PV.
+- [x] Added a pure-FP8 PV path:
+  - V is FP8
+  - `mSFV is None`
+  - softmax writes P directly in FP8 form for the PV GEMM
+  - PV uses pure FP8 MMA (not block-scaled)
+- [x] Generalized PTX-helper selection so the emitted MMA kind matches the op:
+  `.kind::f16` for F16/BF16, pure FP8 kind for `MmaFP8Op`,
+  `.kind::mxf8f6f4…` for block-scaled FP8, `.kind::mxf4nvf4…` for NVFP4.
+- [x] Benchmark driver can exercise QK-only NVFP4 (baseline), MXFP8 QK + BF16 V,
+  and MXFP8 QK + pure FP8 V.
+- [x] Benchmark builds FP8 V tensors with the requested `--fp8_dtype` (was
+  previously reusing the NVFP4 QK dtype by accident).
+- [x] Softmax underflow handling for pure FP8 PV switched to the upstream-style
+  `max_offset=8 / p_log2_offset=8` pattern (LSE subtracts the offset back out
+  after `row_sum` accumulation).
+- [x] P TMEM store shape for pure-FP8 PV: uses `St32x32bOp(Repetition(8))`
+  (keying that off `quant_pv` was wrong for `NVFP4 QK + FP8 PV`; caused long-
+  sequence sparse NaNs before the fix).
+- [x] Explicit E4M3 packing for P: bypasses the generic `.to(Float8E4M3FN)`
+  path and uses `packed_float_to_ue4m3(...)` directly from FP32. Saved PTX
+  diff confirmed removal of `128x cvt.u32.u16` after the switch.
+- [x] SFB helper tiled MMA uses `CtaGroup.ONE` (was `self.cta_group`).
+- [x] MXFP8 QK SFQ/SFK TMEM spacing uses dense-style `16` u32-column separation
+  (`0x10`) instead of the `4`-column split; that fixed one misalignment but
+  not the current fault.
+- [x] **Routed `gemm_ptx_partial_fp8` through the working generic block-scaled
+  helper** — unblocks MXFP8 QK functionally. Both `MXFP8 QK + BF16 PV` and
+  `MXFP8 QK + FP8 PV` now run without `cudaErrorMisalignedAddress`.
+
+## Current blockers
+
+### 1. Is the generic helper for MXFP8 QK actually optimal?
+
+The dedicated `gemm_ptx_partial_fp8` helper faulted, so we fall back to the
+generic block-scaled helper. This is functional but may be leaving perf on
+the table. The dedicated helper should be revived once the real fault is
+understood.
+
+### 2. Pure-FP8 PV regression on long d=128 shapes
+
+NVFP4 QK + FP8 PV beats NVFP4 QK baseline on `(1, 32768, 24, 64)` but not on
+long-d shapes. Nsight confirms the FP8 path reduces DRAM and L2 traffic but
+takes **more active cycles**, with higher `mio_throttle` and `wait` stalls —
+the bottleneck shifted from memory to execution-side overhead (packing /
+scheduling / pipeline balance), not raw BW.
+
+## Current numbers (`bench_fp4.py`, repaired env)
+
+Env to reproduce:
+- `flash_attn/cute/.venv/bin/python`
+- `CUTE_DSL_ARCH=sm_100a`, `CUTE_DSL_ENABLE_TVM_FFI=1`
+- `PYTHONPATH=/sgl-workspace/cutlass/examples/python/CuTeDSL/blackwell/flash-attention:/sgl-workspace/flashinfer`
+
+### NVFP4 QK-only baseline (reference)
+
+| shape | ms | TFLOPS |
+|---|---|---|
+| `(1, 256, 16, 128)` | 0.014–0.015 | 37.1 |
+| `(1, 1024, 16, 128)` | 0.023 | 376.8 |
+| `(4, 4096, 16, 128)` | 0.330–0.336 | 1667.5 |
+| `(4, 4096, 32, 128)` | 0.647–0.654 | 1699.0 |
+| `(1, 4096, 12, 128)` | 0.102–0.105 | 1006.6 |
+| `(1, 32768, 12, 128)` | 3.830–3.858 | 1722.6 |
+| `(1, 4096, 24, 128)` | 0.148–0.153 | 1394.9 |
+| `(1, 32768, 24, 128)` | 7.294–7.643 | 1808.9 |
+| `(1, 32768, 24, 64)` | 7.138–7.176 | 924.2 |
+
+### NVFP4 QK + pure FP8 PV (current best tuning: P-split=1/2, uncapped kv_stage)
+
+| shape | ms | Δ vs baseline |
+|---|---|---|
+| `(1, 256, 16, 128)` | 0.013 | faster |
+| `(1, 1024, 16, 128)` | 0.023 | tied |
+| `(4, 4096, 16, 128)` | 0.343–0.344 | +0.008 ms |
+| `(4, 4096, 32, 128)` | 0.673–0.676 | +0.022 ms |
+| `(1, 4096, 12, 128)` | 0.106–0.107 | tied |
+| `(1, 32768, 12, 128)` | 4.062–4.078 | +0.21 ms (worse) |
+| `(1, 4096, 24, 128)` | 0.154–0.162 | ±0.01 ms |
+| `(1, 32768, 24, 128)` | 7.736–7.807 | +0.1 ms |
+| `(1, 32768, 24, 64)` | 6.945–7.641 | **−0.23 ms (faster)** |
+
+Correctness against BF16 reference (max_diff) over the sweep:
+- d=128 shapes: 0.05 – 0.51
+- d=64 shapes: ~0.06
+
+All configurations complete without NaNs. No cases exceed the benchmark
+tolerance.
+
+### MXFP8 QK — IS NOT actually unblocked (2026-04-15 late, post-bench)
+
+The helper reroute stopped the `cudaErrorMisalignedAddress` crash but did
+**not** restore correctness. End-to-end bench reveals two distinct bugs:
+
+**A. Numerical: every MXFP8 QK config produces garbage output.**
+
+Sample run on `MXFP8 QK + BF16 PV` (default `--qk_mode mxfp8`, `Float8E4M3FN`):
+
+| shape | ms | max_diff vs BF16 |
+|---|---|---|
+| `(1, 256, 16, 128)`   | 0.015 | **6.9e37** |
+| `(1, 1024, 16, 128)`  | 0.026 | **2.9e37** |
+| `(4, 4096, 16, 128)`  | 0.350 | **NaN** |
+| `(4, 4096, 32, 128)`  | 0.686 | **1.3e37** |
+| `(1, 4096, 12, 128)`  | 0.111 | **NaN** |
+| `(1, 32768, 12, 128)` | 4.016 | **NaN** |
+| `(1, 4096, 24, 128)`  | 0.160 | **NaN** |
+| `(1, 32768, 24, 128)` | 8.285 | **NaN** |
+
+Same NaN/inf pattern with `--pv_mode fp8`. Latency numbers themselves are
+plausible (1500–1700 TFLOPS, ~10–15% slower than NVFP4 baseline as expected
+from MXFP8 having 2× wider operands), so the hot loop is running — it's
+just computing the wrong thing.
+
+**B. Compile-time: d=64 crashes during TMA SFQ atom creation.**
+
+`(1, 32768, 24, 64)` with MXFP8 QK fails with:
+
+```
+loc("tma_atom_sfq, tma_tensor_sfq = cute.nvgpu.make_tiled_tma_atom_A("...
+flash_fwd_sm100_fp4.py":759:39): error: expected top-level shape
+equivalence between the SMEM layout and the CTA V-map, but got
+'!cute.layout<"((((32,4),1),(32,1)),1,(2,4)):(((( 16,4),0),(0,0)),0,(0,1))">'
+and
+'!cute.layout<"(((32,4),32),1,2):(((1@0@0@0,1@1@0@0),1@0@0@1),0,1@1@0@1)">'
+```
+
+The two layouts both nominally describe the same total atom but disagree on
+how the K-rest dim is grouped. The "32" in the actual layout is the K-rest
+that's missing from the expected one — likely an `sf_vec_size=32` (MXFP8) vs
+`sf_vec_size=16` (NVFP4) accounting bug in how the SFQ TMA SMEM layout is
+built when `head_dim=64`.
+
+Both bugs (numerical garbage on d=128, compile fault on d=64) point to the
+same root cause: the SFQ/SFK plumbing was tuned for NVFP4's `sf_vec_size=16`
+and doesn't correctly scale when `sf_vec_size=32`. Need to audit:
+- `sfq_smem_size` / `sfk_smem_size` derivation
+- `tile_atom_to_shape_SF` and `make_smem_layout_sfa/sfb` calls for MXFP8
+- the dense_blockscaled_gemm_persistent_prefetch.py's MXFP8 path for the
+  reference layout
+
+## Nsight Compute findings
+
+### `(4, 4096, 16, 128)` NVFP4 QK + BF16 vs + FP8 PV
+
+- Tensor-pipe instructions stayed at `393,216` → PV MMA count already reduced.
+- FP8 PV: `138.7M → 130.3M` total instructions after explicit E4M3 packing
+  (saved non-tensor conversion/pack work).
+- FP8 PV still launches at `128 regs/thread`, limited to 1 resident block by
+  both register and SMEM budget.
+
+### `(1, 32768, 12, 128)` BF16 vs FP8 PV
+
+| metric | BF16 PV | FP8 PV |
+|---|---|---|
+| `gpu__time_duration.sum` | 6,337,600 | 6,645,504 |
+| `dram__bytes.sum` | 235,973,376 | **175,292,416** |
+| `lts__t_bytes.sum` | 14,943,254,528 | **8,322,595,552** |
+| `smsp__cycles_active.sum` | 3,909,509,413 | 4,143,321,907 |
+| `mio_throttle` | 0.33 | **0.88** |
+| `wait` | 2.22 | **2.74** |
+
+### `(1, 32768, 24, 64)` BF16 vs FP8 PV
+
+| metric | BF16 PV | FP8 PV |
+|---|---|---|
+| `gpu__time_duration.sum` | 11,658,816 ns | 12,406,688 ns |
+| `dram__bytes.sum` | 236,132,864 | 178,097,408 |
+| `lts__t_bytes.sum` | 14,000,885,216 | 9,377,248,992 |
+| `smsp__cycles_active.sum` | 7,676,213,467 | 8,191,504,535 |
+| `shared_op_ld` bank conflicts | 1,004,597 | **35,413** |
+| `shared_op_st` bank conflicts | 3,695,857 | **1,687,420** |
+| SMEM / block | 217,088 | 222,208 |
+
+Both datasets tell the same story: **memory pressure goes down, active cycles
+go up.** The regression is execution-side, not bandwidth-side.
+
+## Negative / reverted experiments
+
+- **Single-phase pure-FP8 P handoff** (publish full P before first PV barrier):
+  large regressions on every long-shape (`0.407 ms`, `0.801 ms`, `4.915 ms`,
+  `9.351 ms`, `7.826 ms`). Reverted.
+- **`TMEM_STORE_REP=16` for pure-FP8 P store**: `~0.451 ms` on the key shape
+  vs `~0.344 ms` with `Repetition(8)`. Kept `Repetition(8)`.
+- **E5M2 for pure-FP8 PV**: `~0.350 ms` vs E4M3 `~0.344 ms`. Kept E4M3.
+- **`FA4_FP8_PV_KV_STAGE_CAP` cap on `(1, 32768, 24, 64)`**: uncapped 8.75 ms;
+  cap=8 → 17.79 ms; cap=5 → 18.93 ms. Disproved the cap hypothesis.
+
+## Best current tuning (pure FP8 PV)
+
+- `kv_stage` uncapped by default.
+- Release P to the PV consumer at `1/2` split (not `3/4`).
+- `TMEM_STORE_REP = Repetition(8)`.
+- E4M3 operand dtype.
+- Explicit `packed_float_to_ue4m3(...)` pack, not generic `.to()`.
+- Shape-dependent knobs:
+  - `d=64` prefers lower `p_log2_offset`, smaller TMEM store rep, different P-split.
+  - long `d=128` prefers uncapped KV stage + `p_log2_offset=8`.
+
+## Verification matrix
+
+| mode | functional | numerical (BF16 ref) | perf vs NVFP4 QK baseline |
+|---|---|---|---|
+| NVFP4 QK-only | ✓ | ✓ | reference |
+| NVFP4 QK + pure FP8 PV | ✓ | ✓ (max_diff ≤ 0.51, no NaN) | mixed; wins on d=64, ties on small d=128, **regresses on long d=128** |
+| MXFP8 QK + BF16 PV | ✓ (after helper reroute) | **pending** | **pending** |
+| MXFP8 QK + FP8 PV | ✓ (after helper reroute) | **pending** | **pending** |
+
+## Next steps (ordered)
+
+1. **Re-run full bench sweep in all three new modes** with current code to
+   establish numbers for MXFP8 QK + BF16/FP8 PV now that the crash is gone.
+2. **Investigate FP8 PV `mio_throttle=0.88` / `wait=2.74`** on long `d=128`.
+   Memory went down, cycles went up — so the extra work is in issue/scheduling,
+   packing, or pipeline balance. Look at PTX/SASS for the long-d case the same
+   way the Rep-32 vs Rep-64 `LDTM` investigation did.
+3. **Revive the dedicated `gemm_ptx_partial_fp8` helper** (currently bypassed
+   for the generic block-scaled helper). The dedicated one should be faster
+   once the layout mismatch that made it fault is understood — compare FA
+   SFQ/SFK TMA + TMEM plumbing against the working standalone dense
+   `dense_blockscaled_gemm_persistent_prefetch.py --ab_dtype Float8E4M3FN
+   --sf_dtype Float8E8M0FNU --sf_vec_size 32`.
+4. **Verify PTX-helper / idesc agreement** on the new paths (QK block-scaled
+   FP8, PV pure FP8) — the checklist marks this `~`.
+5. **Recheck stride / descriptor assumptions** wherever byte-based spacing
+   differs between BF16, NVFP4 and FP8. Several bugs so far have been from
+   copy-pasted constants (SFP R2S base offset, TMEM u32-column spacing).
+
+## Bottom line
+
+- NVFP4 QK baseline: still the reference; peak 1805 TFLOPS on `(1, 32768, 24, 128)`.
+- NVFP4 QK + pure FP8 PV: functional, numerically clean, but not yet a
+  universal win — long `d=128` still regresses due to execution-side overhead.
+- MXFP8 QK: **was** blocked on `cudaErrorMisalignedAddress`, now unblocked by
+  routing through the generic block-scaled helper; numbers still need to be
+  collected.
+- The two real open questions are:
+  - Is routing through the generic helper costing us perf on MXFP8 QK, and
+    can the dedicated helper be revived?
+  - Why does FP8 PV use more active cycles on long `d=128` despite lower
+    memory traffic?
+
+## 2026-04-15 update — MXFP8 NaN/inf still open
+
+### Bugs diagnosed and fixed
+
+1. `sf_layout_kwargs` only passed `mma_tile_inst_k` for NVFP4 (sf_vec_size 16).
+   MXFP8 `d=64` was failing to compile with a TMA SFQ atom shape mismatch
+   because the helper default (`4`) didn't match the required value (`2`).
+   Fix: always thread the computed `mma_inst_tile_k` through regardless of
+   `sf_vec_size`.
+
+2. Compile-cache collision: `_flash_attn_fwd.compile_cache` keyed without
+   QK ab_dtype / sf_dtype. An NVFP4 compile could land in the slot later
+   looked up for MXFP8 (or vice-versa), returning a kernel whose PTX emitted
+   `mxf4nvf4` when we needed `mxf8f6f4`. Fix: added `_key_qk_ab_dtype` and
+   `_key_sf_dtype` to `compile_key`. Verified post-fix PTX now emits
+   `tcgen05.mma.cta_group::1.kind::mxf8f6f4.block_scale.scale_vec::1X` for
+   MXFP8 and `...kind::mxf4nvf4.block_scale.scale_vec::4X` for NVFP4.
+
+3. Inline-PTX helper `gemm_ptx_partial_fp4` computed per-K SF offset using
+   `find_tmem_tensor_col_offset`, which returns the slice **cosize**, not
+   the per-K offset. So `offset_sfa[k] = 0` for every `k`, meaning every
+   block-scaled MMA inst read SFs from `k=0`. NVFP4 tolerated this (K=1 for
+   our head-dims, or K=2 with scale_vec::4X which is FP-tolerant). MXFP8
+   with K=4 scale_vec::1X amplifies the bug to 1e37 garbage.
+   Fix attempt: refactored the helper to pass each K-slice's
+   `tScaleA[None, None, k].iterator.toint()` as a separate `r` input so the
+   PTX `[tmem_scale_a]` operand sees the right TMEM address per K-iter.
+   NVFP4 max_diff stays `~0.03`, so the refactor preserved correctness, but
+   **MXFP8 is still NaN/inf** — which means the root cause is NOT the
+   per-K SF offset alone.
+
+### Generic `cute.gemm` fallback also fails the same way
+
+Added `sm100_utils.gemm_blockscaled_generic` that mirrors
+`dense_blockscaled_gemm_persistent.py`: build `mma_atom = make_mma_atom(op)`,
+for each k `mma_atom.set(Field.SFA/SFB, tScaleA[...,k].iterator)`, then
+`cute.gemm(mma_atom, acc, tCrA[...,k], tCrB[...,k], acc)`. Wired through
+`FA4_DEBUG_FORCE_GENERIC_MXFP8_QK=1`.
+
+Result on `--qk_mode mxfp8 --debug` (Q=K=V=1.0, SF=1.0):
+MXFP8 output is `1.3e36`, `2.6e36`, ..., NaN — **same as the inline-PTX path**.
+
+This rules out the inline-PTX helper as the bug source. The block-scaled
+MMA is reading SF bytes from uninitialized/garbage SMEM, not the `0x7F`
+bytes we wrote. The bug is upstream — in SFQ/SFK smem layout, TMA partition,
+or S2T copy for `sf_vec_size=32`. CUTLASS's
+`make_smem_layout_sfa` uses the same `BlockScaledBasicChunk` atom for
+`sf_vec_size in {16, 32}`; the modified copy in
+`flash_attn/cute/modified_utils/block_scaled_layout_test.py` is byte-for-byte
+identical to the stock helper. So the layout builder itself is not the
+culprit.
+
+### Hypotheses to chase next
+
+- **TMA partition / box shape for MXFP8**: For MXFP8 `d=128`, the SFQ row
+  has 4 SF bytes (vs 8 for NVFP4). If the TMA `cta_v_map` / multicast is
+  sized for the NVFP4 row count, TMA will load the wrong byte positions
+  into SMEM.
+- **Effective swizzle differs**: `BlockScaledBasicChunk(32)` has the same
+  atom shape as `(16)`, but the `tile_to_shape` over a tile with 4 instead
+  of 8 SF bytes per row could produce a swizzle mismatch.
+- **`mma_inst_tile_k=4` via helper default happens to match MXFP8 d=128**:
+  flush this through one more time. `self.mma_inst_tile_k = 4` (from
+  `128/(256/8) = 4`) matches the helper default, so the shape it produces
+  may not matter. But `sfq_tmem_cols = (128 // 32) * 4 = 16` in Int32
+  cols — need to verify this is correct for sf_vec_size=32.
+- **S2T copy atom width**: the S2T copy that moves SFQ smem → SFQ tmem is
+  sized for `sf_vec_size=16` (128 bits = 16 bytes = 8 SFs). With
+  `sf_vec_size=32`, 16 bytes per row covers fewer M-rows; if the atom is
+  unchanged, S2T could be writing wrong positions.
+
+### State left in the tree
+
+- `gemm_ptx_partial_fp4` non-TS path now passes per-K SF addresses as
+  separate `r` inputs. NVFP4 still correct. MXFP8 still broken — but for a
+  reason upstream of the helper.
+- `gemm_blockscaled_generic` helper present; gated by
+  `FA4_DEBUG_FORCE_GENERIC_MXFP8_QK=1`.
+- `compile_key` includes `_key_qk_ab_dtype` and `_key_sf_dtype`.
+- `sf_layout_kwargs` threads `mma_tile_inst_k` for both sf_vec sizes.
+
+### Status: MXFP8 QK numerical correctness is **NOT** fixed.
+
+Verification matrix update:
+
+| mode | numerical |
+|---|---|
+| MXFP8 QK + BF16 PV | **NaN / 1e37 garbage** (both helper paths) |
+| MXFP8 QK + FP8 PV | not tested (upstream QK broken) |

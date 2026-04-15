@@ -31,6 +31,39 @@ def _mma_inst_kind(op: cute.nvgpu.tcgen05.mma.MmaOp) -> str:
 
 
 @cute.jit
+def gemm_blockscaled_generic(
+    tiled_mma: cute.TiledMma,
+    acc: cute.Tensor,
+    tCrA: cute.Tensor,
+    tCrB: cute.Tensor,
+    tScaleA: cute.Tensor,
+    tScaleB: cute.Tensor,
+    zero_init: bool | Boolean = False,
+    **_unused,
+) -> None:
+    """Reference-style block-scaled MMA matching dense_blockscaled_gemm_persistent.
+
+    Drives `cute.gemm(tiled_mma, ...)` once per K-slice after binding SFA/SFB
+    via `tiled_mma.set(tcgen05.Field.SFA/SFB, iterator)`. Intended as a
+    correctness fallback when the inline-PTX helper `gemm_ptx_partial_fp4`
+    mis-handles per-K SF addressing (e.g. MXFP8 scale_vec::1X).
+    """
+    num_k = const_expr(cute.size(tCrA.shape[2]))
+    mma_atom = cute.make_mma_atom(tiled_mma.op)
+    for k in cutlass.range_constexpr(num_k):
+        mma_atom.set(tcgen05.Field.ACCUMULATE, not zero_init or k != 0)
+        mma_atom.set(tcgen05.Field.SFA, tScaleA[None, None, k].iterator)
+        mma_atom.set(tcgen05.Field.SFB, tScaleB[None, None, k].iterator)
+        cute.gemm(
+            mma_atom,
+            acc,
+            tCrA[None, None, k],
+            tCrB[None, None, k],
+            acc,
+        )
+
+
+@cute.jit
 def gemm_w_idx(
     tiled_mma: cute.TiledMma,
     acc: cute.Tensor,
@@ -751,9 +784,6 @@ def gemm_ptx_partial_fp4(
     offset_a_diff = [offset_a[k] - offset_a[k - 1] for k in range(1, cute.size(tCrA.shape[2]))]
     offset_b = [cute.crd2idx((0, 0, k), tCrB.layout) for k in range(cute.size(tCrB.shape[2]))]
     offset_b_diff = [offset_b[k] - offset_b[k - 1] for k in range(1, cute.size(tCrB.shape[2]))]
-    # Recast scale factor layouts to 32-bit (u32 column units) since PTX [tmem_addr + offset]
-    # expects column offsets, not element offsets. Without recast, FP8 element offsets (e.g. 16)
-    # would be used as column offsets instead of the correct value (e.g. 4 = 16/4).
     scale_A_base_col = tcgen05.find_tmem_tensor_col_offset(tScaleA[None, None, 0])
     scale_B_base_col = tcgen05.find_tmem_tensor_col_offset(tScaleB[None, None, 0])
     offset_sfa = [
@@ -777,21 +807,64 @@ def gemm_ptx_partial_fp4(
     pred_str = "p" if isinstance(zero_init, Boolean) else "0" if zero_init else "1"
     if const_expr(not is_ts):
         assert mbar_ptr is None, "mbar_ptr must be None when a_src is not TMEM"
-        # Compute base addresses for scale factors
-        scale_A_base_addr = tScaleA[None, None, 0].iterator.toint()
-        scale_B_base_addr = tScaleB[None, None, 0].iterator.toint()
+        # Per-K scale-factor addresses. Previously we used a single base address
+        # plus a compile-time `offset_sfa[k]` computed from `find_tmem_tensor_col_offset`,
+        # but that helper returns the slice COSIZE (not the K offset), giving 0
+        # for every K. That silently read SF from k=0 for every MMA — tolerated
+        # by NVFP4 (K=1, so only k=0) but producing 1e37 garbage for MXFP8 (K=4).
+        # Pass the per-K iterator address explicitly so the PTX sees the right
+        # TMEM address (with sf_id bits baked in) for every iteration.
+        num_k = const_expr(cute.size(tCrA.shape[2]))
+        scale_A_addrs = [
+            Int32(cute.arch.make_warp_uniform(tScaleA[None, None, k].iterator.toint())).ir_value()
+            for k in range(num_k)
+        ]
+        scale_B_addrs = [
+            Int32(cute.arch.make_warp_uniform(tScaleB[None, None, k].iterator.toint())).ir_value()
+            for k in range(num_k)
+        ]
         mma_inst_str = const_expr(_mma_inst_kind(op))
+        sfa_op_base = 4
+        sfb_op_base = 4 + num_k
+        input_args = [
+            Int32(cute.arch.make_warp_uniform(smem_desc_start_a_lo)).ir_value(),
+            Int32(cute.arch.make_warp_uniform(smem_desc_start_b_lo)).ir_value(),
+            Int32(not zero_init).ir_value(),
+            Int32(cute.arch.make_warp_uniform(acc_tmem_addr)).ir_value(),
+        ] + scale_A_addrs + scale_B_addrs
+
+        k0_desc_setup = (
+            f"mov.b64 smem_desc_a, {{smem_desc_a_lo_start, smem_desc_a_hi}};\n\t"
+            f"mov.b64 smem_desc_b, {{smem_desc_b_lo_start, smem_desc_b_hi}};\n\t"
+        )
+        def _kk_desc_setup(kk):
+            return (
+                f"add.u32 smem_desc_a_lo, smem_desc_a_lo_start, {hex(offset_a[kk])};\n\t"
+                f"add.u32 smem_desc_b_lo, smem_desc_b_lo_start, {hex(offset_b[kk])};\n\t"
+                f"mov.b64 smem_desc_a, {{smem_desc_a_lo, smem_desc_a_hi}};\n\t"
+                f"mov.b64 smem_desc_b, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
+            )
+        def _mma_k_block(kk):
+            pred = pred_str if kk == 0 else "1"
+            desc_setup = k0_desc_setup if kk == 0 else _kk_desc_setup(kk)
+            return (
+                f"mov.b32 tmem_scale_a, ${sfa_op_base + kk};\n\t"
+                f"mov.b32 tmem_scale_b, ${sfb_op_base + kk};\n\t"
+                f"mov.b32 idesc, {hex(idesc)};\n\t"
+                "and.b32 sf_id_bits, tmem_scale_a, 0xC0000000;\n\t"
+                "shr.u32 sf_id_bits, sf_id_bits, 1;\n\t"
+                "or.b32 idesc, idesc, sf_id_bits;\n\t"
+                "and.b32 sf_id_bits, tmem_scale_b, 0xC0000000;\n\t"
+                "shr.u32 sf_id_bits, sf_id_bits, 26;\n\t"
+                "or.b32 idesc, idesc, sf_id_bits;\n\t"
+                + desc_setup
+                + f"@leader_thread {mma_inst_str} [tmem_acc], smem_desc_a, smem_desc_b, "
+                f"idesc, [tmem_scale_a], [tmem_scale_b], {pred};\n\t"
+            )
+
         llvm.inline_asm(
             None,
-            [
-                # acc.iterator.toint().ir_value(),
-                Int32(cute.arch.make_warp_uniform(smem_desc_start_a_lo)).ir_value(),
-                Int32(cute.arch.make_warp_uniform(smem_desc_start_b_lo)).ir_value(),
-                Int32(not zero_init).ir_value(),
-                Int32(cute.arch.make_warp_uniform(acc_tmem_addr)).ir_value(),
-                Int32(cute.arch.make_warp_uniform(scale_A_base_addr)).ir_value(),
-                Int32(cute.arch.make_warp_uniform(scale_B_base_addr)).ir_value(),
-            ],
+            input_args,
             "{\n\t"
             ".reg .pred leader_thread;\n\t"
             ".reg .pred p;\n\t"
@@ -805,40 +878,15 @@ def gemm_ptx_partial_fp4(
             ".reg .b32 smem_desc_a_hi, smem_desc_b_hi;\n\t"
             ".reg .b64 smem_desc_a, smem_desc_b;\n\t"
             "elect.sync _|leader_thread, -1;\n\t"
-            f"mov.b32 idesc, {hex(idesc)};\n\t"
-            # f"mov.b32 tmem_acc, {hex(acc_tmem_addr)};\n\t"
             f"mov.b32 tmem_acc, $3;\n\t"
-            f"mov.b32 tmem_scale_a, $4;\n\t"
-            f"mov.b32 tmem_scale_b, $5;\n\t"
-            "and.b32 sf_id_bits, tmem_scale_a, 0xC0000000;\n\t"
-            "shr.u32 sf_id_bits, sf_id_bits, 1;\n\t"
-            "or.b32 idesc, idesc, sf_id_bits;\n\t"
-            "and.b32 sf_id_bits, tmem_scale_b, 0xC0000000;\n\t"
-            "shr.u32 sf_id_bits, sf_id_bits, 26;\n\t"
-            "or.b32 idesc, idesc, sf_id_bits;\n\t"
             "mov.b32 smem_desc_a_lo_start, $0;\n\t"
             "mov.b32 smem_desc_b_lo_start, $1;\n\t"
             f"mov.b32 smem_desc_a_hi, {hex(smem_desc_a_hi)};\n\t"
             f"mov.b32 smem_desc_b_hi, {hex(smem_desc_b_hi)};\n\t"
-            f"mov.b64 smem_desc_a, {{smem_desc_a_lo_start, smem_desc_a_hi}};\n\t"
-            f"mov.b64 smem_desc_b, {{smem_desc_b_lo_start, smem_desc_b_hi}};\n\t"
             "setp.ne.b32 p, $2, 0;\n\t"
-            f"@leader_thread {mma_inst_str} [tmem_acc], smem_desc_a, smem_desc_b, idesc, [tmem_scale_a], [tmem_scale_b], {pred_str};\n\t"
-            + "".join(
-                (
-                    # f"add.u32 smem_desc_a_lo, smem_desc_a_lo, {hex(offset_a_diff[k - 1])};\n\t"
-                    # f"add.u32 smem_desc_b_lo, smem_desc_b_lo, {hex(offset_b_diff[k - 1])};\n\t"
-                    f"add.u32 smem_desc_a_lo, smem_desc_a_lo_start, {hex(offset_a[k])};\n\t"
-                    f"add.u32 smem_desc_b_lo, smem_desc_b_lo_start, {hex(offset_b[k])};\n\t"
-                    f"mov.b64 smem_desc_a, {{smem_desc_a_lo, smem_desc_a_hi}};\n\t"
-                    f"mov.b64 smem_desc_b, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
-                    f"@leader_thread {mma_inst_str} [tmem_acc], smem_desc_a, smem_desc_b, idesc, [tmem_scale_a + {hex(offset_sfa[k])}], [tmem_scale_b + {hex(offset_sfb[k])}], 1;\n\t"
-                )
-                for k in range(1, cute.size(tCrA.shape[2]))
-            )
+            + "".join(_mma_k_block(k) for k in range(num_k))
             + "}\n",
-            # "r,r,r",
-            "r,r,r,r,r,r",
+            ",".join(["r"] * len(input_args)),
             has_side_effects=True,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,

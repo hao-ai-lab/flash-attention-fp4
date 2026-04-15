@@ -578,11 +578,10 @@ class FlashAttentionForwardSm100:
         sfv_smem_layout_staged = None
         sfp_smem_layout_staged = None
         # # (((Atom_Inst_M, Rest_M),(Atom_Inst_K, Rest_K)), MMA_M, MMA_K, STAGE)
-        sf_layout_kwargs = (
-            {"mma_tile_inst_k": self.mma_inst_tile_k}
-            if self.sf_vec_size == 16
-            else {}
-        )
+        # Always thread our computed mma_inst_tile_k through. Default is 4 in the
+        # helper, which only happens to match MXFP8 d=128. MXFP8 d=64 needs 2 and
+        # was failing to compile via TMA SFQ atom shape mismatch.
+        sf_layout_kwargs = {"mma_tile_inst_k": self.mma_inst_tile_k}
         sfq_smem_layout_staged = make_smem_layout_sfa(
             tiled_mma_qk,
             self.mma_tiler_qk,
@@ -2029,26 +2028,42 @@ class FlashAttentionForwardSm100:
 
         qk_mma_op, pv_mma_op = tiled_mma_qk.op, tiled_mma_pv.op
         if const_expr(self.quant_qk):
-            if const_expr(
-                qk_mma_op.a_dtype in (Float8E4M3FN, Float8E5M2)
-                and not self.debug_force_generic_mxfp8_qk
-            ):
-                gemm_qk_helper = sm100_utils.gemm_ptx_partial_fp8
+            if const_expr(self.debug_force_generic_mxfp8_qk):
+                # Generic cute.gemm fallback for block-scaled QK. Matches the
+                # dense_blockscaled reference path and sidesteps per-K SF address
+                # bugs in the inline-PTX helper. MXFP8 scale_vec::1X produces
+                # NaN/inf via gemm_ptx_partial_fp4; this path is a correctness
+                # workaround.
+                gemm_Si = [
+                    partial(
+                        sm100_utils.gemm_blockscaled_generic,
+                        tiled_mma_qk,
+                        tStSs[stage],
+                        tSrQs[stage],
+                        tScaleA=tCtSFQs[stage],
+                        tScaleB=tCtSFKs[stage],
+                        zero_init=True,
+                    )
+                    for stage in range(self.q_stage)
+                ]
             else:
-                gemm_qk_helper = sm100_utils.gemm_ptx_partial_fp4
-            gemm_Si = [
-                partial(
-                    gemm_qk_helper,
-                    qk_mma_op,
-                    self.tmem_s_offset[stage],
-                    tSrQs[stage],
-                    sA=sQ[None, None, None, stage],
-                    zero_init=True,
-                    tScaleA=tCtSFQs[stage],
-                    tScaleB=tCtSFKs[stage],
-                )
-                for stage in range(self.q_stage)
-            ]
+                if const_expr(qk_mma_op.a_dtype in (Float8E4M3FN, Float8E5M2)):
+                    gemm_qk_helper = sm100_utils.gemm_ptx_partial_fp8
+                else:
+                    gemm_qk_helper = sm100_utils.gemm_ptx_partial_fp4
+                gemm_Si = [
+                    partial(
+                        gemm_qk_helper,
+                        qk_mma_op,
+                        self.tmem_s_offset[stage],
+                        tSrQs[stage],
+                        sA=sQ[None, None, None, stage],
+                        zero_init=True,
+                        tScaleA=tCtSFQs[stage],
+                        tScaleB=tCtSFKs[stage],
+                    )
+                    for stage in range(self.q_stage)
+                ]
         else:
             gemm_Si = [
                 partial(
