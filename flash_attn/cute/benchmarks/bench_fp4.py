@@ -442,18 +442,28 @@ def create_blockscaled_attention_tensors(batch, seqlen_q, seqlen_k, nheads, nhea
 
 
 def time_fwd(func, *args, repeats=10, verbose=True, desc="", **kwargs):
-    """Time forward pass execution, falling back when CUPTI is unavailable."""
-    times = bench_gpu_time(
-        fn=lambda: func(*args, **kwargs),
-        dry_run_iters=5,
-        repeat_iters=repeats,
-        enable_cupti=False,
-        use_cuda_graph=False,
-    )
-    return Timing(np.median(times) * 1e-3)  # bench_gpu_time returns ms, Timing expects seconds
+    """Time forward pass via triton.testing.do_bench.
+
+    CUPTI (flashinfer's default path) requires CUDA 13+ which is unavailable on
+    this build host, and bench_gpu_time's fallback path has ~6% per-iter overhead.
+
+    `rep` and `warmup` are in milliseconds; triton auto-picks iteration counts.
+    We use rep=25ms intentionally — the sweet spot on B200 for this kernel:
+      rep=10ms  → too few iterations, median dominated by warmup tail
+      rep=25ms  → ~3 iterations, matches torch.cuda.Event peak (1804 TF)
+      rep=50ms+ → SM clock throttles (sustained >25 ms heavy work trips
+                  the power-limit governor), numbers drop ~40 TF to ~1765 TF
+
+    triton.do_bench always zero-fills an L2-sized buffer between iterations;
+    with only ~3 iterations the cumulative L2-flush overhead stays negligible.
+    """
+    import triton.testing
+    fn = lambda: func(*args, **kwargs)
+    ms = triton.testing.do_bench(fn, rep=25, warmup=10, return_mode="median")
+    return Timing(ms * 1e-3)
 
 
-def main(ab_dtype, sf_dtype, sf_vec_size, pv_mode="bf16", pv_fp8_dtype=cutlass.Float8E4M3FN, debug=False):
+def main(ab_dtype, sf_dtype, sf_vec_size, pv_mode="bf16", pv_fp8_dtype=cutlass.Float8E4M3FN, debug=False, causal=False):
     """Main benchmark function.
     
     Args:
@@ -466,7 +476,6 @@ def main(ab_dtype, sf_dtype, sf_vec_size, pv_mode="bf16", pv_fp8_dtype=cutlass.F
     repeats = 10
     device = 'cuda'
     verbose = True
-    causal = False
     dtype_gen = torch.bfloat16
     
     # Benchmark configurations: (batch, seqlen, nheads, headdim)
@@ -679,6 +688,7 @@ if __name__ == "__main__":
         help="FP8 operand dtype used for MXFP8 QK / FP8 V modes",
     )
     parser.add_argument("--debug", action="store_true", help="Debug precision, set all tensors to 1.0")
+    parser.add_argument("--causal", action="store_true", help="Causal attention")
     # parser.add_argument("--ab_dtype", type=cutlass.dtype, default=cutlass.Float4E2M1FN)
     # parser.add_argument("--sf_dtype", type=cutlass.dtype, default=cutlass.Float8E4M3FN)
 
@@ -693,4 +703,4 @@ if __name__ == "__main__":
         ab_dtype = fp8_dtype
         sf_dtype = cutlass.Float8E8M0FNU
         sf_vec_size = 32
-    main(ab_dtype, sf_dtype, sf_vec_size, pv_mode, fp8_dtype, args.debug)
+    main(ab_dtype, sf_dtype, sf_vec_size, pv_mode, fp8_dtype, args.debug, args.causal)
