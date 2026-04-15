@@ -900,7 +900,10 @@ class FlashAttentionForwardSm100:
             mCuSeqlensQ=mCuSeqlensQ,
             mSeqUsedQ=mSeqUsedQ,
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
-            element_size=self.k_dtype.width // 8,
+            # For sub-byte dtypes (FP4), width=4 rounds to 0 under integer division;
+            # clamp so size_one_head * element_size in the scheduler's L2 swizzle calc
+            # doesn't become 0 and divide by zero in the else branch of the ifexp.
+            element_size=max(self.k_dtype.width // 8, 1),
             is_persistent=self.is_persistent,
             lpt=self.is_causal or self.is_local,
             is_split_kv=self.is_split_kv,

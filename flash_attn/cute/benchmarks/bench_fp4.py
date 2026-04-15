@@ -426,18 +426,29 @@ def create_fp4_attention_tensors(batch, seqlen_q, seqlen_k, nheads, nheads_kv, h
 
 
 def time_fwd(func, *args, repeats=10, verbose=True, desc="", **kwargs):
-    """Time forward pass execution using CUPTI-based GPU timing."""
-    times = bench_gpu_time(
-        fn=lambda: func(*args, **kwargs),
-        dry_run_iters=5,
-        repeat_iters=repeats,
-        enable_cupti=True,
-        use_cuda_graph=False,
-    )
-    return Timing(np.median(times) * 1e-3)  # bench_gpu_time returns ms, Timing expects seconds
+    """Time forward pass via torch.cuda.Event (CUPTI needs CUDA 13+, unavailable here).
+
+    Using Events directly gives tighter timing than flashinfer's bench_gpu_time
+    fallback path — e.g. on (1, 32768, 24, 128) QK-only FP4 this reports ~1803
+    TFLOPS vs ~1702 via bench_gpu_time(enable_cupti=False) due to lower per-iter
+    overhead.
+    """
+    # Warmup
+    for _ in range(5):
+        func(*args, **kwargs)
+    torch.cuda.synchronize()
+    starts = [torch.cuda.Event(enable_timing=True) for _ in range(repeats)]
+    ends = [torch.cuda.Event(enable_timing=True) for _ in range(repeats)]
+    for i in range(repeats):
+        starts[i].record()
+        func(*args, **kwargs)
+        ends[i].record()
+    torch.cuda.synchronize()
+    times_ms = [starts[i].elapsed_time(ends[i]) for i in range(repeats)]
+    return Timing(np.median(times_ms) * 1e-3)
 
 
-def main(ab_dtype, sf_dtype, sf_vec_size, quant_v=False, debug=False):
+def main(ab_dtype, sf_dtype, sf_vec_size, quant_v=False, debug=False, causal=False):
     """Main benchmark function.
     
     Args:
@@ -450,7 +461,6 @@ def main(ab_dtype, sf_dtype, sf_vec_size, quant_v=False, debug=False):
     repeats = 10
     device = 'cuda'
     verbose = True
-    causal = False
     dtype_gen = torch.bfloat16
     
     # Benchmark configurations: (batch, seqlen, nheads, headdim)
@@ -642,6 +652,7 @@ if __name__ == "__main__":
         help="Quantize V to FP4 (default: False, only QK are quantized)"
     )
     parser.add_argument("--debug", action="store_true", help="Debug precision, set all tensors to 1.0")
+    parser.add_argument("--causal", action="store_true", help="Causal attention")
     # parser.add_argument("--ab_dtype", type=cutlass.dtype, default=cutlass.Float4E2M1FN)
     # parser.add_argument("--sf_dtype", type=cutlass.dtype, default=cutlass.Float8E4M3FN)
 
@@ -649,5 +660,5 @@ if __name__ == "__main__":
     ab_dtype = cutlass.Float4E2M1FN
     sf_dtype = cutlass.Float8E4M3FN
     sf_vec_size = 16
-    main(ab_dtype, sf_dtype, sf_vec_size, args.quant_v, args.debug)
+    main(ab_dtype, sf_dtype, sf_vec_size, args.quant_v, args.debug, args.causal)
 
