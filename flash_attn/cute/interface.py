@@ -327,13 +327,41 @@ def _flash_attn_fwd(
         if not use_fp4:
             k_dtype = k.element_type if isinstance(k, cute.Tensor) else k.dtype
             v_dtype = v.element_type if isinstance(v, cute.Tensor) else v.dtype
-            assert q_dtype in [cutlass.Float16, cutlass.BFloat16], "inputs must be float16 or bfloat16"
-            assert q_dtype == k_dtype == v_dtype, "inputs must have the same dtype"
+            allowed_q_dtypes = [cutlass.Float16, cutlass.BFloat16]
+            if mSFQ is not None:
+                allowed_q_dtypes.extend([cutlass.Float8E4M3FN, cutlass.Float8E5M2])
+            assert q_dtype in allowed_q_dtypes, (
+                "inputs must be float16/bfloat16, or FP8 when block-scaled QK scale factors are provided"
+            )
+            assert q_dtype == k_dtype, "Q and K must have the same dtype"
+            if mSFQ is None:
+                assert q_dtype == v_dtype, "inputs must have the same dtype"
+            else:
+                assert v_dtype in [
+                    cutlass.Float16,
+                    cutlass.BFloat16,
+                    cutlass.Float8E4M3FN,
+                    cutlass.Float8E5M2,
+                ], "V must be BF16/FP16 or FP8 when block-scaled QK is enabled"
     else:
         use_fp4 = is_nvfp4_dtype(q.dtype)
         if not use_fp4:
-            assert q.dtype in [torch.float16, torch.bfloat16], "inputs must be float16 or bfloat16"
-            assert q.dtype == k.dtype == v.dtype, "inputs must have the same dtype"
+            allowed_q_dtypes = [torch.float16, torch.bfloat16]
+            if mSFQ is not None:
+                allowed_q_dtypes.extend([torch.float8_e4m3fn, torch.float8_e5m2])
+            assert q.dtype in allowed_q_dtypes, (
+                "inputs must be float16/bfloat16, or FP8 when block-scaled QK scale factors are provided"
+            )
+            assert q.dtype == k.dtype, "Q and K must have the same dtype"
+            if mSFQ is None:
+                assert q.dtype == v.dtype, "inputs must have the same dtype"
+            else:
+                assert v.dtype in [
+                    torch.float16,
+                    torch.bfloat16,
+                    torch.float8_e4m3fn,
+                    torch.float8_e5m2,
+                ], "V must be BF16/FP16 or FP8 when block-scaled QK is enabled"
     
     # Store is_cute_q for later use
     for t in [cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k]:
@@ -386,16 +414,18 @@ def _flash_attn_fwd(
     if pack_gqa is None:
         pack_gqa = qhead_per_kvhead > 1
 
+    use_blockscaled_impl = use_fp4 or mSFQ is not None or force_fp4_impl
+
     # Handle both torch and CUTE tensors for dtype and device
     if is_cute_q:
         # For CUTE tensors, we need to get the torch dtype for output allocation
-        if q_dtype == cutlass.Float4E2M1FN:
+        if q_dtype == cutlass.Float4E2M1FN or use_blockscaled_impl:
             out_torch_dtype = torch.bfloat16
         else:
             out_torch_dtype = cute2torch_dtype_map[q_dtype]
         device = torch.device('cuda')  # CUTE tensors are always on CUDA
     else:
-        out_torch_dtype = torch.bfloat16 if use_fp4 else q.dtype
+        out_torch_dtype = torch.bfloat16 if use_blockscaled_impl else q.dtype
         device = q.device
     q_batch_seqlen_shape = (batch_size, seqlen_q) if cu_seqlens_q is None else (total_q,)
     lse_shape = (batch_size, num_head, seqlen_q) if cu_seqlens_q is None else (num_head, total_q)
@@ -580,6 +610,7 @@ def _flash_attn_fwd(
         compute_capability,
         page_size not in [None, 128],  # paged KV non-TMA
         use_fp4,  # Include FP4 flag in compile key
+        mSFQ is not None,  # Include block-scaled path activation
         mSFQ is not None,  # Include scale factor flags
         mSFK is not None,
         mSFV is not None,
@@ -635,12 +666,20 @@ def _flash_attn_fwd(
         # Extract scale factor dtype and vec_size before converting tensors
         sf_dtype = None
         sf_vec_size = 16  # Default for FP4
-        if use_fp4 and mSFQ is not None:
+        if use_blockscaled_impl and mSFQ is not None:
             if isinstance(mSFQ, cute.Tensor):
                 sf_dtype = mSFQ.element_type
             else:
                 # Convert torch dtype to CUTLASS dtype
                 sf_dtype = torch2cute_dtype_map.get(mSFQ.dtype, cutlass.Float8E4M3FN)
+                if (
+                    sf_dtype == cutlass.Float8E4M3FN
+                    and qk_ab_dtype in {cutlass.Float8E4M3FN, cutlass.Float8E5M2}
+                    and mSFQ.dtype not in {torch.float8_e4m3fn, torch.float8_e5m2}
+                ):
+                    # Float8E8M0FNU scale tensors currently round-trip through the benchmark
+                    # as byte-backed torch tensors, so infer MXFP8 scale metadata from Q/K dtype.
+                    sf_dtype = cutlass.Float8E8M0FNU
             # Set default sf_vec_size based on sf_dtype
             if sf_dtype == cutlass.Float8E4M3FN:
                 sf_vec_size = 16
@@ -664,9 +703,9 @@ def _flash_attn_fwd(
         else:
             v_tensor = to_cute_tensor(v)
         o_tensor = to_cute_tensor(out if not is_split_kv else out_partial)
-        # Pass through scale factor tensors if using FP4 (tvm-ffi handles conversion)
+        # Pass through scale factor tensors when using the SM100 block-scaled kernel.
         mSFQ_tensor = mSFK_tensor = mSFV_tensor = None
-        if use_fp4:
+        if use_blockscaled_impl:
             mSFQ_tensor = to_cute_tensor(mSFQ, leading_dim=3, assumed_align=16) if mSFQ is not None else None
             mSFK_tensor = to_cute_tensor(mSFK, leading_dim=3, assumed_align=16) if mSFK is not None else None
             mSFV_tensor = to_cute_tensor(mSFV, leading_dim=3, assumed_align=16) if mSFV is not None else None
@@ -721,9 +760,8 @@ def _flash_attn_fwd(
                 has_aux_tensors=aux_tensors is not None,
             )
         elif compute_capability == 10:
-            if use_fp4 or force_fp4_impl:
-                # Use FP4 kernel with scale factors
-                # Use extracted sf_dtype if available, otherwise default
+            if use_blockscaled_impl:
+                # Use the SM100 block-scaled attention kernel for NVFP4 / MXFP8 QK.
                 if sf_dtype is None:
                     sf_dtype = cutlass.Float8E4M3FN  # Default scale factor dtype for FP4
                 # Validate dtype and scale factor combinations
@@ -807,11 +845,11 @@ def _flash_attn_fwd(
             sparse_tensors,
             cute_aux_tensors,
         ]
-        # Add scale factor tensors if using FP4
-        if use_fp4 or force_fp4_impl:
+        # Add scale factor tensors if using the block-scaled SM100 kernel
+        if use_blockscaled_impl:
             compile_args.extend([mSFQ_tensor, mSFK_tensor, mSFV_tensor])
-        # Add q/k shapes for FP4 kernel (it always builds tensors from pointer + shape)
-        if use_fp4 or force_fp4_impl:
+        # Add q/k shapes for the block-scaled kernel (it always builds tensors from pointer + shape)
+        if use_blockscaled_impl:
             if fp4_qk:
                 sym_q_shape = tuple(cutlass.Int32(0) for _ in q_ptr_shape)
                 sym_k_shape = tuple(cutlass.Int32(0) for _ in k_ptr_shape)
@@ -825,7 +863,6 @@ def _flash_attn_fwd(
         _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
             *compile_args,
             options="--enable-tvm-ffi",
-            # options="--ptxas-options '-g-tmem-access-check'"
         )
         # dump_kernel_attributes(_flash_attn_fwd.compile_cache[compile_key])
 
@@ -876,11 +913,11 @@ def _flash_attn_fwd(
         aux_tensors,
     ]
 
-    # Add scale factor tensors if using FP4
-    if use_fp4 or force_fp4_impl:
+    # Add scale factor tensors if using the block-scaled SM100 kernel
+    if use_blockscaled_impl:
         call_args.extend([mSFQ, mSFK, mSFV])
-    # Add q/k shapes for FP4 kernel
-    if use_fp4 or force_fp4_impl:
+    # Add q/k shapes for the block-scaled kernel
+    if use_blockscaled_impl:
         call_args.extend([q_ptr_shape, k_ptr_shape])
         if fp4_v:
             call_args.append(v_ptr_shape)

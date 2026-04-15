@@ -12,6 +12,24 @@ import flash_attn.cute.mma_sm100_desc as sm100_desc
 from flash_attn.cute.utils import parse_swizzle_from_pointer
 
 
+def _is_pure_fp8_mma(op: cute.nvgpu.tcgen05.mma.MmaOp) -> bool:
+    return (
+        not hasattr(op, "sf_dtype")
+        and op.a_dtype in (cutlass.Float8E4M3FN, cutlass.Float8E5M2)
+        and op.b_dtype in (cutlass.Float8E4M3FN, cutlass.Float8E5M2)
+    )
+
+
+def _mma_inst_kind(op: cute.nvgpu.tcgen05.mma.MmaOp) -> str:
+    if hasattr(op, "sf_dtype"):
+        if op.a_dtype is cutlass.Float4E2M1FN:
+            return "tcgen05.mma.cta_group::1.kind::mxf4nvf4.block_scale.scale_vec::4X"
+        return "tcgen05.mma.cta_group::1.kind::mxf8f6f4.block_scale.scale_vec::1X"
+    if _is_pure_fp8_mma(op):
+        return "tcgen05.mma.cta_group::1.kind::f8f6f4"
+    return "tcgen05.mma.cta_group::1.kind::f16"
+
+
 @cute.jit
 def gemm_w_idx(
     tiled_mma: cute.TiledMma,
@@ -431,57 +449,105 @@ def gemm_ptx_partial(
         smem_desc_base_b_lo | sm100_desc.make_smem_desc_start_addr(sB[None, None, 0].iterator)
     )
     pred_str = "p" if isinstance(zero_init, Boolean) else "0" if zero_init else "1"
+    use_fp8_masks = False
+    mma_inst_str = const_expr(_mma_inst_kind(op))
+    mask = [Int32(0)] * 4
     if const_expr(not is_ts):
         assert mbar_ptr is None, "mbar_ptr must be None when a_src is not TMEM"
-        llvm.inline_asm(
-            None,
-            [
-                # acc.iterator.toint().ir_value(),
-                Int32(cute.arch.make_warp_uniform(smem_desc_start_a_lo)).ir_value(),
-                Int32(cute.arch.make_warp_uniform(smem_desc_start_b_lo)).ir_value(),
-                Int32(not zero_init).ir_value(),
-                Int32(cute.arch.make_warp_uniform(acc_tmem_addr)).ir_value(),
-            ],
-            "{\n\t"
-            ".reg .pred leader_thread;\n\t"
-            ".reg .pred p;\n\t"
-            ".reg .b32 idesc;\n\t"
-            ".reg .b32 tmem_acc;\n\t"
-            ".reg .b32 smem_desc_a_lo_start, smem_desc_b_lo_start;\n\t"
-            ".reg .b32 smem_desc_a_lo, smem_desc_b_lo;\n\t"
-            ".reg .b32 smem_desc_a_hi, smem_desc_b_hi;\n\t"
-            ".reg .b64 smem_desc_a, smem_desc_b;\n\t"
-            "elect.sync _|leader_thread, -1;\n\t"
-            f"mov.b32 idesc, {hex(idesc)};\n\t"
-            # f"mov.b32 tmem_acc, {hex(acc_tmem_addr)};\n\t"
-            f"mov.b32 tmem_acc, $3;\n\t"
-            "mov.b32 smem_desc_a_lo_start, $0;\n\t"
-            "mov.b32 smem_desc_b_lo_start, $1;\n\t"
-            f"mov.b32 smem_desc_a_hi, {hex(smem_desc_a_hi)};\n\t"
-            f"mov.b32 smem_desc_b_hi, {hex(smem_desc_b_hi)};\n\t"
-            f"mov.b64 smem_desc_a, {{smem_desc_a_lo_start, smem_desc_a_hi}};\n\t"
-            f"mov.b64 smem_desc_b, {{smem_desc_b_lo_start, smem_desc_b_hi}};\n\t"
-            "setp.ne.b32 p, $2, 0;\n\t"
-            f"@leader_thread tcgen05.mma.cta_group::1.kind::f16 [tmem_acc], smem_desc_a, smem_desc_b, idesc, {pred_str};\n\t"
-            + "".join(
-                (
-                    # f"add.u32 smem_desc_a_lo, smem_desc_a_lo, {hex(offset_a_diff[k - 1])};\n\t"
-                    # f"add.u32 smem_desc_b_lo, smem_desc_b_lo, {hex(offset_b_diff[k - 1])};\n\t"
-                    f"add.u32 smem_desc_a_lo, smem_desc_a_lo_start, {hex(offset_a[k])};\n\t"
-                    f"add.u32 smem_desc_b_lo, smem_desc_b_lo_start, {hex(offset_b[k])};\n\t"
-                    f"mov.b64 smem_desc_a, {{smem_desc_a_lo, smem_desc_a_hi}};\n\t"
-                    f"mov.b64 smem_desc_b, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
-                    f"@leader_thread tcgen05.mma.cta_group::1.kind::f16 [tmem_acc], smem_desc_a, smem_desc_b, idesc, 1;\n\t"
+        if const_expr(use_fp8_masks):
+            llvm.inline_asm(
+                None,
+                [
+                    Int32(cute.arch.make_warp_uniform(smem_desc_start_a_lo)).ir_value(),
+                    Int32(cute.arch.make_warp_uniform(smem_desc_start_b_lo)).ir_value(),
+                    Int32(not zero_init).ir_value(),
+                    Int32(cute.arch.make_warp_uniform(acc_tmem_addr)).ir_value(),
+                    mask[0].ir_value(),
+                    mask[1].ir_value(),
+                    mask[2].ir_value(),
+                    mask[3].ir_value(),
+                ],
+                "{\n\t"
+                ".reg .pred leader_thread;\n\t"
+                ".reg .pred p;\n\t"
+                ".reg .b32 idesc;\n\t"
+                ".reg .b32 tmem_acc;\n\t"
+                ".reg .b32 smem_desc_a_lo_start, smem_desc_b_lo_start;\n\t"
+                ".reg .b32 smem_desc_a_lo, smem_desc_b_lo;\n\t"
+                ".reg .b32 smem_desc_a_hi, smem_desc_b_hi;\n\t"
+                ".reg .b64 smem_desc_a, smem_desc_b;\n\t"
+                "elect.sync _|leader_thread, -1;\n\t"
+                f"mov.b32 idesc, {hex(idesc)};\n\t"
+                f"mov.b32 tmem_acc, $3;\n\t"
+                "mov.b32 smem_desc_a_lo_start, $0;\n\t"
+                "mov.b32 smem_desc_b_lo_start, $1;\n\t"
+                f"mov.b32 smem_desc_a_hi, {hex(smem_desc_a_hi)};\n\t"
+                f"mov.b32 smem_desc_b_hi, {hex(smem_desc_b_hi)};\n\t"
+                f"mov.b64 smem_desc_a, {{smem_desc_a_lo_start, smem_desc_a_hi}};\n\t"
+                f"mov.b64 smem_desc_b, {{smem_desc_b_lo_start, smem_desc_b_hi}};\n\t"
+                "setp.ne.b32 p, $2, 0;\n\t"
+                f"@leader_thread {mma_inst_str} [tmem_acc], smem_desc_a, smem_desc_b, idesc, {{$4, $5, $6, $7}}, {pred_str};\n\t"
+                + "".join(
+                    (
+                        f"add.u32 smem_desc_a_lo, smem_desc_a_lo_start, {hex(offset_a[k])};\n\t"
+                        f"add.u32 smem_desc_b_lo, smem_desc_b_lo_start, {hex(offset_b[k])};\n\t"
+                        f"mov.b64 smem_desc_a, {{smem_desc_a_lo, smem_desc_a_hi}};\n\t"
+                        f"mov.b64 smem_desc_b, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
+                        f"@leader_thread {mma_inst_str} [tmem_acc], smem_desc_a, smem_desc_b, idesc, {{$4, $5, $6, $7}}, 1;\n\t"
+                    )
+                    for k in range(1, cute.size(tCrA.shape[2]))
                 )
-                for k in range(1, cute.size(tCrA.shape[2]))
+                + "}\n",
+                "r,r,r,r,r,r,r,r",
+                has_side_effects=True,
+                is_align_stack=False,
+                asm_dialect=llvm.AsmDialect.AD_ATT,
             )
-            + "}\n",
-            # "r,r,r",
-            "r,r,r,r",
-            has_side_effects=True,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
+        else:
+            llvm.inline_asm(
+                None,
+                [
+                    Int32(cute.arch.make_warp_uniform(smem_desc_start_a_lo)).ir_value(),
+                    Int32(cute.arch.make_warp_uniform(smem_desc_start_b_lo)).ir_value(),
+                    Int32(not zero_init).ir_value(),
+                    Int32(cute.arch.make_warp_uniform(acc_tmem_addr)).ir_value(),
+                ],
+                "{\n\t"
+                ".reg .pred leader_thread;\n\t"
+                ".reg .pred p;\n\t"
+                ".reg .b32 idesc;\n\t"
+                ".reg .b32 tmem_acc;\n\t"
+                ".reg .b32 smem_desc_a_lo_start, smem_desc_b_lo_start;\n\t"
+                ".reg .b32 smem_desc_a_lo, smem_desc_b_lo;\n\t"
+                ".reg .b32 smem_desc_a_hi, smem_desc_b_hi;\n\t"
+                ".reg .b64 smem_desc_a, smem_desc_b;\n\t"
+                "elect.sync _|leader_thread, -1;\n\t"
+                f"mov.b32 idesc, {hex(idesc)};\n\t"
+                f"mov.b32 tmem_acc, $3;\n\t"
+                "mov.b32 smem_desc_a_lo_start, $0;\n\t"
+                "mov.b32 smem_desc_b_lo_start, $1;\n\t"
+                f"mov.b32 smem_desc_a_hi, {hex(smem_desc_a_hi)};\n\t"
+                f"mov.b32 smem_desc_b_hi, {hex(smem_desc_b_hi)};\n\t"
+                f"mov.b64 smem_desc_a, {{smem_desc_a_lo_start, smem_desc_a_hi}};\n\t"
+                f"mov.b64 smem_desc_b, {{smem_desc_b_lo_start, smem_desc_b_hi}};\n\t"
+                "setp.ne.b32 p, $2, 0;\n\t"
+                f"@leader_thread {mma_inst_str} [tmem_acc], smem_desc_a, smem_desc_b, idesc, {pred_str};\n\t"
+                + "".join(
+                    (
+                        f"add.u32 smem_desc_a_lo, smem_desc_a_lo_start, {hex(offset_a[k])};\n\t"
+                        f"add.u32 smem_desc_b_lo, smem_desc_b_lo_start, {hex(offset_b[k])};\n\t"
+                        f"mov.b64 smem_desc_a, {{smem_desc_a_lo, smem_desc_a_hi}};\n\t"
+                        f"mov.b64 smem_desc_b, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
+                        f"@leader_thread {mma_inst_str} [tmem_acc], smem_desc_a, smem_desc_b, idesc, 1;\n\t"
+                    )
+                    for k in range(1, cute.size(tCrA.shape[2]))
+                )
+                + "}\n",
+                "r,r,r,r",
+                has_side_effects=True,
+                is_align_stack=False,
+                asm_dialect=llvm.AsmDialect.AD_ATT,
+            )
     else:
         # For TS gemm, somehow tCrA.iterator.toint() returns 0 no matter what, so we need to
         # explicitly pass in the tA_addr for correctness.
@@ -507,64 +573,118 @@ def gemm_ptx_partial(
             )
         else:
             mbar_wait_str = ""
-        llvm.inline_asm(
-            None,
-            input_args,
-            "{\n\t"
-            ".reg .pred leader_thread;\n\t"
-            ".reg .pred p;\n\t"
-            ".reg .b32 idesc;\n\t"
-            ".reg .b32 tmem_acc;\n\t"
-            ".reg .b32 tmem_a;\n\t"
-            ".reg .b32 smem_desc_b_lo_start;\n\t"
-            ".reg .b32 smem_desc_b_lo;\n\t"
-            ".reg .b32 smem_desc_b_hi;\n\t"
-            ".reg .b64 smem_desc_b;\n\t"
-            "elect.sync _|leader_thread, -1;\n\t"
-            f"mov.b32 idesc, {hex(idesc)};\n\t"
-            # f"mov.b32 tmem_acc, {hex(acc_tmem_addr)};\n\t"
-            f"mov.b32 tmem_acc, $3;\n\t"
-            f"mov.b32 tmem_a, $0;\n\t"
-            f"mov.b32 smem_desc_b_lo_start, $1;\n\t"
-            f"mov.b32 smem_desc_b_hi, {hex(smem_desc_b_hi)};\n\t"
-            f"mov.b64 smem_desc_b, {{smem_desc_b_lo_start, smem_desc_b_hi}};\n\t"
-            "setp.ne.b32 p, $2, 0;\n\t"
-            f"@leader_thread tcgen05.mma.cta_group::1.kind::f16 [tmem_acc], [tmem_a], smem_desc_b, idesc, {pred_str};\n\t"
-            + "".join(
-                (
-                    # f"add.u32 tmem_a, tmem_a, {hex(offset_a_diff[k - 1])};\n\t"
-                    # f"add.u32 smem_desc_b_lo, smem_desc_b_lo, {hex(offset_b_diff[k - 1])};\n\t"
-                    f"add.u32 smem_desc_b_lo, smem_desc_b_lo_start, {hex(offset_b[k])};\n\t"
-                    f"mov.b64 smem_desc_b, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
-                    # f"@leader_thread tcgen05.mma.cta_group::1.kind::f16 [tmem_acc], [tmem_a], smem_desc_b, idesc, 1;\n\t"
-                    f"@leader_thread tcgen05.mma.cta_group::1.kind::f16 [tmem_acc], [tmem_a + {hex(offset_a[k])}], smem_desc_b, idesc, 1;\n\t"
-                )
-                for k in range(
-                    1,
-                    cute.size(tCrA.shape[2])
-                    if const_expr(mbar_ptr is None)
-                    else (pre_mbar_tiles if const_expr(pre_mbar_tiles is not None) else cute.size(tCrA.shape[2]) // 4 * 3),
-                )
-            )
-            + mbar_wait_str
-            + (
-                "".join(
+        if const_expr(use_fp8_masks):
+            mask_operands = "{$4, $5, $6, $7}" if const_expr(mbar_ptr is None) else "{$6, $7, $8, $9}"
+            input_args.extend([mask[0].ir_value(), mask[1].ir_value(), mask[2].ir_value(), mask[3].ir_value()])
+            llvm.inline_asm(
+                None,
+                input_args,
+                "{\n\t"
+                ".reg .pred leader_thread;\n\t"
+                ".reg .pred p;\n\t"
+                ".reg .b32 idesc;\n\t"
+                ".reg .b32 tmem_acc;\n\t"
+                ".reg .b32 tmem_a;\n\t"
+                ".reg .b32 smem_desc_b_lo_start;\n\t"
+                ".reg .b32 smem_desc_b_lo;\n\t"
+                ".reg .b32 smem_desc_b_hi;\n\t"
+                ".reg .b64 smem_desc_b;\n\t"
+                "elect.sync _|leader_thread, -1;\n\t"
+                f"mov.b32 idesc, {hex(idesc)};\n\t"
+                f"mov.b32 tmem_acc, $3;\n\t"
+                f"mov.b32 tmem_a, $0;\n\t"
+                f"mov.b32 smem_desc_b_lo_start, $1;\n\t"
+                f"mov.b32 smem_desc_b_hi, {hex(smem_desc_b_hi)};\n\t"
+                f"mov.b64 smem_desc_b, {{smem_desc_b_lo_start, smem_desc_b_hi}};\n\t"
+                "setp.ne.b32 p, $2, 0;\n\t"
+                f"@leader_thread {mma_inst_str} [tmem_acc], [tmem_a], smem_desc_b, idesc, {mask_operands}, {pred_str};\n\t"
+                + "".join(
                     (
                         f"add.u32 smem_desc_b_lo, smem_desc_b_lo_start, {hex(offset_b[k])};\n\t"
                         f"mov.b64 smem_desc_b, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
-                        f"@leader_thread tcgen05.mma.cta_group::1.kind::f16 [tmem_acc], [tmem_a + {hex(offset_a[k])}], smem_desc_b, idesc, 1;\n\t"
+                        f"@leader_thread {mma_inst_str} [tmem_acc], [tmem_a + {hex(offset_a[k])}], smem_desc_b, idesc, {mask_operands}, 1;\n\t"
                     )
-                    for k in range(max(1, pre_mbar_tiles if const_expr(pre_mbar_tiles is not None) else cute.size(tCrA.shape[2]) // 4 * 3), cute.size(tCrA.shape[2]))
+                    for k in range(
+                        1,
+                        cute.size(tCrA.shape[2])
+                        if const_expr(mbar_ptr is None)
+                        else (pre_mbar_tiles if const_expr(pre_mbar_tiles is not None) else cute.size(tCrA.shape[2]) // 4 * 3),
+                    )
                 )
-                if const_expr(mbar_ptr is not None)
-                else ""
+                + mbar_wait_str
+                + (
+                    "".join(
+                        (
+                            f"add.u32 smem_desc_b_lo, smem_desc_b_lo_start, {hex(offset_b[k])};\n\t"
+                            f"mov.b64 smem_desc_b, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
+                            f"@leader_thread {mma_inst_str} [tmem_acc], [tmem_a + {hex(offset_a[k])}], smem_desc_b, idesc, {mask_operands}, 1;\n\t"
+                        )
+                        for k in range(max(1, pre_mbar_tiles if const_expr(pre_mbar_tiles is not None) else cute.size(tCrA.shape[2]) // 4 * 3), cute.size(tCrA.shape[2]))
+                    )
+                    if const_expr(mbar_ptr is not None)
+                    else ""
+                )
+                + "}\n",
+                "r,r,r,r,r,r,r,r" if const_expr(mbar_ptr is None) else "r,r,r,r,r,r,r,r,r,r",
+                has_side_effects=True,
+                is_align_stack=False,
+                asm_dialect=llvm.AsmDialect.AD_ATT,
             )
-            + "}\n",
-            "r,r,r,r" if const_expr(mbar_ptr is None) else "r,r,r,r,r,r",
-            has_side_effects=True,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
+        else:
+            llvm.inline_asm(
+                None,
+                input_args,
+                "{\n\t"
+                ".reg .pred leader_thread;\n\t"
+                ".reg .pred p;\n\t"
+                ".reg .b32 idesc;\n\t"
+                ".reg .b32 tmem_acc;\n\t"
+                ".reg .b32 tmem_a;\n\t"
+                ".reg .b32 smem_desc_b_lo_start;\n\t"
+                ".reg .b32 smem_desc_b_lo;\n\t"
+                ".reg .b32 smem_desc_b_hi;\n\t"
+                ".reg .b64 smem_desc_b;\n\t"
+                "elect.sync _|leader_thread, -1;\n\t"
+                f"mov.b32 idesc, {hex(idesc)};\n\t"
+                f"mov.b32 tmem_acc, $3;\n\t"
+                f"mov.b32 tmem_a, $0;\n\t"
+                f"mov.b32 smem_desc_b_lo_start, $1;\n\t"
+                f"mov.b32 smem_desc_b_hi, {hex(smem_desc_b_hi)};\n\t"
+                f"mov.b64 smem_desc_b, {{smem_desc_b_lo_start, smem_desc_b_hi}};\n\t"
+                "setp.ne.b32 p, $2, 0;\n\t"
+                f"@leader_thread {mma_inst_str} [tmem_acc], [tmem_a], smem_desc_b, idesc, {pred_str};\n\t"
+                + "".join(
+                    (
+                        f"add.u32 smem_desc_b_lo, smem_desc_b_lo_start, {hex(offset_b[k])};\n\t"
+                        f"mov.b64 smem_desc_b, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
+                        f"@leader_thread {mma_inst_str} [tmem_acc], [tmem_a + {hex(offset_a[k])}], smem_desc_b, idesc, 1;\n\t"
+                    )
+                    for k in range(
+                        1,
+                        cute.size(tCrA.shape[2])
+                        if const_expr(mbar_ptr is None)
+                        else (pre_mbar_tiles if const_expr(pre_mbar_tiles is not None) else cute.size(tCrA.shape[2]) // 4 * 3),
+                    )
+                )
+                + mbar_wait_str
+                + (
+                    "".join(
+                        (
+                            f"add.u32 smem_desc_b_lo, smem_desc_b_lo_start, {hex(offset_b[k])};\n\t"
+                            f"mov.b64 smem_desc_b, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
+                            f"@leader_thread {mma_inst_str} [tmem_acc], [tmem_a + {hex(offset_a[k])}], smem_desc_b, idesc, 1;\n\t"
+                        )
+                        for k in range(max(1, pre_mbar_tiles if const_expr(pre_mbar_tiles is not None) else cute.size(tCrA.shape[2]) // 4 * 3), cute.size(tCrA.shape[2]))
+                    )
+                    if const_expr(mbar_ptr is not None)
+                    else ""
+                )
+                + "}\n",
+                "r,r,r,r" if const_expr(mbar_ptr is None) else "r,r,r,r,r,r",
+                has_side_effects=True,
+                is_align_stack=False,
+                asm_dialect=llvm.AsmDialect.AD_ATT,
+            )
 
 
 @cute.jit
@@ -634,10 +754,16 @@ def gemm_ptx_partial_fp4(
     # Recast scale factor layouts to 32-bit (u32 column units) since PTX [tmem_addr + offset]
     # expects column offsets, not element offsets. Without recast, FP8 element offsets (e.g. 16)
     # would be used as column offsets instead of the correct value (e.g. 4 = 16/4).
-    sfa_layout_u32 = cute.recast_layout(32, tScaleA.element_type.width, tScaleA.layout)
-    sfb_layout_u32 = cute.recast_layout(32, tScaleB.element_type.width, tScaleB.layout)
-    offset_sfa = [cute.crd2idx((0, 0, k), sfa_layout_u32) for k in range(cute.size(tCrA.shape[2]))]
-    offset_sfb = [cute.crd2idx((0, 0, k), sfb_layout_u32) for k in range(cute.size(tCrB.shape[2]))]
+    scale_A_base_col = tcgen05.find_tmem_tensor_col_offset(tScaleA[None, None, 0])
+    scale_B_base_col = tcgen05.find_tmem_tensor_col_offset(tScaleB[None, None, 0])
+    offset_sfa = [
+        tcgen05.find_tmem_tensor_col_offset(tScaleA[None, None, k]) - scale_A_base_col
+        for k in range(cute.size(tCrA.shape[2]))
+    ]
+    offset_sfb = [
+        tcgen05.find_tmem_tensor_col_offset(tScaleB[None, None, k]) - scale_B_base_col
+        for k in range(cute.size(tCrB.shape[2]))
+    ]
     if const_expr(not is_ts):
         smem_desc_start_a_lo = Int32(
             smem_desc_base_a_lo | sm100_desc.make_smem_desc_start_addr(sA[None, None, 0].iterator)
@@ -654,7 +780,7 @@ def gemm_ptx_partial_fp4(
         # Compute base addresses for scale factors
         scale_A_base_addr = tScaleA[None, None, 0].iterator.toint()
         scale_B_base_addr = tScaleB[None, None, 0].iterator.toint()
-        mma_inst_str = "tcgen05.mma.cta_group::1.kind::mxf4nvf4.block_scale.scale_vec::4X"
+        mma_inst_str = const_expr(_mma_inst_kind(op))
         llvm.inline_asm(
             None,
             [
@@ -670,6 +796,7 @@ def gemm_ptx_partial_fp4(
             ".reg .pred leader_thread;\n\t"
             ".reg .pred p;\n\t"
             ".reg .b32 idesc;\n\t"
+            ".reg .b32 sf_id_bits;\n\t"
             ".reg .b32 tmem_acc;\n\t"
             ".reg .b32 tmem_scale_a;\n\t"
             ".reg .b32 tmem_scale_b;\n\t"
@@ -683,6 +810,12 @@ def gemm_ptx_partial_fp4(
             f"mov.b32 tmem_acc, $3;\n\t"
             f"mov.b32 tmem_scale_a, $4;\n\t"
             f"mov.b32 tmem_scale_b, $5;\n\t"
+            "and.b32 sf_id_bits, tmem_scale_a, 0xC0000000;\n\t"
+            "shr.u32 sf_id_bits, sf_id_bits, 1;\n\t"
+            "or.b32 idesc, idesc, sf_id_bits;\n\t"
+            "and.b32 sf_id_bits, tmem_scale_b, 0xC0000000;\n\t"
+            "shr.u32 sf_id_bits, sf_id_bits, 26;\n\t"
+            "or.b32 idesc, idesc, sf_id_bits;\n\t"
             "mov.b32 smem_desc_a_lo_start, $0;\n\t"
             "mov.b32 smem_desc_b_lo_start, $1;\n\t"
             f"mov.b32 smem_desc_a_hi, {hex(smem_desc_a_hi)};\n\t"
@@ -717,7 +850,7 @@ def gemm_ptx_partial_fp4(
         # Compute base addresses for scale factors similar to tA_addr
         scale_A_base_addr = tScaleA[None, None, 0].iterator.toint()
         scale_B_base_addr = tScaleB[None, None, 0].iterator.toint()
-        mma_inst_str = "tcgen05.mma.cta_group::1.kind::mxf4nvf4.block_scale.scale_vec::4X"
+        mma_inst_str = const_expr(_mma_inst_kind(op))
         input_args = [
             # Int32(cute.arch.make_warp_uniform(tCrA[None, None, 0].iterator.toint())).ir_value(),
             Int32(cute.arch.make_warp_uniform(tA_addr)).ir_value(),
@@ -749,6 +882,7 @@ def gemm_ptx_partial_fp4(
             ".reg .pred leader_thread;\n\t"
             ".reg .pred p;\n\t"
             ".reg .b32 idesc;\n\t"
+            ".reg .b32 sf_id_bits;\n\t"
             ".reg .b32 tmem_acc;\n\t"
             ".reg .b32 tmem_a;\n\t"
             ".reg .b32 smem_desc_b_lo_start;\n\t"
@@ -764,6 +898,12 @@ def gemm_ptx_partial_fp4(
             f"mov.b32 tmem_a, $0;\n\t"
             f"mov.b32 tmem_scale_a, $4;\n\t"
             f"mov.b32 tmem_scale_b, $5;\n\t"
+            "and.b32 sf_id_bits, tmem_scale_a, 0xC0000000;\n\t"
+            "shr.u32 sf_id_bits, sf_id_bits, 1;\n\t"
+            "or.b32 idesc, idesc, sf_id_bits;\n\t"
+            "and.b32 sf_id_bits, tmem_scale_b, 0xC0000000;\n\t"
+            "shr.u32 sf_id_bits, sf_id_bits, 26;\n\t"
+            "or.b32 idesc, idesc, sf_id_bits;\n\t"
             f"mov.b32 smem_desc_b_lo_start, $1;\n\t"
             f"mov.b32 smem_desc_b_hi, {hex(smem_desc_b_hi)};\n\t"
             f"mov.b64 smem_desc_b, {{smem_desc_b_lo_start, smem_desc_b_hi}};\n\t"
@@ -801,6 +941,39 @@ def gemm_ptx_partial_fp4(
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
         )
+
+
+@cute.jit
+def gemm_ptx_partial_fp8(
+    op: cute.nvgpu.tcgen05.mma.MmaOp,
+    acc_tmem_addr: Int32,
+    tCrA: cute.Tensor,
+    tCrB: cute.Tensor,
+    sA: Optional[cute.Tensor],
+    sB: cute.Tensor,
+    tScaleA: cute.Tensor,
+    tScaleB: cute.Tensor,
+    mbar_ptr: Optional[cutlass.Pointer] = None,
+    mbar_phase: Optional[Int32] = None,
+    zero_init: bool | Boolean = False,
+    tA_addr: Optional[Int32] = None,
+    pre_mbar_tiles: Optional[cutlass.Constexpr[int]] = None,
+) -> None:
+    return gemm_ptx_partial_fp4(
+        op,
+        acc_tmem_addr,
+        tCrA,
+        tCrB,
+        sA,
+        sB,
+        tScaleA,
+        tScaleB,
+        mbar_ptr=mbar_ptr,
+        mbar_phase=mbar_phase,
+        zero_init=zero_init,
+        tA_addr=tA_addr,
+        pre_mbar_tiles=pre_mbar_tiles,
+    )
 
 
 @cute.jit

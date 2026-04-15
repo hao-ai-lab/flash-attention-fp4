@@ -163,6 +163,7 @@ class SoftmaxSm100(Softmax):
 
     fp8_scalexfp4_scale_log2: cutlass.Constexpr[float] = -11.392317422778762 # log2f(fp8_scalexfp4_scale=1.0 / (448 * 6))
     fp4_scale_log2: cutlass.Constexpr[float] = -2.584962500721156 # log2f(fp4_scale=1 / 6)
+    p_log2_offset: cutlass.Constexpr[float] = 0.0
     quant_pv: cutlass.Constexpr[bool] = False
     compute_sp1: cutlass.Constexpr[bool] = False
 
@@ -171,6 +172,7 @@ class SoftmaxSm100(Softmax):
         scale_log2: Float32,
         rescale_threshold: cutlass.Constexpr[float] = 0.0,
         softmax_scale: Float32 | None = None,
+        p_log2_offset: cutlass.Constexpr[float] = 0.0,
         quant_pv: cutlass.Constexpr[bool] = False,
         compute_sp1: cutlass.Constexpr[bool] = False,
     ):
@@ -187,6 +189,7 @@ class SoftmaxSm100(Softmax):
             arch,
             softmax_scale,
             rescale_threshold=rescale_threshold,
+            p_log2_offset=p_log2_offset,
             quant_pv=quant_pv,
             compute_sp1=compute_sp1,
         )
@@ -295,7 +298,7 @@ class SoftmaxSm100(Softmax):
         if const_expr(self.compute_sp1) and const_expr(self.quant_pv):
             row_max_scaled = row_max * self.scale_log2 + self.fp8_scalexfp4_scale_log2
         else:
-            row_max_scaled = row_max * self.scale_log2
+            row_max_scaled = row_max * self.scale_log2 - self.p_log2_offset
 
         if const_expr(acc_S_row_group_max is not None):
             if const_expr(self.compute_sp1) and const_expr(self.quant_pv):
@@ -329,6 +332,7 @@ class SoftmaxSm100(Softmax):
         self,
         acc_S_row: cute.Tensor,
         acc_S_row_converted: Optional[cute.Tensor] = None,
+        converted_scale: cutlass.Constexpr[float] = 1.0,
         e2e: cutlass.Constexpr[bool] = False,
         e2e_freq: cutlass.Constexpr[int] = 16,
         e2e_res: cutlass.Constexpr[int] = 4,
@@ -362,8 +366,11 @@ class SoftmaxSm100(Softmax):
                 acc_S_row_converted_frg = cute.logical_divide(
                     acc_S_row_converted, cute.make_layout(frg_tile)
                 )
+                converted_vals = acc_S_row_frg[None, j].load()
+                if cutlass.const_expr(converted_scale != 1.0):
+                    converted_vals = converted_vals * converted_scale
                 acc_S_row_converted_frg[None, j].store(
-                    acc_S_row_frg[None, j].load().to(acc_S_row_converted.element_type)
+                    converted_vals.to(acc_S_row_converted.element_type)
                 )
 
     @cute.jit

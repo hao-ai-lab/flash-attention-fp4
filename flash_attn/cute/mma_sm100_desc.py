@@ -253,17 +253,14 @@ def make_instr_desc_block_scaled(
 
     
 def mma_op_to_idesc(op: cute.nvgpu.tcgen05.mma.MmaOp):
-    # Use block-scaled descriptor for FP4 (nvfp4) which uses MXF8F6F4Format::E2M1
-    if op.a_dtype is cutlass.Float4E2M1FN:
-        # For FP4, we need to pass the scale factor type (typically Float8E4M3FN for nvfp4)
-        # This will be determined from the actual scale factor tensor type
-        # For now, default to Float8E4M3FN as that's the typical scale factor type for nvfp4
-        sf_type = cutlass.Float8E4M3FN  # Scale factors for nvfp4 are typically FP8 E4M3
+    # Block-scaled tcgen05 ops carry sf_dtype / sf_vec_size. Use the block-scaled
+    # descriptor for both NVFP4 and MXFP8 variants.
+    if hasattr(op, "sf_dtype"):
         return make_instr_desc_block_scaled(
             op.a_dtype,
             op.b_dtype,
             op.acc_dtype,
-            sf_type,
+            op.sf_dtype,
             op.shape_mnk[0],
             op.shape_mnk[1],
             Major.K if op.a_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K else Major.MN,

@@ -248,10 +248,10 @@ def _compact_fp4_data(torch_underlying, ab_dtype):
     torch_underlying.flatten()[:packed.numel()].copy_(packed.flatten())
 
 
-def create_fp4_attention_tensors(batch, seqlen_q, seqlen_k, nheads, nheads_kv, headdim, headdim_v,
-                                  device='cuda', dtype_gen=torch.bfloat16, quant_v=False, return_torch=True,
-                                  ab_dtype=None, sf_dtype=None, sf_vec_size=None, debug=False):
-    """Create FP4 attention tensors (Q, K, V) with scale factors.
+def create_blockscaled_attention_tensors(batch, seqlen_q, seqlen_k, nheads, nheads_kv, headdim, headdim_v,
+                                         device='cuda', dtype_gen=torch.bfloat16, pv_mode='bf16', return_torch=True,
+                                         ab_dtype=None, sf_dtype=None, sf_vec_size=None, pv_fp8_dtype=None, debug=False):
+    """Create block-scaled Q/K attention tensors with optional FP4 / FP8 V.
     
     Args:
         batch: Batch size
@@ -263,24 +263,29 @@ def create_fp4_attention_tensors(batch, seqlen_q, seqlen_k, nheads, nheads_kv, h
         headdim_v: Head dimension for V
         device: Device to create tensors on
         dtype_gen: Dtype to generate random data in (before conversion to FP4)
-        quant_v: Whether to quantize V to FP4 (default: False, only QK are quantized)
+        pv_mode: One of {'bf16', 'fp4', 'fp8'}
         return_torch: Whether to return torch tensors (default: True)
-        ab_dtype: Data type for A/B matrices (default: Float4E2M1FN)
-        sf_dtype: Scale factor dtype (default: Float8E4M3FN)
-        sf_vec_size: Scale factor vector size (default: 16)
+        ab_dtype: Data type for block-scaled Q/K matrices
+        sf_dtype: Q/K scale factor dtype
+        sf_vec_size: Q/K scale factor vector size
     Returns:
-        Tuple of (q_fp4, k_fp4, v_tensor, q_sf, k_sf, v_sf, q_ref, k_ref, v_ref)
-        where q_fp4, k_fp4 are FP4 tensors, v_tensor is FP4 if quant_v=True else regular dtype,
-        q_sf, k_sf are scale factor tensors, v_sf is scale factor tensor if quant_v=True else None,
+        Tuple of (q_tensor, k_tensor, v_tensor, q_sf, k_sf, v_sf, q_ref, k_ref, v_ref)
+        where q_tensor, k_tensor are block-scaled operand tensors, v_tensor depends on pv_mode,
+        q_sf, k_sf are Q/K scale factor tensors, v_sf is scale factor tensor only for pv_mode='fp4',
         and *_ref are reference FP32 tensors
     """
-    # Default FP4 parameters
+    if pv_mode not in {"bf16", "fp4", "fp8"}:
+        raise ValueError(f"Invalid pv_mode={pv_mode}")
+
+    # Default block-scaled parameters
     if ab_dtype is None:
-        ab_dtype = cutlass.Float4E2M1FN  # FP4 data type
+        ab_dtype = cutlass.Float4E2M1FN
     if sf_dtype is None:
-        sf_dtype = cutlass.Float8E4M3FN  # Scale factor dtype
+        sf_dtype = cutlass.Float8E4M3FN
     if sf_vec_size is None:
-        sf_vec_size = 16  # 1 scale factor per 16 elements
+        sf_vec_size = 16
+    if pv_fp8_dtype is None:
+        pv_fp8_dtype = cutlass.Float8E4M3FN
     
     # Create reference FP32 tensors
     if debug:
@@ -299,13 +304,11 @@ def create_fp4_attention_tensors(batch, seqlen_q, seqlen_k, nheads, nheads_kv, h
         k_ref = torch.randn(batch, seqlen_k, nheads_kv, headdim, device=device, dtype=torch.float32)
         v_ref = torch.randn(batch, seqlen_k, nheads_kv, headdim_v, device=device, dtype=torch.float32)
 
-    # Create FP4 tensors for Q and K (V quantization is optional)
-    # For FP4 (Float4E2M1FN), pack 2 values per byte using int8 with halved last dim.
-    # The kernel detects Int8 dtype and converts to Float4E2M1FN internally.
+    # Create Q/K tensors for the selected block-scaled operand type.
     if ab_dtype == cutlass.Float4E2M1FN:
-        k_fct = 2  # 2 FP4 values per byte
+        qk_divisibility = 32
     else:
-        k_fct = 1
+        qk_divisibility = 16
     q_tensor, q_torch_underlying = cutlass_torch.cute_tensor_like(
         q_ref, ab_dtype, is_dynamic_layout=True, assumed_align=16
     )
@@ -322,12 +325,12 @@ def create_fp4_attention_tensors(batch, seqlen_q, seqlen_k, nheads, nheads_kv, h
     q_tensor.mark_compact_shape_dynamic(
         mode=1,  # headdim dimension needs divisibility for FP4
         stride_order=q_stride_order,
-        divisibility=32 if ab_dtype == cutlass.Float4E2M1FN else 16,
+        divisibility=qk_divisibility,
     )
     k_tensor.mark_compact_shape_dynamic(
         mode=1,  # headdim dimension needs divisibility for FP4
         stride_order=k_stride_order,
-        divisibility=32 if ab_dtype == cutlass.Float4E2M1FN else 1,
+        divisibility=qk_divisibility,
     )
 
     # Convert FP32 tensors to FP4 format for Q and K
@@ -341,8 +344,8 @@ def create_fp4_attention_tensors(batch, seqlen_q, seqlen_k, nheads, nheads_kv, h
     # Note: convert_cute_tensor writes FP4 data contiguously, matching the
     # FP4 stride interpretation. No compaction or stride fix needed.
     
-    # Handle V: quantize to FP4 if quant_v=True, otherwise use regular dtype
-    if quant_v:
+    # Handle V according to the requested PV path.
+    if pv_mode == "fp4":
         # FP4 block-scaled MMA requires V to be K-major (seqlen contiguous in SMEM).
         # Create V with seqlen as the contiguous dimension by physically transposing.
         # v_ref: (batch, seqlen, nheads, headdim) with headdim contiguous
@@ -363,8 +366,21 @@ def create_fp4_attention_tensors(batch, seqlen_q, seqlen_k, nheads, nheads_kv, h
             v_ref_kmajor, v_tensor, ab_dtype, is_dynamic_layout=True
         )
         # V is (batch, seqlen, nheads, headdim) with seqlen contiguous
+    elif pv_mode == "fp8":
+        v_tensor, v_torch_underlying = cutlass_torch.cute_tensor_like(
+            v_ref, pv_fp8_dtype, is_dynamic_layout=True, assumed_align=16
+        )
+        v_stride_order = tuple(v_ref.dim_order())
+        v_tensor.mark_compact_shape_dynamic(
+            mode=1,
+            stride_order=v_stride_order,
+            divisibility=16,
+        )
+        v_tensor = cutlass_torch.convert_cute_tensor(
+            v_ref, v_tensor, pv_fp8_dtype, is_dynamic_layout=True
+        )
     else:
-        # V stays as regular dtype (not FP4 quantized) - create CUTE tensor
+        # V stays in regular dtype (BF16/FP16).
         # Convert torch dtype to CUTE dtype
         assert dtype_gen in [torch.bfloat16, torch.float16]
         if dtype_gen == torch.bfloat16:
@@ -400,8 +416,8 @@ def create_fp4_attention_tensors(batch, seqlen_q, seqlen_k, nheads, nheads_kv, h
         device, debug=debug, sf_value=k_sf_value
     )
     
-    # Create V scale factors only if V is being quantized
-    if quant_v:
+    # Create V scale factors only if V is block-scaled FP4.
+    if pv_mode == "fp4":
         v_sf_ref, v_sf_tensor, v_sf_torch_underlying = create_scale_factor_tensor(
             batch, seqlen_k, nheads_kv, headdim_v, sf_vec_size, sf_dtype, ab_dtype, device, debug=debug
         )
@@ -426,25 +442,25 @@ def create_fp4_attention_tensors(batch, seqlen_q, seqlen_k, nheads, nheads_kv, h
 
 
 def time_fwd(func, *args, repeats=10, verbose=True, desc="", **kwargs):
-    """Time forward pass execution using CUPTI-based GPU timing."""
+    """Time forward pass execution, falling back when CUPTI is unavailable."""
     times = bench_gpu_time(
         fn=lambda: func(*args, **kwargs),
         dry_run_iters=5,
         repeat_iters=repeats,
-        enable_cupti=True,
+        enable_cupti=False,
         use_cuda_graph=False,
     )
     return Timing(np.median(times) * 1e-3)  # bench_gpu_time returns ms, Timing expects seconds
 
 
-def main(ab_dtype, sf_dtype, sf_vec_size, quant_v=False, debug=False):
+def main(ab_dtype, sf_dtype, sf_vec_size, pv_mode="bf16", pv_fp8_dtype=cutlass.Float8E4M3FN, debug=False):
     """Main benchmark function.
     
     Args:
         ab_dtype: Data type for A/B matrices
         sf_dtype: Scale factor dtype
         sf_vec_size: Scale factor vector size
-        quant_v: Whether to quantize V to FP4 (default: False, only QK are quantized)
+        pv_mode: One of {'bf16', 'fp4', 'fp8'}
     """
     torch.manual_seed(0)
     repeats = 10
@@ -468,15 +484,18 @@ def main(ab_dtype, sf_dtype, sf_vec_size, quant_v=False, debug=False):
         (1, 4096, 24, 128),
         (1, 32768, 24, 128),
     ]
-    if not quant_v:
-        # headdim=64 only works for quant_qk (quant_v needs K=headdim>=128 for block-scaled MMA)
+    if pv_mode != "fp4":
+        # headdim=64 only works when PV does not use block-scaled FP4.
         configs.append((1, 32768, 24, 64))
     print("=" * 80)
     print("FP4 Flash Attention Benchmark")
     print("=" * 80)
     print(f"Device: {device}")
     print(f"Causal: {causal}")
-    print(f"Quantize V: {quant_v}")
+    print(f"PV mode: {pv_mode}")
+    print(f"QK ab_dtype: {ab_dtype}")
+    print(f"QK sf_dtype: {sf_dtype}")
+    print(f"QK sf_vec_size: {sf_vec_size}")
     print("=" * 80)
     
     for batch_size, seqlen, nheads, headdim in configs:
@@ -487,18 +506,18 @@ def main(ab_dtype, sf_dtype, sf_vec_size, quant_v=False, debug=False):
 
         print(f"\n### Batch={batch_size}, SeqLen={seqlen}, Nheads={nheads}, Headdim={headdim} ###")
         
-        # Create FP4 tensors (V quantization is optional)
+        # Create block-scaled Q/K tensors plus the requested V mode.
         (q_fp4, k_fp4, v_tensor, q_sf, k_sf, v_sf, 
-            q_ref, k_ref, v_ref) = create_fp4_attention_tensors(
+            q_ref, k_ref, v_ref) = create_blockscaled_attention_tensors(
             batch_size, seqlen_q, seqlen, nheads, nheads_kv, 
-            headdim, headdim_v, device, dtype_gen, quant_v=quant_v, return_torch=False,
+            headdim, headdim_v, device, dtype_gen, pv_mode=pv_mode, return_torch=False,
             ab_dtype=ab_dtype, sf_dtype=sf_dtype, sf_vec_size=sf_vec_size,
-            debug=debug
+            pv_fp8_dtype=pv_fp8_dtype, debug=debug
         )
         q_sf_torch = check_tensor_for_nans(q_sf, name="q_sf")
         k_sf_torch = check_tensor_for_nans(k_sf, name="k_sf")
 
-        if quant_v:
+        if pv_mode == "fp4":
             v_sf_torch = check_tensor_for_nans(v_sf, name="v_sf")
 
         # Calculate FLOPS
@@ -512,7 +531,7 @@ def main(ab_dtype, sf_dtype, sf_vec_size, quant_v=False, debug=False):
         try:
             # The interface should detect nvfp4 dtype and dispatch to FP4 kernel
             # Pass scale factor tensors (V scale factors only if quant_v=True)
-            desc_str = 'FP4 Attention (QKV quantized)' if quant_v else 'FP4 Attention (QK quantized)'
+            desc_str = f'Block-scaled Attention (pv_mode={pv_mode})'
             m_fp4 = time_fwd(
                 flash_attn_func_python,
                 q_fp4, k_fp4, v_tensor,
@@ -578,7 +597,7 @@ def main(ab_dtype, sf_dtype, sf_vec_size, quant_v=False, debug=False):
             import traceback
             traceback.print_exc()
 
-        # Test: force_fp4_impl with bf16 data (no scale factors, no FP4 encoding)
+        # Test: force block-scaled SM100 path with bf16 data (no scale factors).
         # This runs the FP4 kernel code path but with bf16 Q/K/V
         force_fp4_out = None
         try:
@@ -635,19 +654,43 @@ def main(ab_dtype, sf_dtype, sf_vec_size, quant_v=False, debug=False):
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Benchmark FP4 Flash Attention")
+    parser = argparse.ArgumentParser(description="Benchmark block-scaled Flash Attention")
     parser.add_argument(
         "--quant_v",
         action="store_true",
-        help="Quantize V to FP4 (default: False, only QK are quantized)"
+        help="Deprecated alias for --pv_mode=fp4"
+    )
+    parser.add_argument(
+        "--qk_mode",
+        choices=["nvfp4", "mxfp8"],
+        default="nvfp4",
+        help="Block-scaled QK mode",
+    )
+    parser.add_argument(
+        "--pv_mode",
+        choices=["bf16", "fp4", "fp8"],
+        default=None,
+        help="PV path: bf16 baseline V, fp4 block-scaled V, or pure fp8 V",
+    )
+    parser.add_argument(
+        "--fp8_dtype",
+        choices=["e4m3", "e5m2"],
+        default="e4m3",
+        help="FP8 operand dtype used for MXFP8 QK / FP8 V modes",
     )
     parser.add_argument("--debug", action="store_true", help="Debug precision, set all tensors to 1.0")
     # parser.add_argument("--ab_dtype", type=cutlass.dtype, default=cutlass.Float4E2M1FN)
     # parser.add_argument("--sf_dtype", type=cutlass.dtype, default=cutlass.Float8E4M3FN)
 
     args = parser.parse_args()
-    ab_dtype = cutlass.Float4E2M1FN
-    sf_dtype = cutlass.Float8E4M3FN
-    sf_vec_size = 16
-    main(ab_dtype, sf_dtype, sf_vec_size, args.quant_v, args.debug)
-
+    pv_mode = "fp4" if args.quant_v else (args.pv_mode or "bf16")
+    fp8_dtype = cutlass.Float8E4M3FN if args.fp8_dtype == "e4m3" else cutlass.Float8E5M2
+    if args.qk_mode == "nvfp4":
+        ab_dtype = cutlass.Float4E2M1FN
+        sf_dtype = cutlass.Float8E4M3FN
+        sf_vec_size = 16
+    else:
+        ab_dtype = fp8_dtype
+        sf_dtype = cutlass.Float8E8M0FNU
+        sf_vec_size = 32
+    main(ab_dtype, sf_dtype, sf_vec_size, pv_mode, fp8_dtype, args.debug)
