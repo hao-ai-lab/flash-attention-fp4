@@ -374,3 +374,41 @@ Verification matrix update:
 |---|---|
 | MXFP8 QK + BF16 PV | **NaN / 1e37 garbage** (both helper paths) |
 | MXFP8 QK + FP8 PV | not tested (upstream QK broken) |
+
+## 2026-04-15 stride audit (task #23)
+
+Audited every `.width // 8`, `* width`, `<< 4`, hardcoded `* 16` /
+`+ 512` style constant in the FA4 forward path. Three concrete bugs found
+and fixed:
+
+1. **`element_size=self.k_dtype.width // 8`** (`flash_fwd_sm100_fp4.py:929`)
+   For FP4 (width=4), integer division rounds to 0; the LPT scheduler then
+   computes `size_one_head=0` and divides by zero at MLIR trace time. Fixed
+   by `max(width // 8, 1)` (re-applied from the `fp4` branch — the fix had
+   been committed there but never landed on `mixed_precision`).
+
+2. **`sf_dtype_per_u32` undefined** at `flash_fwd_sm100_fp4.py:1479`.
+   This name was referenced inside the `quant_pv` block but never defined.
+   The path didn't fail because `quant_pv` evaluates `--quant_v` (NVFP4 V
+   only) and not the MXFP8-V path, but the symbol was a `NameError` ticking
+   bomb. Defined locally as `sf_dtype_per_u32 = 32 // self.sf_dtype.width`
+   (= 4 for both E4M3 and E8M0).
+
+3. **SFP R2S hardcoded for `sf_vec_size=16`** at `flash_fwd_sm100_fp4.py:2932`
+   The thread layout `(4, 2) stride=(1, 512)` and divisor `make_layout(4)`
+   assume 8 SF bytes per row — only correct for NVFP4 (`128/16=8`). For MXFP8
+   (`128/32=4`) we would over-write 4 extra bytes into the next atom or
+   beyond the buffer. Generalized to derive `k_groups_per_row` from
+   `mma_tiler_pv[2] // sf_vec_size`, and split into `(k_inner=min(k_groups,4),
+   k_outer)`. NVFP4 path numerics unchanged (verified `--quant_v` max_diff
+   identical to before).
+
+The audit did NOT find a smoking-gun bug for the MXFP8 QK NaN/inf issue —
+the relevant constants on the QK side are properly parameterized by
+`sf_vec_size` already. The bug must be in either:
+- the SFQ/SFK SMEM layout itself (`make_smem_layout_sfa/b` in
+  `modified_utils/block_scaled_layout_test.py` — byte-for-byte identical
+  to stock CUTLASS `blockscaled_utils.make_smem_layout_sfa`), or
+- the SFQ/SFK TMA partition / cta_v_map (different SF-bytes-per-row count
+  for MXFP8 may need a different TMA box shape), or
+- the SFQ/SFK S2T copy atom which moves SMEM → TMEM.

@@ -926,7 +926,10 @@ class FlashAttentionForwardSm100:
             mCuSeqlensQ=mCuSeqlensQ,
             mSeqUsedQ=mSeqUsedQ,
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
-            element_size=self.k_dtype.width // 8,
+            # For sub-byte dtypes (FP4), width=4 rounds to 0 under integer division;
+            # clamp so size_one_head * element_size in the scheduler's L2 swizzle calc
+            # doesn't become 0 and divide by zero in the else branch of the ifexp.
+            element_size=max(self.k_dtype.width // 8, 1),
             is_persistent=self.is_persistent,
             lpt=self.is_causal or self.is_local,
             is_split_kv=self.is_split_kv,
@@ -1472,7 +1475,12 @@ class FlashAttentionForwardSm100:
             )
             tCtSFPs = [cute.make_tensor(sfp_tmem_ptrs[stage], tCtSFP_layout) for stage in range(self.q_stage)]
             
-            # Make SFV tmem tensor
+            # Make SFV tmem tensor.
+            # find_tmem_tensor_col_offset returns u32 cols; sfp_tmem_ptrs are
+            # typed as `self.sf_dtype` (1 byte for E4M3/E8M0), so we convert
+            # u32 cols → SF-element offset via `sf_dtype_per_u32 = 32 / sf_width`.
+            # Both E4M3 and E8M0 are 8 bits → 4 SFs per u32 col.
+            sf_dtype_per_u32 = 32 // self.sf_dtype.width
             sfp_offset = math.ceil(tcgen05.find_tmem_tensor_col_offset(tCtSFPs[0]) * sf_dtype_per_u32 / align) * align
             sfv_tmem_ptrs = [sfp_tmem_ptrs[stage] + sfp_offset for stage in range(self.q_stage)]
 
@@ -2915,22 +2923,30 @@ class FlashAttentionForwardSm100:
             softmax.scale_groupwise(tSrS_t2r, tSrPSF_f32, sf_size=self.sf_vec_size)
             self._quant_fp4(tSrS_t2r, tSrPSF_f32, tSrP_r2t, tSrPSF)
             # R2S: Copy tSrPSF (registers) to sSFP (shared memory).
-            # The SFP smem layout is BlockScaledBasicChunk(16) tile_to_shape((M=128, K=128)),
-            # giving byte offsets:
-            #   byte = (m%32)*16 + ((m//32)%4)*4 + (k_block%4) + (k_block//4)*512
-            # Each softmax thread holds 1 M row (lane_id within warp = row in [0,32),
-            # warp_id within softmax warpgroup = row block in [0,4)) and 8 K groups.
-            # The first 4 K groups land at +0,+1,+2,+3 within the row's atom; the
-            # next 4 land at +512,+513,+514,+515 (rest_k stride).
+            # The SFP smem layout is BlockScaledBasicChunk(sf_vec_size).layout
+            # tile_to_shape((M=128, K=128)). The atom is ((32,4),(sf_vec,4))
+            # with stride ((16,4),(0,1)) — those strides are independent of
+            # sf_vec_size, so `base_offset = lane_id*16 + (warp_id%4)*4` is
+            # correct for both NVFP4 (sf_vec=16) and MXFP8 (sf_vec=32).
+            # What changes is the K-group count per row:
+            #   sf_vec=16, K=128 → 8 SFs per row → 4 inner + 2 outer (rest_k stride 512)
+            #   sf_vec=32, K=128 → 4 SFs per row → 4 inner + 1 outer (no rest_k)
             if const_expr(sSFP is not None):
                 thread_idx = thr_tmem_load.thr_idx
                 lane_id = thread_idx % 32
                 warp_id = thread_idx // 32
                 base_offset = lane_id * 16 + (warp_id % 4) * 4
-                sfp_thread_layout = cute.make_layout((4, 2), stride=(1, 512))
+                # PV is (M=128, N=head_dim_v, K=n_block_size). SFP scales the
+                # P (=A) operand along the K dim, so per-row SF count is
+                # n_block_size // sf_vec_size.
+                k_groups_per_row = const_expr(self.mma_tiler_pv[2] // self.sf_vec_size)
+                k_inner = const_expr(min(k_groups_per_row, 4))
+                k_outer = const_expr(k_groups_per_row // k_inner)
+                # cute.cosize of one atom = 512 bytes for both sf_vec sizes.
+                sfp_thread_layout = cute.make_layout((k_inner, k_outer), stride=(1, 512))
                 sSFP_stage_ptr = sSFP[None, None, None, stage].iterator
                 sSFP_thread = cute.make_tensor(sSFP_stage_ptr + base_offset, sfp_thread_layout)
-                tSrPSF_2d = cute.logical_divide(tSrPSF, cute.make_layout(4))
+                tSrPSF_2d = cute.logical_divide(tSrPSF, cute.make_layout(k_inner))
                 cute.autovec_copy(tSrPSF_2d, sSFP_thread)
         else:
             # softmax.scale_apply_exp2_convert(tSrS_t2r, row_max, tSrP_r2t)
