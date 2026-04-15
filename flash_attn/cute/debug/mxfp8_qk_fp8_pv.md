@@ -463,3 +463,65 @@ fields `mma_op_to_idesc` packs into the descriptor.
 PTX kind ↔ idesc agreement is **OK for all currently shipping paths**.
 The NVFP4 b_format=1 quirk is harmless because `kind::mxf4nvf4` constrains
 both operands to E2M1 by spec.
+
+## 2026-04-15 FP8-PV active-cycle regression on long d=128 (task #20)
+
+### Confirmed regression on current commit
+
+Re-ran `bench_fp4 --pv_mode {bf16, fp8}` (commit `4631b50e`). Long d=128
+shapes still favor BF16 PV; d=64 still favors FP8 PV:
+
+| shape | BF16 PV | FP8 PV | Δ |
+|---|---|---|---|
+| `(1, 32768, 12, 128)` | 3.85 ms | 4.08 ms | **FP8 +6%** |
+| `(1, 32768, 24, 128)` | 7.55 ms | 7.76 ms | **FP8 +3%** |
+| `(1, 32768, 24, 64)`  | 7.17 ms | 6.94 ms | FP8 −3% |
+
+### Structural diagnosis (without nsight on this build)
+
+Looking at the `softmax_step` body (`flash_fwd_sm100_fp4.py:2940-2946`), the
+pure-FP8 path runs **two** elementwise passes over `tSrS_t2r`:
+
+1. `softmax.apply_exp2_convert(tSrS_t2r, ...)` — exp2(s - row_max) in
+   place; result stays FP32.
+2. `self._pack_fp8(tSrS_t2r, tSrP_r2t)` — FP32 → FP8 via 32 calls of
+   `packed_float_to_ue4m3` (each = 2 `cvt.rn.satfinite.e4m3x2.f32`
+   instructions), per softmax thread.
+
+The BF16 path (`flash_fwd_sm100_fp4.py:2948-2954`) **fuses**: a single
+`apply_exp2_convert(tSrS_t2r, tSrP_r2t, converted_scale=1.0, ...)`
+writes BF16 directly into `tSrP_r2t`, no second pass.
+
+With sf_size=16 and head_dim=128, the second-pass overhead is 32×2 = 64
+extra `cvt` instructions per softmax thread per softmax_step iteration. On
+short d (e.g. 64), the PV memory savings dominate; on long d=128, the pack
+cost shows up as `mio_throttle 0.33→0.88` and `wait 2.22→2.74`
+(unchanged from the previous nsight numbers in the table above — same
+structural cause).
+
+The bank-conflict numbers (`shared_op_st 1M→35K` for FP8) confirm that
+the pure-FP8 staging itself isn't the bottleneck — it's the **issue-side
+register / convert work** between exp2 and PV start.
+
+### Proposed fix (not implemented this session)
+
+Add a fused helper `apply_exp2_pack_fp8(tSrS_t2r, tSrP_r2t)` that walks
+both tensors in lockstep:
+
+```text
+for k in 0..N_per_thread step 4:
+    f0..f3 = exp2(tSrS_t2r[k:k+4] - row_max)  # already fused
+    tSrP_r2t[k:k+4] = packed_float_to_ue4m3(f0, f1, f2, f3)
+```
+
+This collapses two passes into one, removes a register-resident FP32
+intermediate, and matches the BF16 path's single-pass structure.
+
+`SoftmaxSm100.apply_exp2_convert` already has a flag for in-place
+conversion to dst dtype — extending it to take an explicit packer
+(`fn(f0, f1, f2, f3) -> Int32`) is the smallest change. Tagging this for
+follow-up; not landing this session because tuning the exp2/pack
+interleaving for long d=128 needs nsight metrics that are unavailable on
+this build host (CUPTI requires CUDA 13+ driver).
+
+### Status: diagnosed, fix designed but not implemented.
