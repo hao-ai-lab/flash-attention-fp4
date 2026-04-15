@@ -581,3 +581,33 @@ Both modes now share the NVFP4-proven layout.
 - All three modes (NVFP4, MXFP8, FP4 V) produce valid output with no NaN.
 
 Status: **#24 FIXED**. Unblocks #21 (dedicated FP8 helper perf A/B).
+
+## 2026-04-15 MXFP8 inline-PTX vs generic cute.gemm A/B (task #21)
+
+Now that MXFP8 numerics are fixed (#24), benched both helper paths:
+
+| shape | inline-PTX | generic cute.gemm | winner |
+|---|---|---|---|
+| `(4, 4096, 16, 128)`   | 1583 | 1588 | generic +0.3% |
+| `(4, 4096, 32, 128)`   | 1607 | 1611 | generic +0.3% |
+| `(1, 4096, 12, 128)`   | 948  | 955  | generic +0.7% |
+| `(1, 32768, 12, 128)`  | 1638 | 1650 | generic +0.7% |
+| `(1, 4096, 24, 128)`   | 1307 | 1321 | generic +1.1% |
+| `(1, 32768, 24, 128)`  | 1651 | 1726 | generic +4.5% |
+
+Generic wins on every MXFP8 shape. Root cause: the inline-PTX helper's
+per-K SF address plumbing (passing `tScaleA[..., k].iterator.toint()`
+as separate `r` operands, and recomputing idesc with sf_id extraction
+per K-iter) adds register pressure that the cleaner cute.gemm path
+avoids. NVFP4 still wins on inline-PTX because scale_vec::4X packs 4
+SFs per operand so the per-K advance is trivial.
+
+### Default change
+
+Routed MXFP8 (Float8E4M3FN / Float8E5M2 ab dtype) through
+`sm100_utils.gemm_blockscaled_generic` by default; NVFP4 stays on
+`gemm_ptx_partial_fp4`. Env `FA4_DEBUG_FORCE_GENERIC_MXFP8_QK=1` still
+forces generic on NVFP4 too for A/B tests.
+
+Status: **#21 resolved**. Dedicated helper offers no perf win on MXFP8;
+keep generic.

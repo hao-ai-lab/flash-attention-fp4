@@ -2042,12 +2042,16 @@ class FlashAttentionForwardSm100:
 
         qk_mma_op, pv_mma_op = tiled_mma_qk.op, tiled_mma_pv.op
         if const_expr(self.quant_qk):
-            if const_expr(self.debug_force_generic_mxfp8_qk):
-                # Generic cute.gemm fallback for block-scaled QK. Matches the
-                # dense_blockscaled reference path and sidesteps per-K SF address
-                # bugs in the inline-PTX helper. MXFP8 scale_vec::1X produces
-                # NaN/inf via gemm_ptx_partial_fp4; this path is a correctness
-                # workaround.
+            # For MXFP8 QK the generic cute.gemm path is slightly faster than
+            # our inline-PTX helper (+1-5% across shapes, +4.5% on
+            # (1,32768,24,128)) because the helper's per-K SF-address
+            # plumbing adds register pressure. Use generic by default for
+            # block-scaled FP8; keep inline-PTX for NVFP4 where it wins.
+            # The debug flag lets us force generic on NVFP4 too for A/B tests.
+            if const_expr(
+                self.debug_force_generic_mxfp8_qk
+                or qk_mma_op.a_dtype in (Float8E4M3FN, Float8E5M2)
+            ):
                 gemm_Si = [
                     partial(
                         sm100_utils.gemm_blockscaled_generic,
@@ -2061,13 +2065,9 @@ class FlashAttentionForwardSm100:
                     for stage in range(self.q_stage)
                 ]
             else:
-                if const_expr(qk_mma_op.a_dtype in (Float8E4M3FN, Float8E5M2)):
-                    gemm_qk_helper = sm100_utils.gemm_ptx_partial_fp8
-                else:
-                    gemm_qk_helper = sm100_utils.gemm_ptx_partial_fp4
                 gemm_Si = [
                     partial(
-                        gemm_qk_helper,
+                        sm100_utils.gemm_ptx_partial_fp4,
                         qk_mma_op,
                         self.tmem_s_offset[stage],
                         tSrQs[stage],
