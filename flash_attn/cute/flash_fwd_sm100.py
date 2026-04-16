@@ -546,6 +546,10 @@ class FlashAttentionForwardSm100:
                     stride=(*sV_layout.outer.stride[:-1], stage_stride),
                 ),
             )
+        # NOTE: when k_dtype < v_dtype (K aliases V), sK_layout is left at its
+        # natural stride so the TMA atom's cosize matches K's actual data size.
+        # The runtime sK construction below uses a rebuilt layout with scaled
+        # stage stride to place K into V's buffer at the correct byte offsets.
 
         if const_expr(self.pack_gqa):
             nheads_kv = mK.shape[2]
@@ -730,12 +734,6 @@ class FlashAttentionForwardSm100:
             ]
 
         self.shared_storage = SharedStorage
-        print(
-            f"FA4_SMEM k_dtype={self.k_dtype} v_dtype={self.v_dtype} "
-            f"kv_stage={self.kv_stage} "
-            f"TOTAL={_total_smem}B ({_total_smem/1024:.1f}KB)",
-            flush=True,
-        )
 
         softmax_scale_log2, softmax_scale = utils.compute_softmax_scale_log2(softmax_scale, self.score_mod)
         window_size_left = Int32(window_size_left) if window_size_left is not None else None
@@ -1032,6 +1030,8 @@ class FlashAttentionForwardSm100:
             sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
             sV = cute.make_tensor(cute.recast_ptr(sK.iterator, sV_layout.inner), sV_layout.outer)
         elif const_expr(self.k_dtype.width < self.v_dtype.width):
+            # K aliases V's buffer with a rebuilt sK outer layout whose stage
+            # stride = stride_sV * (v_width/k_width). Byte-equivalent footprint.
             sV = storage.sV.get_tensor(sV_layout.outer, swizzle=sV_layout.inner)
             stride_sV = const_expr(max(sV_layout.outer.stride[-1], 0))
             stride_sK_aligned = const_expr(
