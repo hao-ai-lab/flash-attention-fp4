@@ -625,8 +625,12 @@ def _flash_attn_fwd(
     else:
         aux_tensor_metadata = None
 
+    # Separate v_dtype into the compile key so mixed QK(FP8) + PV(BF16) doesn't
+    # collide with all-FP8 or all-BF16 variants.
+    v_dtype_key = torch2cute_dtype_map[v.dtype]
     compile_key = (
         dtype,
+        v_dtype_key,
         head_dim,
         head_dim_v,
         qhead_per_kvhead,
@@ -858,7 +862,10 @@ def _flash_attn_fwd(
             # need uint8 workaround until we pin torch >= 2.11.0 where fp8 export is supported
             q_call = q_call.view(torch.uint8)
             k_call = k_call.view(torch.uint8)
-            v_call = v_call.view(torch.uint8)
+            # Only view V as uint8 if V itself is FP8 (mixed FP8 QK + BF16 PV
+            # keeps V as BF16 natively).
+            if v.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                v_call = v_call.view(torch.uint8)
         descale_tensors = (
             DescaleTensors(q_descale=q_descale, k_descale=k_descale, v_descale=v_descale)
             if q_descale is not None or k_descale is not None or v_descale is not None
