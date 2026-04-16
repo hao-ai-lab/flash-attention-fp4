@@ -611,3 +611,70 @@ forces generic on NVFP4 too for A/B tests.
 
 Status: **#21 resolved**. Dedicated helper offers no perf win on MXFP8;
 keep generic.
+
+## 2026-04-16 MXFP8+FP8 vs NVFP4 QK-only perf gap (task #25)
+
+### Target
+MXFP8 QK + FP8 PV should beat NVFP4 QK + BF16 PV baseline.
+
+### 4-way comparison (bench_fp4 triton.do_bench rep=25)
+
+| shape | NVFP4+BF16 | NVFP4+FP8 | MXFP8+BF16 | MXFP8+FP8 | MXFP8+FP8 Δ |
+|---|---|---|---|---|---|
+| (1,32768,12,128) | 1713 | 1620 | 1650 | 1580 | **-7.8%** |
+| (1,32768,24,128) | 1783 | 1701 | 1670 | 1663 | **-6.7%** |
+| (4,4096,16,128)  | 1646 | 1603 | 1588 | 1560 | **-5.2%** |
+| (4,4096,32,128)  | 1683 | 1632 | 1607 | 1592 | **-5.4%** |
+
+### Attribution
+
+Decomposed for `(1, 32768, 24, 128)`:
+- `NVFP4+BF16 → MXFP8+BF16` = **-113 TF (-6.3%)** ← QK path cost
+- `MXFP8+BF16 → MXFP8+FP8` = **-7 TF (-0.4%)** ← PV path cost
+
+For this shape, **90%+ of the gap is MXFP8 QK itself**, not FP8 PV.
+For `(1, 32768, 12, 128)` the split is roughly 50/50.
+
+### Root cause
+
+MXFP8 uses `kind::mxf8f6f4.block_scale.scale_vec::1X` which has
+**K=32 elements per MMA instruction**. NVFP4 uses
+`kind::mxf4nvf4.block_scale.scale_vec::4X` with **K=64 per instruction**
+(4 packed SFs per operand). For d=128:
+- NVFP4: 2 MMA insts per (M=128, N=128, K=128) tile
+- MXFP8: 4 MMA insts per tile
+
+The extra MMA instructions have fixed scheduling / SF-fetch overhead
+per inst. This shows as `smsp__cycles_active` going up even though
+DRAM/L2 traffic goes down. No kv_stage tuning or softmax fusion closes
+the gap because MMA throughput is the bottleneck.
+
+### Attempts
+
+1. **Fused `_apply_exp2_pack_fp8`** (commit pending): interleaves exp2
+   with cvt.rn.satfinite.e4m3x2.f32 in the same 4-FP32 chunk, removing
+   the explicit 2-pass. Benched at parity — the DSL IR optimizer already
+   fuses at register-allocation level. Kept behind
+   `FA4_FP8_PV_USE_FUSED_PACK=1` for future shapes where the 2-pass
+   cost might matter.
+2. **KV stage cap sweep** (`FA4_FP8_PV_KV_STAGE_CAP` in {0, 4, 6, 8}):
+   no measurable difference; this path isn't kv_stage-bound on B200.
+
+### Structural verdict
+
+**MXFP8 QK + FP8 PV cannot beat NVFP4 QK + BF16 PV on this MMA shape
+without one of:**
+- Dropping block-scaling on QK (use `kind::f8f6f4` pure FP8, losing
+  per-group SF precision), or
+- A `scale_vec::2X` MMA kind that doubles K-per-inst for FP8 (would
+  need PTX support and redesigned SF layout — currently `scale_vec::2X`
+  is the sf_vec_size=16 MXFP8 variant, same 32-K-per-inst), or
+- Layer-level optimization where MXFP8 is traded for better quant
+  precision on downstream layers, not this kernel's TFLOPS.
+
+### Current numerics (unchanged by this task)
+
+- NVFP4 QK: max_diff 0.02–0.27
+- MXFP8 QK + BF16 PV: max_diff 0.004–0.043
+- MXFP8 QK + FP8 PV: max_diff 0.05–0.51
+- FP4 PV (`--quant_v`): max_diff 0.08–1.18

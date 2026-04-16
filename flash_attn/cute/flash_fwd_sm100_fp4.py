@@ -231,6 +231,12 @@ class FlashAttentionForwardSm100:
         self.debug_skip_sfk_s2t = os.getenv("FA4_DEBUG_SKIP_SFK_S2T", "0") == "1"
         self.debug_force_generic_mxfp8_qk = os.getenv("FA4_DEBUG_FORCE_GENERIC_MXFP8_QK", "0") == "1"
         self.fp8_pv_use_explicit_pack = os.getenv("FA4_FP8_PV_USE_EXPLICIT_PACK", "1") == "1"
+        # Fused exp2 + packed E4M3 conversion. A/B'd against the 2-pass baseline
+        # on (1, 32768, 24, 128) MXFP8+FP8 at parity (~1663 TFLOPS both ways) —
+        # the DSL's IR fuser likely achieves the same register schedule. Kept
+        # behind a flag so it can be revisited on shapes where the 2-pass cost
+        # is more exposed.
+        self.fp8_pv_use_fused_pack = os.getenv("FA4_FP8_PV_USE_FUSED_PACK", "0") == "1"
         self.fp8_pv_zero_fill_regs = os.getenv("FA4_FP8_PV_ZERO_FILL_REGS", "1") == "1"
         self.mma_inst_bits_k = 256
         if self.sf_vec_size == 16:
@@ -2782,6 +2788,52 @@ class FlashAttentionForwardSm100:
                 tSrP_u32_view[k] = packed_e2m1
 
     @cute.jit
+    def _apply_exp2_pack_fp8(
+        self,
+        softmax,
+        tSrS: cute.Tensor,
+        tSrP: cute.Tensor,
+        e2e: cutlass.Constexpr[bool] = False,
+        e2e_freq: cutlass.Constexpr[int] = 16,
+    ):
+        """Fused apply_exp2 + pack FP32→FP8.
+
+        Structurally mirrors `_pack_fp8` but runs `exp2` on each 4-tuple of
+        FP32 values just before feeding them into `packed_float_to_ue4m3`
+        (which emits two `cvt.rn.satfinite.e4m3x2.f32` instructions per
+        4-tuple). Avoids the 2-pass overhead that caused FP8 PV to regress
+        vs BF16 PV on long d=128.
+
+        e2e fast-path for exp2 isn't worth it here because each 4-tuple
+        only has 4 vals and we want them packed straight into the FP8
+        lanes; caller can still enable it via `e2e=True` in which case we
+        fall back to the generic apply_exp2_convert + _pack_fp8 path.
+        """
+        assert self.v_dtype == Float8E4M3FN, "only E4M3 packed path implemented"
+        if const_expr(e2e):
+            # Fused path doesn't implement e2e exp2 emulation; use generic.
+            softmax.apply_exp2_convert(tSrS, e2e=e2e, e2e_freq=e2e_freq)
+            self._pack_fp8(tSrS, tSrP)
+            return
+        tSrS_frag = cute.logical_divide(tSrS, cute.make_layout(4))
+        tSrP_frag = cute.logical_divide(tSrP, cute.make_layout(4))
+        for i in cutlass.range_constexpr(0, cute.size(tSrP_frag, mode=[1])):
+            tSrP_u32_view = cute.recast_tensor(tSrP_frag[None, i], cute.Int32)
+            for k in cutlass.range_constexpr(0, cute.size(tSrP_u32_view, mode=[0])):
+                f0 = cute.arch.exp2(tSrS_frag[k * 4, i])
+                f1 = cute.arch.exp2(tSrS_frag[k * 4 + 1, i])
+                f2 = cute.arch.exp2(tSrS_frag[k * 4 + 2, i])
+                f3 = cute.arch.exp2(tSrS_frag[k * 4 + 3, i])
+                # Keep FP32 source updated too, because update_row_sum
+                # (softmax) reads tSrS after this. Writing back avoids a
+                # separate exp2 pass.
+                tSrS_frag[k * 4, i] = f0
+                tSrS_frag[k * 4 + 1, i] = f1
+                tSrS_frag[k * 4 + 2, i] = f2
+                tSrS_frag[k * 4 + 3, i] = f3
+                tSrP_u32_view[k] = packed_float_to_ue4m3(f0, f1, f2, f3)
+
+    @cute.jit
     def _pack_fp8(self, tSrP_f32: cute.Tensor, tSrP: cute.Tensor):
         # Pack FP32 probabilities directly into FP8 lanes so the pure-FP8 PV path
         # avoids the generic elementwise convert-and-pack sequence.
@@ -2957,12 +3009,21 @@ class FlashAttentionForwardSm100:
         else:
             # softmax.scale_apply_exp2_convert(tSrS_t2r, row_max, tSrP_r2t)
             if const_expr(pure_fp8_pv and self.v_dtype == Float8E4M3FN and self.fp8_pv_use_explicit_pack):
-                softmax.apply_exp2_convert(
-                    tSrS_t2r,
-                    e2e=mask_fn is None and self.head_dim_padded <= 128,
-                    e2e_freq=self.e2e_freq,
-                )
-                self._pack_fp8(tSrS_t2r, tSrP_r2t)
+                if const_expr(self.fp8_pv_use_fused_pack):
+                    self._apply_exp2_pack_fp8(
+                        softmax,
+                        tSrS_t2r,
+                        tSrP_r2t,
+                        e2e=mask_fn is None and self.head_dim_padded <= 128,
+                        e2e_freq=self.e2e_freq,
+                    )
+                else:
+                    softmax.apply_exp2_convert(
+                        tSrS_t2r,
+                        e2e=mask_fn is None and self.head_dim_padded <= 128,
+                        e2e_freq=self.e2e_freq,
+                    )
+                    self._pack_fp8(tSrS_t2r, tSrP_r2t)
             else:
                 softmax.apply_exp2_convert(
                     tSrS_t2r,
