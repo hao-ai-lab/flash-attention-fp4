@@ -99,3 +99,31 @@ Next step: add cute.printf of `sK.iterator.toint()` and `sV.iterator.toint()`
 from inside the kernel body (not the host setup) to verify K aliases V's
 base at runtime. Then audit the producer warp's `load_kv_fn` /
 `tma_copy_k` / `tma_copy_v` partition to confirm both use the new layout.
+
+## Correction: 7.78 ms result was spurious
+
+Re-running the current branch HEAD and commit 587564b4 (separate-sV variant)
+both fail with cudaErrorInvalidValue on every tested shape:
+- (1, 32768, 24, 128)
+- (1, 4096, 8, 128)
+- (1, 1024, 4, 128)
+
+The earlier 7.78 ms / 1697 TF result was likely a stale compile cache hit
+from an intermediate state (before proper invalidation). **No variant of
+this WIP patch set has demonstrably run the mixed FP8 QK + BF16 PV config
+to completion.** The bench value is retracted.
+
+## Summary of what blocks progress
+
+1. TMA atom K is built from `sK_layout` (natural stride, cosize = natural).
+2. sK constructed at runtime with scaled stride points into sV buffer.
+3. `cpasync.tma_partition(tma_atom_K, ..., sK, ...)` at call site uses the
+   aligned sK — likely fails validation because its layout doesn't match
+   the atom's internal expectation.
+
+Concrete next step: either
+- Build tma_atom_K with the ALIGNED sK_layout *and* allocate a sV buffer
+  large enough for the doubled cosize, or
+- Patch cpasync.tma_partition to accept layout-relaxed sK.
+
+Both need audit of cpasync internals. Deferred.
