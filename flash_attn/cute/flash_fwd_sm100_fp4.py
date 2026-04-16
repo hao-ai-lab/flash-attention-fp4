@@ -2803,38 +2803,40 @@ class FlashAttentionForwardSm100:
         e2e: cutlass.Constexpr[bool] = False,
         e2e_freq: cutlass.Constexpr[int] = 16,
     ):
-        """Fused exp2 + packed E4M3 conversion — mirrors apply_exp2_convert's
-        32-element fragment structure (not 4-element chunks) so the compiler
-        sees the same big-fragment pattern as the BF16 path. At each fragment
-        boundary, the 32 post-exp2 FP32 values get packed into 8 u32 cells
-        via 8 × `cvt.rn.satfinite.e4m3x2.f32` pairs.
+        """Fused exp2 + packed E4M3 — "all exp2 first, then all pack" structure.
+
+        Runs MUFU.EX2 on the entire tSrS in the first pass, then F2FP.E4M3 in the
+        second pass. Because the second pass only reads registers written in the
+        first pass (no write-after-read on the pack side), the compiler is free
+        to schedule F2FP much later than the MUFU that produced its operands.
+        Compared to the per-fragment fused version, this gives F2FP the maximum
+        possible scheduling distance from its input MUFU.EX2 — reducing the
+        scoreboard stalls observed on F2FP.SATFINITE.E4M3.
+
+        e2e=True still falls back to the 2-pass apply_exp2_convert + _pack_fp8,
+        because apply_exp2_convert uses emulated exp2 which isn't easy to replicate
+        here and the mask-free d=128 callers rely on it.
         """
         assert self.v_dtype == Float8E4M3FN, "only E4M3 packed path implemented"
         if const_expr(e2e):
             softmax.apply_exp2_convert(tSrS, e2e=e2e, e2e_freq=e2e_freq)
             self._pack_fp8(tSrS, tSrP)
             return
-        # 32-element fragments: same shape apply_exp2_convert uses for BF16 dst.
-        frg_tile = const_expr(min(32, cute.size(tSrS)))
-        assert frg_tile % 8 == 0  # need multiples of 8 for 2 × e4m3x2 per 4-chunk
-        frg_cnt = const_expr(cute.size(tSrS) // frg_tile)
-        tSrS_frg = cute.logical_divide(tSrS, cute.make_layout(frg_tile))
-        tSrP_frg = cute.logical_divide(tSrP, cute.make_layout(frg_tile))
-        for j in cutlass.range_constexpr(frg_cnt):
-            # Pass 1: in-place exp2 (identical to apply_exp2_convert BF16 path)
-            for k in cutlass.range_constexpr(0, frg_tile, 2):
-                tSrS_frg[k, j] = cute.arch.exp2(tSrS_frg[k, j])
-                tSrS_frg[k + 1, j] = cute.arch.exp2(tSrS_frg[k + 1, j])
-            # Pass 2: pack 32 FP32 → 8 u32 cells via 16 e4m3x2 cvts.
-            # Kept in the same fragment so regs stay live between exp2 writes
-            # and pack reads.
-            u32_view = cute.recast_tensor(tSrP_frg[None, j], cute.Int32)
-            for k in cutlass.range_constexpr(0, frg_tile // 4):
+        # Pass 1: all exp2, in-place
+        for k in cutlass.range_constexpr(0, cute.size(tSrS), 2):
+            tSrS[k] = cute.arch.exp2(tSrS[k])
+            tSrS[k + 1] = cute.arch.exp2(tSrS[k + 1])
+        # Pass 2: all pack, reading the now-complete tSrS
+        tSrS_frg = cute.logical_divide(tSrS, cute.make_layout(4))
+        tSrP_frg = cute.logical_divide(tSrP, cute.make_layout(4))
+        for i in cutlass.range_constexpr(0, cute.size(tSrP_frg, mode=[1])):
+            u32_view = cute.recast_tensor(tSrP_frg[None, i], cute.Int32)
+            for k in cutlass.range_constexpr(0, cute.size(u32_view, mode=[0])):
                 u32_view[k] = packed_float_to_ue4m3(
-                    tSrS_frg[k * 4, j],
-                    tSrS_frg[k * 4 + 1, j],
-                    tSrS_frg[k * 4 + 2, j],
-                    tSrS_frg[k * 4 + 3, j],
+                    tSrS_frg[k * 4, i],
+                    tSrS_frg[k * 4 + 1, i],
+                    tSrS_frg[k * 4 + 2, i],
+                    tSrS_frg[k * 4 + 3, i],
                 )
 
     @cute.jit
