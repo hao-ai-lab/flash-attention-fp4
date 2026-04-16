@@ -77,3 +77,25 @@ This matches `flash_fwd_sm100_fp4.py:1345-1361` exactly.
    layout (not the original sK_layout).
 3. Audit the pipeline barrier indexing for K vs V — they share stage slots
    but need consistent numbering.
+
+## Update: SMEM is NOT the blocker
+
+Instrumented `SharedStorage.size_in_bytes()` and kv_stage calc. Results:
+
+| config | k_per (B) | v_per (B) | kv_per (B) | cta_group | kv_stage | total SMEM |
+|---|---|---|---|---|---|---|
+| all-BF16 (baseline) | 32768 | 32768 | 16384 | 2 | 6 | 228.0 KB |
+| FP8 QK + BF16 PV (mixed) | 16384 | 32768 | 16384 | 2 | 8 | 228.0 KB |
+
+Both configs allocate **identical 228 KB total** — the mixed case is not
+overflowing SMEM. B200's max dynamic SMEM per block IS 228 KB and the BF16
+baseline happily runs at that limit. So `cudaErrorInvalidValue` on the
+mixed path comes from elsewhere (likely TMA producer/consumer assuming old
+sV=recast(sK) addressing, or pipeline barrier state mismatch).
+
+## Remaining debug (runtime kernel launch / TMA)
+
+Next step: add cute.printf of `sK.iterator.toint()` and `sV.iterator.toint()`
+from inside the kernel body (not the host setup) to verify K aliases V's
+base at runtime. Then audit the producer warp's `load_kv_fn` /
+`tma_copy_k` / `tma_copy_v` partition to confirm both use the new layout.

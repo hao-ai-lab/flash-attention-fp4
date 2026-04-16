@@ -730,6 +730,12 @@ class FlashAttentionForwardSm100:
             ]
 
         self.shared_storage = SharedStorage
+        print(
+            f"FA4_SMEM k_dtype={self.k_dtype} v_dtype={self.v_dtype} "
+            f"kv_stage={self.kv_stage} "
+            f"TOTAL={_total_smem}B ({_total_smem/1024:.1f}KB)",
+            flush=True,
+        )
 
         softmax_scale_log2, softmax_scale = utils.compute_softmax_scale_log2(softmax_scale, self.score_mod)
         window_size_left = Int32(window_size_left) if window_size_left is not None else None
