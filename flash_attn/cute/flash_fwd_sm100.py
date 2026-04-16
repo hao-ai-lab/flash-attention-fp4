@@ -420,8 +420,12 @@ class FlashAttentionForwardSm100:
         # check type consistency
         if const_expr(self.q_dtype != self.k_dtype):
             raise TypeError(f"Type mismatch: {self.q_dtype} != {self.k_dtype}")
-        if const_expr(self.q_dtype != self.v_dtype):
-            raise TypeError(f"Type mismatch: {self.q_dtype} != {self.v_dtype}")
+        # Allow mixed dtype between Q/K (FP8) and V (BF16/FP16) for perf A/B:
+        # PV MMA uses kind::f16 when V is BF16, QK uses kind::f8f6f4 when Q/K
+        # are FP8. This requires the P operand path to stay BF16 (which we
+        # achieve by having apply_exp2_convert cast to v_dtype at end of
+        # softmax — same as the same-dtype baseline).
+        pass  # was: assert q_dtype == v_dtype
         if const_expr(self.q_dtype.width == 8):
             paged_kv_non_tma = not self.use_tma_KV
             if const_expr(self.head_dim_padded < 96):
@@ -497,8 +501,11 @@ class FlashAttentionForwardSm100:
         sK_layout = sm100_utils_basic.make_smem_layout_b(
             tiled_mma_qk, self.mma_tiler_qk, self.k_dtype, self.kv_stage
         )
+        # P (A operand of PV MMA) dtype must match the PV MMA's A-operand dtype,
+        # which equals v_dtype (since tiled_mma_pv was constructed with v_dtype).
+        # When q_dtype != v_dtype (mixed FP8 QK + BF16 PV), we need v_dtype here.
         tP_layout = sm100_utils_basic.make_smem_layout_a(
-            tiled_mma_pv, self.mma_tiler_pv, self.q_dtype, self.s_stage
+            tiled_mma_pv, self.mma_tiler_pv, self.v_dtype, self.s_stage
         )
         sV_layout = sm100_utils_basic.make_smem_layout_b(
             tiled_mma_pv, self.mma_tiler_pv, self.v_dtype, self.kv_stage
