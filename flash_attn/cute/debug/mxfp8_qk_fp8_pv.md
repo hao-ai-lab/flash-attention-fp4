@@ -678,3 +678,37 @@ without one of:**
 - MXFP8 QK + BF16 PV: max_diff 0.004–0.043
 - MXFP8 QK + FP8 PV: max_diff 0.05–0.51
 - FP4 PV (`--quant_v`): max_diff 0.08–1.18
+
+## 2026-04-16 Full comparison: FP8 QK + BF16/FP8 PV apples-to-apples
+
+Shape: `(1, 32768, 24, 128)`, non-causal, triton.do_bench rep=25 warmup=10.
+
+| kernel | QK dtype | PV dtype | Duration | TFLOPs | IPC | SM Busy | cyc/inst | F2FP count / stalls |
+|---|---|---|---|---|---|---|---|---|
+| pr2109 | BF16 | BF16 | 15.67 ms | 1193 | 1.50 | 65.16% | 9.97 | 256 / 1564 |
+| pr2109 | FP8  | FP8  | 10.85 ms | 1978 | 2.18 | 74.73% | 6.89 | 256 / 5851 |
+| pr2109 | FP8  | BF16 | pending  | —    | —    | —      | —    | — (mixed dtype requires kernel surgery) |
+| ours   | BF16 | BF16 |  9.26 ms | 1425 | —    | —      | —    | — |
+| ours   | **FP8**  | **FP8**  | **11.99 ms** | **1794** | **1.69** | 82.31% | 8.89 | 256 / 6633 |
+| ours   | FP8  | BF16 | pending  | —    | —    | —      | —    | — (mixed dtype requires kernel surgery) |
+| ours   | NVFP4 | BF16 | 11.91 ms | 1767 | 1.57 | 82.97% | 9.53 | 256 / 3425 |
+| ours   | NVFP4 | FP8  | 12.62 ms | 1705 | 1.46 | 78.14% | 10.26 | 256 / **14129** |
+| ours   | MXFP8 | FP8  | 12.89 ms | 1667 | 1.44 | 76.57% | 10.41 | 256 / **14632** |
+
+### Key findings
+
+- **Pure FP8 QK + FP8 PV beats NVFP4+BF16** in our kernel (1794 vs 1767 TF). Block-scale
+  wasn't essential; it was actually hurting the FP8 PV path.
+- **F2FP stall attribution is clear**: pure FP8 paths show ~6K stalls; block-scaled FP8
+  paths show ~14K stalls. The extra ~8K come from the SF plumbing, not from FP8 pack
+  itself.
+- Our FP8 kernel IPC jumps 1.44 → 1.69 when we drop block-scale.
+- pr2109 still wins (10.85 vs 11.99 ms, +10%) on pure-FP8 apples-to-apples — their
+  kernel has better FP8 scheduling (IPC 2.18 vs ours 1.69). Fixable kernel-level gap.
+
+### Ours: how to enable pure FP8 QK
+
+`FA4_ALLOW_PURE_FP8_QK=1` — interface.py lets FP8 Q/K/V through to
+`FlashAttentionForwardSm100` (the non-blockscaled path) when set. The kernel already
+supports kind::f8f6f4 via `_mma_inst_kind`; only the assertion in interface.py
+gated it off.

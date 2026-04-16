@@ -20,6 +20,7 @@
 # - bwd pass optimized for Hopper/Blackwell
 
 import math
+import os
 from functools import lru_cache
 from typing import Optional, Tuple, Callable, Union, Type
 
@@ -327,14 +328,19 @@ def _flash_attn_fwd(
         if not use_fp4:
             k_dtype = k.element_type if isinstance(k, cute.Tensor) else k.dtype
             v_dtype = v.element_type if isinstance(v, cute.Tensor) else v.dtype
+            # Allow pure FP8 Q/K/V (no block scale) — routes through
+            # FlashAttentionForwardSm100 with kind::f8f6f4. Gated on the env flag
+            # so the default behavior (reject pure FP8 → force block-scale) is
+            # preserved; set FA4_ALLOW_PURE_FP8_QK=1 to opt into A/B testing.
             allowed_q_dtypes = [cutlass.Float16, cutlass.BFloat16]
-            if mSFQ is not None:
+            if mSFQ is not None or os.environ.get("FA4_ALLOW_PURE_FP8_QK", "0") == "1":
                 allowed_q_dtypes.extend([cutlass.Float8E4M3FN, cutlass.Float8E5M2])
             assert q_dtype in allowed_q_dtypes, (
                 "inputs must be float16/bfloat16, or FP8 when block-scaled QK scale factors are provided"
             )
             assert q_dtype == k_dtype, "Q and K must have the same dtype"
-            if mSFQ is None:
+            _mixed_ok = os.environ.get("FA4_ALLOW_PURE_FP8_QK", "0") == "1"
+            if mSFQ is None and not _mixed_ok:
                 assert q_dtype == v_dtype, "inputs must have the same dtype"
             else:
                 assert v_dtype in [
@@ -347,13 +353,14 @@ def _flash_attn_fwd(
         use_fp4 = is_nvfp4_dtype(q.dtype)
         if not use_fp4:
             allowed_q_dtypes = [torch.float16, torch.bfloat16]
-            if mSFQ is not None:
+            if mSFQ is not None or os.environ.get("FA4_ALLOW_PURE_FP8_QK", "0") == "1":
                 allowed_q_dtypes.extend([torch.float8_e4m3fn, torch.float8_e5m2])
             assert q.dtype in allowed_q_dtypes, (
                 "inputs must be float16/bfloat16, or FP8 when block-scaled QK scale factors are provided"
             )
             assert q.dtype == k.dtype, "Q and K must have the same dtype"
-            if mSFQ is None:
+            _mixed_ok = os.environ.get("FA4_ALLOW_PURE_FP8_QK", "0") == "1"
+            if mSFQ is None and not _mixed_ok:
                 assert q.dtype == v.dtype, "inputs must have the same dtype"
             else:
                 assert v.dtype in [
