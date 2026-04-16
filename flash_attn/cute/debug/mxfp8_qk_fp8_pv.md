@@ -687,7 +687,7 @@ Shape: `(1, 32768, 24, 128)`, non-causal, triton.do_bench rep=25 warmup=10.
 |---|---|---|---|---|---|---|---|---|
 | pr2109 | BF16 | BF16 | 15.67 ms | 1193 | 1.50 | 65.16% | 9.97 | 256 / 1564 |
 | pr2109 | FP8  | FP8  | 10.85 ms | 1978 | 2.18 | 74.73% | 6.89 | 256 / 5851 |
-| pr2109 | FP8  | BF16 | pending  | —    | —    | —      | —    | — (mixed dtype requires kernel surgery) |
+| pr2109 | FP8  | BF16 |  7.77 ms | 1697 | 2.20 | 64.45% | 6.83 | 256 / pending |
 | ours   | BF16 | BF16 |  9.26 ms | 1425 | —    | —      | —    | — |
 | ours   | **FP8**  | **FP8**  | **11.99 ms** | **1794** | **1.69** | 82.31% | 8.89 | 256 / 6633 |
 | ours   | FP8  | BF16 | pending  | —    | —    | —      | —    | — (mixed dtype requires kernel surgery) |
@@ -705,6 +705,15 @@ Shape: `(1, 32768, 24, 128)`, non-causal, triton.do_bench rep=25 warmup=10.
 - Our FP8 kernel IPC jumps 1.44 → 1.69 when we drop block-scale.
 - pr2109 still wins (10.85 vs 11.99 ms, +10%) on pure-FP8 apples-to-apples — their
   kernel has better FP8 scheduling (IPC 2.18 vs ours 1.69). Fixable kernel-level gap.
+- **pr2109 FP8 QK + BF16 PV** (new row): 7.77 ms / 1697 TF at (1,32768,24,128).
+  Sits between pr2109 FP8/FP8 (10.85 ms) and pr2109 BF16/BF16 (15.67 ms), showing
+  the FP8 speedup in pr2109 is NOT exclusive to FP8 V — FP8 QK alone captures a
+  large fraction of the improvement. IPC 2.20 matches their pure-FP8 path, so
+  their QK MMA throughput isn't materially hurt by switching V back to BF16.
+  Implementation: `hao-ai-lab/flash-attention-fp4` branch `pr2109-mixed-dtype`
+  commit 65cbcc8a — key fixes: SharedStorage sizes sK for V's byte footprint,
+  recast_ptr sets dtype=v_dtype, P operand dtype follows v_dtype, tmem store
+  Repetition keyed on v_dtype.width.
 
 ### Ours: how to enable pure FP8 QK
 
