@@ -546,10 +546,6 @@ class FlashAttentionForwardSm100:
                     stride=(*sV_layout.outer.stride[:-1], stage_stride),
                 ),
             )
-        # NOTE: when k_dtype < v_dtype (K aliases V), sK_layout is left at its
-        # natural stride so the TMA atom's cosize matches K's actual data size.
-        # The runtime sK construction below uses a rebuilt layout with scaled
-        # stage stride to place K into V's buffer at the correct byte offsets.
 
         if const_expr(self.pack_gqa):
             nheads_kv = mK.shape[2]
@@ -714,23 +710,21 @@ class FlashAttentionForwardSm100:
             sQ: cute.struct.Align[
                 cute.struct.MemRange[self.q_dtype, sQ_size], self.buffer_align_bytes
             ]
-            # K/V SMEM aliasing pattern (matches flash_fwd_sm100_fp4):
-            # - same dtype: sK holds the buffer, sV aliases via recast_ptr.
-            # - k_dtype < v_dtype (FP8 K + BF16 V): sV holds the larger buffer,
-            #   sK is a dummy placeholder and K aliases sV's base with its stage
-            #   stride scaled by (v_width/k_width) so they stay byte-aligned.
-            # - k_dtype > v_dtype: separate sV of its own size.
+            # K/V SMEM aliasing (three-way):
+            # - k_dtype == v_dtype: pristine pr2109 layout — sK owns, sV aliases
+            #   via recast_ptr at runtime (no sV field needed).
+            # - k_dtype < v_dtype (FP8 K + BF16 V): sK sized for V's byte
+            #   footprint using k_dtype count = cosize(sV_layout) * v_width/k_width.
+            #   sV aliases sK at runtime via recast_ptr.
+            # Byte-identical to pristine struct when k_dtype == v_dtype.
             sK: cute.struct.Align[
-                cute.struct.MemRange[self.k_dtype, 1]
-                if self.k_dtype.width < self.v_dtype.width
-                else cute.struct.MemRange[self.k_dtype, cute.cosize(sK_layout)],
-                1 if self.k_dtype.width < self.v_dtype.width else self.buffer_align_bytes,
-            ]
-            sV: cute.struct.Align[
-                cute.struct.MemRange[self.v_dtype, cute.cosize(sV_layout)]
-                if self.k_dtype != self.v_dtype
-                else cute.struct.MemRange[self.k_dtype, 1],
-                self.buffer_align_bytes if self.k_dtype != self.v_dtype else 1,
+                cute.struct.MemRange[
+                    self.k_dtype,
+                    cute.cosize(sV_layout) * self.v_dtype.width // self.k_dtype.width
+                    if self.k_dtype.width < self.v_dtype.width
+                    else cute.cosize(sK_layout),
+                ],
+                self.buffer_align_bytes,
             ]
 
         self.shared_storage = SharedStorage
@@ -1020,33 +1014,27 @@ class FlashAttentionForwardSm100:
         #  Generate smem tensor Q/K/V/O
         # (MMA, MMA_Q, MMA_D, PIPE)
         sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner)
-        # K/V SMEM aliasing — matches flash_fwd_sm100_fp4 three-way pattern:
-        # - same dtype: sK owns buffer, sV aliases sK via recast_ptr.
-        # - k_dtype < v_dtype (FP8 K + BF16 V): sV owns the larger buffer,
-        #   sK aliases sV with its stage-stride scaled up by (v_width/k_width)
-        #   so both keep the same byte stride per stage.
-        # - k_dtype > v_dtype: sK owns its buffer, sV has a separate allocation.
-        if const_expr(self.v_dtype == self.k_dtype):
-            sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
-            sV = cute.make_tensor(cute.recast_ptr(sK.iterator, sV_layout.inner), sV_layout.outer)
-        elif const_expr(self.k_dtype.width < self.v_dtype.width):
-            # K aliases V's buffer with a rebuilt sK outer layout whose stage
-            # stride = stride_sV * (v_width/k_width). Byte-equivalent footprint.
-            sV = storage.sV.get_tensor(sV_layout.outer, swizzle=sV_layout.inner)
-            stride_sV = const_expr(max(sV_layout.outer.stride[-1], 0))
+        # K/V SMEM aliasing. sK always owns the physical buffer (sized for V
+        # bytes when k_dtype < v_dtype). sV aliases sK via recast_ptr. For
+        # k_dtype < v_dtype we rebuild sK's outer layout with a scaled stage
+        # stride so each stage spans V's per-stage byte footprint.
+        if const_expr(self.k_dtype.width < self.v_dtype.width):
+            stride_sV_elts = const_expr(max(sV_layout.outer.stride[-1], 0))
             stride_sK_aligned = const_expr(
-                stride_sV * self.v_dtype.width // self.k_dtype.width
+                stride_sV_elts * self.v_dtype.width // self.k_dtype.width
             )
             sK_outer_aligned = cute.make_layout(
                 sK_layout.outer.shape,
                 stride=(*sK_layout.outer.stride[:-1], stride_sK_aligned),
             )
-            sK = storage.sV.get_tensor(
-                sK_outer_aligned, swizzle=sK_layout.inner, dtype=self.k_dtype
+            sK = storage.sK.get_tensor(sK_outer_aligned, swizzle=sK_layout.inner)
+            sV = cute.make_tensor(
+                cute.recast_ptr(sK.iterator, sV_layout.inner, dtype=self.v_dtype),
+                sV_layout.outer,
             )
         else:
             sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
-            sV = storage.sV.get_tensor(sV_layout.outer, swizzle=sV_layout.inner)
+            sV = cute.make_tensor(cute.recast_ptr(sK.iterator, sV_layout.inner), sV_layout.outer)
         if const_expr(not self.overlap_sO_sQ):
             sO = storage.sO.get_tensor(sO_layout.outer, swizzle=sO_layout.inner)
         else:
@@ -1944,9 +1932,10 @@ class FlashAttentionForwardSm100:
             tidx
         )
         tStScale_r2t = thr_tmem_store_scale.partition_D(tStScale)
+        # P tmem-store repetition depends on P's dtype (= v_dtype for PV MMA).
         tmem_store_atom = cute.make_copy_atom(
             tcgen05.copy.St32x32bOp(
-                tcgen05.copy.Repetition(8 if const_expr(self.q_dtype.width == 8) else 16)
+                tcgen05.copy.Repetition(8 if const_expr(self.v_dtype.width == 8) else 16)
             ),
             Float32,
         )
@@ -2331,8 +2320,9 @@ class FlashAttentionForwardSm100:
         tSrP_r2t_f32 = cute.make_fragment(
             thr_tmem_store.partition_S(cute.make_identity_tensor(tScP_shape)).shape, Float32
         )
+        # P operand of PV MMA uses v_dtype (BF16 when mixed FP8 QK + BF16 PV).
         tSrP_r2t = cute.make_tensor(
-            cute.recast_ptr(tSrP_r2t_f32.iterator, dtype=self.q_dtype), tSrS_t2r.layout
+            cute.recast_ptr(tSrP_r2t_f32.iterator, dtype=self.v_dtype), tSrS_t2r.layout
         )
         # softmax.scale_apply_exp2_convert(tSrS_t2r, row_max, tSrP_r2t)
         softmax.apply_exp2_convert(
