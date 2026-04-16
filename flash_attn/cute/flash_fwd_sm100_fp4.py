@@ -230,6 +230,12 @@ class FlashAttentionForwardSm100:
         self.debug_skip_sfq_s2t = os.getenv("FA4_DEBUG_SKIP_SFQ_S2T", "0") == "1"
         self.debug_skip_sfk_s2t = os.getenv("FA4_DEBUG_SKIP_SFK_S2T", "0") == "1"
         self.debug_force_generic_mxfp8_qk = os.getenv("FA4_DEBUG_FORCE_GENERIC_MXFP8_QK", "0") == "1"
+        # Force MXFP8 QK through the inline-PTX helper for perf A/B. Measured
+        # after the tmem_s_offset SFQ collision fix:
+        #   MXFP8+BF16 (1,32768,24,128): inline 1718 TF, generic 1670 TF (+2.9%)
+        #   MXFP8+BF16 (1,32768,12,128): inline 1643 TF, generic 1650 TF (tie)
+        # Mixed results; keep default generic, toggleable for per-shape tuning.
+        self.debug_mxfp8_use_inline_ptx = os.getenv("FA4_MXFP8_USE_INLINE_PTX", "0") == "1"
         self.fp8_pv_use_explicit_pack = os.getenv("FA4_FP8_PV_USE_EXPLICIT_PACK", "1") == "1"
         # Fused exp2 + packed E4M3 conversion. A/B'd against the 2-pass baseline
         # on (1, 32768, 24, 128) MXFP8+FP8 at parity (~1663 TFLOPS both ways) —
@@ -2056,7 +2062,8 @@ class FlashAttentionForwardSm100:
             # The debug flag lets us force generic on NVFP4 too for A/B tests.
             if const_expr(
                 self.debug_force_generic_mxfp8_qk
-                or qk_mma_op.a_dtype in (Float8E4M3FN, Float8E5M2)
+                or (qk_mma_op.a_dtype in (Float8E4M3FN, Float8E5M2)
+                    and not self.debug_mxfp8_use_inline_ptx)
             ):
                 gemm_Si = [
                     partial(
