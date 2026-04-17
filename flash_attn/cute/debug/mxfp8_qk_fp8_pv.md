@@ -88,6 +88,11 @@ Per-warp avg stall contribution (`inst/warp`, single-shot NCU on
 | ours MXFP8 BF16 → MXFP8 FP8        |  −583K   |  +555K   | +640K |  +0.61 |
 | ours BF16 BF16 → pure FP8 FP8      | **−2,169K** |  +246K |     0  | **−1.75** |
 
+**Note:** when `pv_mode='fp8'` the benchmark passes `mSFV=None`, so
+`self.quant_pv = (mSFV is not None) = False`. PV uses `make_trivial_tiled_mma`
+(pure `MmaFP8Op`) — **no SFV and no SFP** plumbing in this config. The cost
+below is not from PV scale factors.
+
 **Interpretation**:
 - **pr2109's FP8 PV win is bandwidth-driven.** V's per-stage byte count halves
   (BF16 → FP8), which drops the long-scoreboard wait by ~1M cyc/inst (consumer
@@ -97,44 +102,63 @@ Per-warp avg stall contribution (`inst/warp`, single-shot NCU on
 - **Ours pure FP8 / FP8 also wins** for the same bandwidth reason: long_sb
   drops ~2M cyc/inst, mio_throttle rises only modestly (+246K). Net cyc/inst
   falls 1.75 — FP8 PV is unambiguously good here.
-- **Ours block-scaled + FP8 PV regresses** because mio_throttle spikes by
-  **+735K (NVFP4)** or **+555K (MXFP8)** — 4–5× the rise pr2109 sees. That
-  wipes out the bandwidth gain (−570K long_sb) and leaves cyc/inst +0.7
-  worse. This is a direct symptom of SFP + SFV plumbing: softmax now has to
-  compute and store SFP alongside FP8-packed P, and each PV MMA needs SFV
-  loaded from smem → per-thread registers → broadcast among threads. Those
-  operations run on the MIO pipe.
+- **Ours block-scaled QK + FP8 PV regresses** because mio_throttle spikes by
+  **+735K (NVFP4)** or **+555K (MXFP8)**, wiping out the bandwidth gain.
 
-#### Why our pure-FP8/FP8 path DOES benefit
+#### What is actually loading MIO (confirmed by knob-toggling)
 
-With `FA4_ALLOW_PURE_FP8_QK=1`, Q/K/V go through `flash_fwd_sm100.py`
-(non-block-scaled) — no SFQ/SFK/SFP/SFV anywhere. That makes the FP8 PV
-transition look exactly like pr2109's: a pure bandwidth/MMA-throughput win
-with no MIO tax.
+Two components combine:
+
+**1. Narrower P tmem-store atom for FP8 P (Rep=8 vs 16).** P is emitted to
+TMEM via `tcgen05.St32x32bOp(Repetition(N))`. Our default is Rep=16 for BF16
+P and Rep=8 for FP8 P. Direct measurement at this shape with NVFP4 QK:
+
+| FA4_FP8_PV_TMEM_STORE_REP | ms   | mio_throttle | long_sb | cyc/inst |
+|---|---|---|---|---|
+| 8 (default for FP8 V)     | 12.60 | 1,129K | 6,290K | 10.23 |
+| 16 (BF16-style)           | 16.98 |    46K | 12,387K | 13.96 |
+
+Rep=8 issues 2× as many tmem-store atoms per tile — that's where the MIO
+pressure on the FP8 V path comes from. It's still a clear overall win over
+Rep=16 (−4.4 ms) because Rep=16 stalls waiting on long-scoreboard instead.
+
+**2. SFQ / SFK smem → register reads.** Block-scaled QK's per-MMA
+scale-factor reads from SMEM go through the MIO pipe. On the NVFP4+BF16
+path, the P tmem-store is wide (Rep=16) so MIO has slack and SFQ/SFK reads
+don't throttle. On the NVFP4+FP8 path, the narrower Rep=8 tmem-store is
+already loading MIO; adding the SFQ/SFK reads on top saturates it.
+
+Evidence: the ONLY structural difference between ours-pure-FP8/FP8 (mio
+510K) and ours-NVFP4+FP8 (mio 1,129K) is SFQ/SFK plumbing — both use FP8 V,
+both use Rep=8, both use `MmaFP8Op` for PV. The +619K gap between them is
+attributable to SFQ/SFK on MIO.
+
+`sm__inst_executed_pipe_lsu.sum` is nearly identical across NVFP4+BF16 vs
+NVFP4+FP8 (13.19M vs 13.17M); the MIO jump comes from **queue contention**,
+not from more instructions issuing.
+
+Knob sweeps that did NOT move the dial (confirming it's not any of these):
+- `FA4_FP8_PV_KV_STAGE_CAP ∈ {0, 4, 6, 8}` — flat at 12.60 ms / mio 1,129K.
+- `FA4_FP8_PV_USE_EXPLICIT_PACK × FA4_FP8_PV_USE_FUSED_PACK` all four
+  combos — flat at ~12.90 ms / mio ~1,046K.
+- `FA4_FP8_PV_ZERO_FILL_REGS ∈ {0, 1}` — flat.
 
 #### Why pr2109's MIO stays low
 
-pr2109 has zero scale-factor plumbing. The FP8 PV step is just:
-(a) halve V smem bytes → long_sb drops, (b) use `kind::f8f6f4` PV MMA
-instead of `kind::f16` → 2× compute throughput. Nothing touches MIO.
+pr2109 has zero scale-factor plumbing. Its Rep=8 FP8-P tmem-store does load
+MIO (rises 128K → 267K for the BF16 → FP8 PV switch), but without the
+SFQ/SFK reads competing, MIO has plenty of slack — the rise is a
+rounding-error +139K cyc/inst, not +735K.
 
-#### Fixing the block-scaled + FP8 PV regression (speculative)
+#### Fixing the block-scaled QK + FP8 PV regression (possibilities)
 
-The +735K mio_throttle on ours is probably dominated by:
-1. SFV load from smem to register per PV-MMA iteration (tcgen05 needs SFV in
-   a specific register layout; `find_tmem_tensor_col_offset` returns cosize
-   so we iterate addresses manually).
-2. SFP compute + tmem-store in the softmax warp (fused exp2+pack already
-   helps but the SF generation is additional).
-
-Plausible mitigations:
-- Keep SFV resident in registers across multiple PV iterations (amortize
-  the load).
-- Fuse the SFP+P pack into a single tmem-store (the `_apply_exp2_pack_fp8`
-  helper does this for P; SF side is still separate).
-- Skip block-scaling on PV entirely when V is FP8: use pure `MmaFP8Op` for
-  PV even when QK is block-scaled. That removes SFV/SFP but needs
-  descale handling for V in the correction step.
+- Issue SFQ/SFK reads further from the P tmem-stores so MIO queue slots
+  don't clash. Current code loads SFQ/SFK inside the same warp-group that
+  produces P — reorder so they're phase-shifted.
+- Consume SFQ/SFK in larger bursts (pack more SFs per LDS) to reduce MIO
+  op count. Current path reads them individually.
+- Cache SFQ/SFK in a register file slot across multiple PV iterations
+  rather than reloading every tile.
 
 ### 3. Why pr2109 extracts more from FP8 on long seqlens
 
