@@ -228,6 +228,9 @@ class FlashAttentionForwardSm100:
         self.sf_dtype = sf_dtype
         self.sf_vec_size = sf_vec_size
         self.debug_skip_sfq_s2t = os.getenv("FA4_DEBUG_SKIP_SFQ_S2T", "0") == "1"
+        # FA4_SFQK_TMEM_SLOT: "s" (default staggered-S), "o" (o-offsets),
+        # "o_stagger" (staggered-O). Experiment knob for SFQK TMEM placement.
+        self.sfqk_tmem_slot = os.getenv("FA4_SFQK_TMEM_SLOT", "s")
         self.debug_skip_sfk_s2t = os.getenv("FA4_DEBUG_SKIP_SFK_S2T", "0") == "1"
         self.debug_force_generic_mxfp8_qk = os.getenv("FA4_DEBUG_FORCE_GENERIC_MXFP8_QK", "0") == "1"
         # Force MXFP8 QK through the inline-PTX helper for perf A/B. Measured
@@ -1420,18 +1423,28 @@ class FlashAttentionForwardSm100:
         tCtSFQs = [None] * self.q_stage
         tCtSFKs = [None] * self.q_stage
         if const_expr(self.quant_qk):
-            # Use tmem_s_offset for both NVFP4 and MXFP8 — SFA sits in the same TMEM
-            # col range as the S accumulator, but its physical layout uses non-
-            # overlapping rows per the make_tmem_layout_sfa encoding. Previously
-            # MXFP8 was using tmem_o_offset which collides with the O accumulator
-            # once the PV pipeline stage overlaps with QK — suspected root cause
-            # of the MXFP8 NaN/inf garbage.
-            sfq_base_offsets = self.tmem_s_offset
-            # Match NVFP4's staggered stage order (stage k → offset[q_stage-1-k])
-            # for MXFP8 as well, since they now share the same base offsets.
-            sfq_stage_order = tuple(
-                self.q_stage - 1 - stage for stage in range(self.q_stage)
-            )
+            # SFQK tmem placement experiment (FA4_SFQK_TMEM_SLOT env):
+            #   "s"  (default) — use tmem_s_offset (staggered): SF for stage k
+            #                    lives where S for stage (q_stage-1-k) lives.
+            #                    Safe by construction; current baseline.
+            #   "o"            — use tmem_o_offset slots. Frees S's tmem from
+            #                    SFQK traffic so softmax warp + SFQK MMA copy
+            #                    don't compete. Risk: collides with O acc.
+            #   "o_stagger"    — o offsets with opposite-stage staggering
+            #                    (stage k → tmem_o_offset[q_stage-1-k]).
+            if const_expr(self.sfqk_tmem_slot == "o"):
+                sfq_base_offsets = self.tmem_o_offset
+                sfq_stage_order = tuple(range(self.q_stage))
+            elif const_expr(self.sfqk_tmem_slot == "o_stagger"):
+                sfq_base_offsets = self.tmem_o_offset
+                sfq_stage_order = tuple(
+                    self.q_stage - 1 - stage for stage in range(self.q_stage)
+                )
+            else:  # "s" default — original staggered S-offset
+                sfq_base_offsets = self.tmem_s_offset
+                sfq_stage_order = tuple(
+                    self.q_stage - 1 - stage for stage in range(self.q_stage)
+                )
             sfq_tmem_ptrs_f32 = [
                 cute.make_ptr(
                     Float32,
