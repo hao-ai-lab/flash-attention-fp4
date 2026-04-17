@@ -122,6 +122,8 @@ torch2cute_dtype_map = {
     torch.float16: cutlass.Float16,
     torch.bfloat16: cutlass.BFloat16,
     torch.float32: cutlass.Float32,
+    torch.float8_e4m3fn: cutlass.Float8E4M3FN,
+    torch.float8_e5m2: cutlass.Float8E5M2,
 }
 
 cute2torch_dtype_map = {
@@ -432,7 +434,13 @@ def _flash_attn_fwd(
             out_torch_dtype = cute2torch_dtype_map[q_dtype]
         device = torch.device('cuda')  # CUTE tensors are always on CUDA
     else:
-        out_torch_dtype = torch.bfloat16 if use_blockscaled_impl else q.dtype
+        if use_blockscaled_impl:
+            out_torch_dtype = torch.bfloat16
+        elif q.dtype in (torch.float8_e4m3fn, torch.float8_e5m2) and v.dtype in (torch.float16, torch.bfloat16):
+            # Mixed FP8 QK + BF16/FP16 PV: output follows v_dtype (the widest operand).
+            out_torch_dtype = v.dtype
+        else:
+            out_torch_dtype = q.dtype
         device = q.device
     q_batch_seqlen_shape = (batch_size, seqlen_q) if cu_seqlens_q is None else (total_q,)
     lse_shape = (batch_size, num_head, seqlen_q) if cu_seqlens_q is None else (num_head, total_q)
@@ -617,8 +625,14 @@ def _flash_attn_fwd(
         else:
             _key_sf_dtype = cutlass.Float8E4M3FN
 
+    # v_dtype key: distinguish mixed FP8 QK + BF16 PV vs pure FP8 QK + FP8 PV.
+    if isinstance(v, cute.Tensor):
+        _key_v_dtype = v.element_type
+    else:
+        _key_v_dtype = torch2cute_dtype_map.get(v.dtype, cutlass.BFloat16)
     compile_key = (
         dtype,
+        _key_v_dtype,
         head_dim,
         head_dim_v,
         qhead_per_kvhead,

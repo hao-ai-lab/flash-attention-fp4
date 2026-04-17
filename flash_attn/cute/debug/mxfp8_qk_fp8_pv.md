@@ -17,8 +17,9 @@ the mixed-dtype fix landed.
 | pr2109 | BF16  | BF16 | 11.23 | 1175 | baseline |
 | pr2109 | FP8   | BF16 |  8.14 | 1620 | −27%  |
 | pr2109 | FP8   | FP8  |  6.76 | 1951 | −40%  |
-| ours   | BF16  | BF16 |  8.98 | 1470 | baseline |
-| ours   | FP8   | FP8  |  7.35 | 1794 | −18%  |
+| ours   | BF16  | BF16 |  9.28 | 1421 | baseline |
+| ours   | FP8   | BF16 |  7.73 | 1708 | −17%  |
+| ours   | FP8   | FP8  |  7.33 | 1799 | −21%  |
 | ours   | NVFP4 | BF16 |  7.36 | 1792 | −18%  |
 | ours   | NVFP4 | FP8  |  7.74 | 1706 | −14% (↓ from NVFP4+BF16) |
 | ours   | MXFP8 | BF16 |  8.29 | 1592 |  −8%  |
@@ -70,6 +71,7 @@ Per-warp avg stall contribution (`inst/warp`, single-shot NCU on
 | mode | long_sb | mio_throttle | math_pipe | wait | barrier | cyc/inst | ms | SM% |
 |---|---|---|---|---|---|---|---|---|
 | ours BF16 / BF16    | 8,508K |   264K |  47K | 2,878K |  0.1K | 10.64 | 13.54 | 78.0% |
+| ours FP8 / BF16     | 7,107K |   259K | 115K | 2,956K |  0.2K |  9.46 | 12.32 | 79.0% |
 | ours NVFP4 / BF16   | 6,860K |   394K |  82K | 2,883K |  0.2K |  9.53 | 11.91 | 81.5% |
 | ours NVFP4 / FP8    | 6,290K | **1,129K** | 151K | 3,517K |  0.2K | 10.23 | 12.60 | 76.8% |
 | ours MXFP8 / BF16   | 7,341K |   335K |  54K | 2,879K |  0.1K |  9.80 | — | — |
