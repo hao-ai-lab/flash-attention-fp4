@@ -152,15 +152,54 @@ MIO (rises 128K → 267K for the BF16 → FP8 PV switch), but without the
 SFQ/SFK reads competing, MIO has plenty of slack — the rise is a
 rounding-error +139K cyc/inst, not +735K.
 
-#### Fixing the block-scaled QK + FP8 PV regression (possibilities)
+#### Fixing the block-scaled QK + FP8 PV regression — hypotheses tested
 
-- Issue SFQ/SFK reads further from the P tmem-stores so MIO queue slots
-  don't clash. Current code loads SFQ/SFK inside the same warp-group that
-  produces P — reorder so they're phase-shifted.
-- Consume SFQ/SFK in larger bursts (pack more SFs per LDS) to reduce MIO
-  op count. Current path reads them individually.
-- Cache SFQ/SFK in a register file slot across multiple PV iterations
-  rather than reloading every tile.
+Tested on 2026-04-17 via NCU knob sweeps on `(1, 32768, 24, 128)`:
+
+**Ruled out:**
+
+1. **SFQK TMEM placement.** `FA4_SFQK_TMEM_SLOT=s|o|o_stagger` knob
+   relocates SFQ/SFK TMEM columns. `o` breaks correctness (collides with
+   O acc); `o_stagger` is correct but NCU mio_throttle & duration
+   identical to baseline "s". SFQK `tcgen05.cp` already overlaps with
+   MMA per `figures/pipeline.png` — placement is not on the critical path.
+
+2. **SFQK SMEM→TMEM copies.** `FA4_DEBUG_SKIP_SFQ_S2T=1` +
+   `FA4_DEBUG_SKIP_SFK_S2T=1` (skip the copies entirely, result is
+   garbage but runtime remains valid) does NOT reduce mio_throttle
+   (stays at 1,129K for NVFP4+FP8). The `tcgen05.cp` path is not the
+   MIO consumer.
+
+3. **Batching SFQ/SFK LDS reads.** `sm__sass_inst_executed_op_shared_ld.sum`
+   is **identical (6,291,900)** across all 5 modes tested (fp8/fp8,
+   nvfp4/bf16, nvfp4/fp8, mxfp8/bf16, mxfp8/fp8). LDS count does not
+   explain mio_throttle variance. STS count is 6,488K (pure FP8) vs
+   6,685K (any block-scaled, +196K for SF plumbing) — same delta for
+   BF16 or FP8 PV, so STS isn't the FP8-PV-specific cost either.
+
+**Identified but unresolved:**
+
+- **P tmem-store Rep=8 vs Rep=16 correlates with mio_throttle.** Forcing
+  `FA4_FP8_PV_TMEM_STORE_REP=16` on nvfp4_fp8 drops mio_throttle from
+  1,129K → 46K (24×) but raises long_scoreboard from 6,290K → 12,387K
+  (because r2t becomes serial on fewer, wider stores). Rep=8 is the
+  right choice for duration (12.60 ms vs 16.98 ms), but it loads
+  something MIO-pipe-adjacent. tcgen05.st is nominally on ADU, not MIO —
+  measured ADU count is basically constant across Rep={8,16}. So the
+  MIO pressure attribution remains open.
+
+- **Block-scaled QK + FP8 PV interaction is additive in time cost, not
+  pure bandwidth.** nvfp4/bf16 (MIO 395K) and fp8/fp8 (MIO 520K) both
+  run well, but nvfp4/fp8 hits MIO 1,129K — higher than either. Neither
+  the SF plumbing nor FP8 P r2t alone causes this magnitude. Their
+  combined execution (not the independent op counts) saturates MIO.
+
+Plausible next directions (not yet tested):
+- Change block-scaled QK's MMA kind (e.g. group multiple K-tiles into
+  one mma.sp call) to reduce MMA-warp MIO activity per PV iteration.
+- Shift PV MMA issue to a different warp group than the current MMA
+  warp so the MMA warp's MIO budget isn't competing with softmax warps'
+  SMEM stores.
 
 ### 3. Why pr2109 extracts more from FP8 on long seqlens
 
