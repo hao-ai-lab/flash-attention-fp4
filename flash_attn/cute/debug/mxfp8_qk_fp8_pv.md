@@ -20,10 +20,10 @@ the mixed-dtype fix landed.
 | ours   | BF16  | BF16 |  9.28 | 1421 | baseline |
 | ours   | FP8   | BF16 |  7.73 | 1708 | −17%  |
 | ours   | FP8   | FP8  |  7.33 | 1799 | −21%  |
-| ours   | NVFP4 | BF16 |  7.36 | 1792 | −18%  |
-| ours   | NVFP4 | FP8  |  7.74 | 1706 | −14% (↓ from NVFP4+BF16) |
-| ours   | MXFP8 | BF16 |  8.29 | 1592 |  −8%  |
-| ours   | MXFP8 | FP8  |  7.92 | 1666 | −12%  |
+| ours   | NVFP4 | BF16 |  7.36 | 1792 | −21%  |
+| ours   | NVFP4 | FP8  |  7.74 | 1706 | −17% (↓ from NVFP4+BF16) |
+| ours   | MXFP8 | BF16 |  8.29 | 1592 | −11%  |
+| ours   | MXFP8 | FP8  |  7.92 | 1666 | −15%  |
 
 ### Key observations
 
