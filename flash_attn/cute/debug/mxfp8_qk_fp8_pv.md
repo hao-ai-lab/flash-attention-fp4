@@ -179,27 +179,37 @@ Tested on 2026-04-17 via NCU knob sweeps on `(1, 32768, 24, 128)`:
 
 **Identified but unresolved:**
 
-- **P tmem-store Rep=8 vs Rep=16 correlates with mio_throttle.** Forcing
-  `FA4_FP8_PV_TMEM_STORE_REP=16` on nvfp4_fp8 drops mio_throttle from
-  1,129K → 46K (24×) but raises long_scoreboard from 6,290K → 12,387K
-  (because r2t becomes serial on fewer, wider stores). Rep=8 is the
-  right choice for duration (12.60 ms vs 16.98 ms), but it loads
-  something MIO-pipe-adjacent. tcgen05.st is nominally on ADU, not MIO —
-  measured ADU count is basically constant across Rep={8,16}. So the
-  MIO pressure attribution remains open.
+- **SASS-confirmed root cause: `F2FP.E4M3.PACK_AB_MERGE_C` serialization.**
+  Clean SASS comparison (from freshly-compiled cubins with lineinfo):
 
-- **Block-scaled QK + FP8 PV interaction is additive in time cost, not
-  pure bandwidth.** nvfp4/bf16 (MIO 395K) and fp8/fp8 (MIO 520K) both
-  run well, but nvfp4/fp8 hits MIO 1,129K — higher than either. Neither
-  the SF plumbing nor FP8 P r2t alone causes this magnitude. Their
-  combined execution (not the independent op counts) saturates MIO.
+  | cubin | F2FP.E4M3 (MERGE_C) | F2FP.BF16 (PACK_AB) | MUFU | total |
+  |---|---|---|---|---|
+  | NVFP4+FP8 | **128** (hot: P→FP8) | 128 (cold: O→BF16) | 259 | 3400 |
+  | NVFP4+BF16 | 0 | **256** (128 hot + 128 cold) | 259 | 3440 |
 
-Plausible next directions (not yet tested):
-- Change block-scaled QK's MMA kind (e.g. group multiple K-tiles into
-  one mma.sp call) to reduce MMA-warp MIO activity per PV iteration.
-- Shift PV MMA issue to a different warp group than the current MMA
-  warp so the MMA warp's MIO budget isn't competing with softmax warps'
-  SMEM stores.
+  Both cubins have 128 F2FP in the softmax hot loop for P conversion.
+  But **`F2FP.BF16.PACK_AB` writes independent registers** (the MIO pipe
+  can pipeline them freely), while **`F2FP.E4M3.PACK_AB_MERGE_C` creates
+  a read-after-write dependency chain** — the second F2FP reads the
+  register written by the first. Each pair of E4M3 instructions must
+  serialize on the MIO pipe, halving its effective throughput.
+
+  Neither `FA4_FP8_PV_USE_EXPLICIT_PACK` nor the generic `.to()` path
+  avoids this — the compiler lowers both to the same MERGE_C SASS.
+  Attempted replacement with PRMT-based pack (two independent F2FP →
+  PRMT combine on ALU) reduced MIO by only 6% (1,129K → 1,066K) and
+  hurt total duration because the compiler partially folded the PRMT
+  back to MERGE_C.
+
+  **This is a hardware-level cost**: packing 4 FP8 into one u32
+  requires two serial F2FP passes — the architecture does not offer a
+  single-instruction 4-way FP8 pack.
+
+- **Rep=8 tmem-store amplifies the effect.** NVFP4+FP8 uses
+  `St32x32bOp(Repetition(8))` for P tmem-store (vs Rep=16 for BF16 P).
+  Rep=8 issues 2× as many tmem r2t stores per tile. Combined with
+  the serialized F2FP, the MIO pipe is under sustained pressure from
+  both sources simultaneously.
 
 ### 3. Why pr2109 extracts more from FP8 on long seqlens
 
