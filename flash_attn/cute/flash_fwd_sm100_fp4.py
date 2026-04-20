@@ -493,6 +493,7 @@ class FlashAttentionForwardSm100:
         self.use_tma_O = self.arch >= 90 and mCuSeqlensQ is None and mSeqUsedQ is None
         # This can be tuned
         self.e2e_freq = int(os.getenv("FA4_E2E_FREQ", "16"))
+        self.e2e_start_frg = int(os.getenv("FA4_E2E_START_FRG", "0"))
         if const_expr(
             self.head_dim_padded > 64 and not self.is_causal and not self.is_local and self.pack_gqa
         ):
@@ -2816,40 +2817,29 @@ class FlashAttentionForwardSm100:
         e2e: cutlass.Constexpr[bool] = False,
         e2e_freq: cutlass.Constexpr[int] = 16,
     ):
-        """Fused exp2 + packed E4M3 — "all exp2 first, then all pack" structure.
+        """Per-fragment interleaved exp2 + packed E4M3.
 
-        Runs MUFU.EX2 on the entire tSrS in the first pass, then F2FP.E4M3 in the
-        second pass. Because the second pass only reads registers written in the
-        first pass (no write-after-read on the pack side), the compiler is free
-        to schedule F2FP much later than the MUFU that produced its operands.
-        Compared to the per-fragment fused version, this gives F2FP the maximum
-        possible scheduling distance from its input MUFU.EX2 — reducing the
-        scoreboard stalls observed on F2FP.SATFINITE.E4M3.
-
-        e2e=True still falls back to the 2-pass apply_exp2_convert + _pack_fp8,
-        because apply_exp2_convert uses emulated exp2 which isn't easy to replicate
-        here and the mask-free d=128 callers rely on it.
+        Processes one fragment at a time: exp2 all elements in the fragment,
+        then F2FP pack that fragment, before moving to the next. This
+        interleaves MUFU.EX2 (MIO pipe) with F2FP (also MIO) per fragment,
+        preventing long back-to-back MUFU bursts that saturate MIO dispatch.
         """
         assert self.v_dtype == Float8E4M3FN, "only E4M3 packed path implemented"
-        if const_expr(e2e):
-            softmax.apply_exp2_convert(tSrS, e2e=e2e, e2e_freq=e2e_freq)
-            self._pack_fp8(tSrS, tSrP)
-            return
-        # Pass 1: all exp2, in-place
-        for k in cutlass.range_constexpr(0, cute.size(tSrS), 2):
-            tSrS[k] = cute.arch.exp2(tSrS[k])
-            tSrS[k + 1] = cute.arch.exp2(tSrS[k + 1])
-        # Pass 2: all pack, reading the now-complete tSrS
-        tSrS_frg = cute.logical_divide(tSrS, cute.make_layout(4))
-        tSrP_frg = cute.logical_divide(tSrP, cute.make_layout(4))
-        for i in cutlass.range_constexpr(0, cute.size(tSrP_frg, mode=[1])):
-            u32_view = cute.recast_tensor(tSrP_frg[None, i], cute.Int32)
+        frg_tile = min(32, cute.size(tSrS))
+        frg_cnt = cute.size(tSrS) // frg_tile
+        tSrS_frg = cute.logical_divide(tSrS, cute.make_layout(frg_tile))
+        tSrP_frg = cute.logical_divide(tSrP, cute.make_layout(frg_tile))
+        for j in cutlass.range_constexpr(frg_cnt):
+            for k in cutlass.range_constexpr(0, frg_tile, 2):
+                tSrS_frg[k, j] = cute.arch.exp2(tSrS_frg[k, j])
+                tSrS_frg[k + 1, j] = cute.arch.exp2(tSrS_frg[k + 1, j])
+            u32_view = cute.recast_tensor(tSrP_frg[None, j], cute.Int32)
             for k in cutlass.range_constexpr(0, cute.size(u32_view, mode=[0])):
                 u32_view[k] = packed_float_to_ue4m3(
-                    tSrS_frg[k * 4, i],
-                    tSrS_frg[k * 4 + 1, i],
-                    tSrS_frg[k * 4 + 2, i],
-                    tSrS_frg[k * 4 + 3, i],
+                    tSrS_frg[k * 4, j],
+                    tSrS_frg[k * 4 + 1, j],
+                    tSrS_frg[k * 4 + 2, j],
+                    tSrS_frg[k * 4 + 3, j],
                 )
 
     @cute.jit
@@ -2992,6 +2982,7 @@ class FlashAttentionForwardSm100:
                 tSrS_t2r,
                 e2e=mask_fn is None and self.head_dim_padded <= 128,
                 e2e_freq=self.e2e_freq,
+                    e2e_start_frg=self.e2e_start_frg,
             )
             # update_row_sum BEFORE scale_groupwise so it uses original P values
             softmax.update_row_sum(tSrS_t2r.load(), acc_scale, is_first)
@@ -3041,6 +3032,7 @@ class FlashAttentionForwardSm100:
                         tSrS_t2r,
                         e2e=mask_fn is None and self.head_dim_padded <= 128,
                         e2e_freq=self.e2e_freq,
+                    e2e_start_frg=self.e2e_start_frg,
                     )
                     self._pack_fp8(tSrS_t2r, tSrP_r2t)
             else:
@@ -3050,6 +3042,7 @@ class FlashAttentionForwardSm100:
                     converted_scale=1.0,
                     e2e=mask_fn is None and self.head_dim_padded <= 128,
                     e2e_freq=self.e2e_freq,
+                    e2e_start_frg=self.e2e_start_frg,
                 )
         # Sequence barrier arrive
         if const_expr(self.s0_s1_barrier):

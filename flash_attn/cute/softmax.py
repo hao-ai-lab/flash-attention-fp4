@@ -337,6 +337,7 @@ class SoftmaxSm100(Softmax):
         e2e_freq: cutlass.Constexpr[int] = 16,
         e2e_res: cutlass.Constexpr[int] = 4,
         e2e_frg_limit: cutlass.Constexpr[int] = 1,
+        e2e_start_frg: cutlass.Constexpr[int] = 0,
     ):
         assert cute.size(acc_S_row.shape) % 2 == 0, "acc_S_row must have an even number of elements"
         frg_tile = min(32, cute.size(acc_S_row))
@@ -346,19 +347,18 @@ class SoftmaxSm100(Softmax):
         acc_S_row_frg = cute.logical_divide(acc_S_row, cute.make_layout(frg_tile))
         for j in cutlass.range_constexpr(frg_cnt):
             for k in cutlass.range_constexpr(0, cute.size(acc_S_row_frg, mode=[0]), 2):
-                # acc_S_row_frg[k, j] = utils.exp2f(acc_S_row_frg[k, j])
-                # acc_S_row_frg[k + 1, j] = utils.exp2f(acc_S_row_frg[k + 1, j])
                 if cutlass.const_expr(not e2e):
                     acc_S_row_frg[k, j] = cute.arch.exp2(acc_S_row_frg[k, j])
                     acc_S_row_frg[k + 1, j] = cute.arch.exp2(acc_S_row_frg[k + 1, j])
                 else:
                     if cutlass.const_expr(
-                        k % e2e_freq < e2e_freq - e2e_res or j >= frg_cnt - e2e_frg_limit
+                        k % e2e_freq < e2e_freq - e2e_res
+                        or j >= frg_cnt - e2e_frg_limit
+                        or j < e2e_start_frg
                     ):
                         acc_S_row_frg[k, j] = cute.arch.exp2(acc_S_row_frg[k, j])
                         acc_S_row_frg[k + 1, j] = cute.arch.exp2(acc_S_row_frg[k + 1, j])
                     else:
-                        # acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = utils.e2e_asm2(acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j])
                         acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = utils.ex2_emulation_2(
                             acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j]
                         )
