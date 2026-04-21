@@ -240,6 +240,13 @@ class FlashAttentionForwardSm100:
         # Mixed results; keep default generic, toggleable for per-shape tuning.
         self.debug_mxfp8_use_inline_ptx = os.getenv("FA4_MXFP8_USE_INLINE_PTX", "0") == "1"
         self.fp8_pv_use_explicit_pack = os.getenv("FA4_FP8_PV_USE_EXPLICIT_PACK", "1") == "1"
+        # e2e (exp2 emulation) interleaving config — env vars read here,
+        # applied in __call__ where v_dtype/quant_pv are known.
+        _e2e_freq_env = os.getenv("FA4_E2E_FREQ")
+        self._e2e_freq_override = int(_e2e_freq_env) if _e2e_freq_env else None
+        self.e2e_freq = self._e2e_freq_override if self._e2e_freq_override is not None else 16
+        self.e2e_start_frg = int(os.getenv("FA4_E2E_START_FRG", "0"))
+        self.force_e2e = os.getenv("FA4_FORCE_E2E", "0") == "1"
         # Fused exp2 + packed E4M3 conversion. A/B'd against the 2-pass baseline
         # on (1, 32768, 24, 128) MXFP8+FP8 at parity (~1663 TFLOPS both ways) —
         # the DSL's IR fuser likely achieves the same register schedule. Kept
@@ -491,11 +498,14 @@ class FlashAttentionForwardSm100:
             raise TypeError(f"Type mismatch: {self.q_dtype} != {self.v_dtype} (V quantization requires matching dtype)")
         self._setup_attributes()
         self.use_tma_O = self.arch >= 90 and mCuSeqlensQ is None and mSeqUsedQ is None
-        # This can be tuned
-        self.e2e_freq = int(os.getenv("FA4_E2E_FREQ", "16"))
-        self.e2e_start_frg = int(os.getenv("FA4_E2E_START_FRG", "0"))
+        # Adjust e2e for FP8 PV (quant_pv and v_dtype only known here).
+        if const_expr(not self.quant_pv and self.v_dtype.width == 8):
+            if const_expr(self._e2e_freq_override is None):
+                self.e2e_freq = 8
+            self.force_e2e = True
         if const_expr(
-            self.head_dim_padded > 64 and not self.is_causal and not self.is_local and self.pack_gqa
+            self.head_dim_padded > 64 and not self.is_causal and not self.is_local
+            and self.pack_gqa and not self.force_e2e
         ):
             self.e2e_freq = 32 if mCuSeqlensQ is not None or mSeqUsedQ is not None else 10
 
@@ -2980,7 +2990,7 @@ class FlashAttentionForwardSm100:
             # Exp2 with softmax scale and sp1 scaling
             softmax.apply_exp2_convert(
                 tSrS_t2r,
-                e2e=self.head_dim_padded <= 128 and (mask_fn is None or os.getenv("FA4_FORCE_E2E","0")=="1"),
+                e2e=self.force_e2e,
                 e2e_freq=self.e2e_freq,
                     e2e_start_frg=self.e2e_start_frg,
             )
@@ -3024,13 +3034,13 @@ class FlashAttentionForwardSm100:
                         softmax,
                         tSrS_t2r,
                         tSrP_r2t,
-                        e2e=self.head_dim_padded <= 128 and (mask_fn is None or os.getenv("FA4_FORCE_E2E","0")=="1"),
+                        e2e=self.force_e2e,
                         e2e_freq=self.e2e_freq,
                     )
                 else:
                     softmax.apply_exp2_convert(
                         tSrS_t2r,
-                        e2e=self.head_dim_padded <= 128 and (mask_fn is None or os.getenv("FA4_FORCE_E2E","0")=="1"),
+                        e2e=self.force_e2e,
                         e2e_freq=self.e2e_freq,
                     e2e_start_frg=self.e2e_start_frg,
                     )
@@ -3040,7 +3050,7 @@ class FlashAttentionForwardSm100:
                     tSrS_t2r,
                     tSrP_r2t,
                     converted_scale=1.0,
-                    e2e=self.head_dim_padded <= 128 and (mask_fn is None or os.getenv("FA4_FORCE_E2E","0")=="1"),
+                    e2e=self.force_e2e,
                     e2e_freq=self.e2e_freq,
                     e2e_start_frg=self.e2e_start_frg,
                 )
