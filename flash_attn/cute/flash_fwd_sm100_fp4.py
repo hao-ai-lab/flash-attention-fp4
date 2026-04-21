@@ -498,16 +498,19 @@ class FlashAttentionForwardSm100:
             raise TypeError(f"Type mismatch: {self.q_dtype} != {self.v_dtype} (V quantization requires matching dtype)")
         self._setup_attributes()
         self.use_tma_O = self.arch >= 90 and mCuSeqlensQ is None and mSeqUsedQ is None
-        # Adjust e2e for FP8 PV (quant_pv and v_dtype only known here).
-        if const_expr(not self.quant_pv and self.v_dtype.width == 8):
-            if const_expr(self._e2e_freq_override is None):
+        # e2e (exp2 emulation) breaks MUFU.EX2 bursts on MIO pipe. Auto-enabled
+        # for FP8 PV where fast PV MMA causes sustained MIO saturation. BF16 PV
+        # doesn't have MIO pressure in our 1-CTA kernel, so e2e hurts there.
+        # pr2109 (2-CTA) benefits from e2e on BF16 too — different pipeline.
+        if const_expr(self._e2e_freq_override is None):
+            if const_expr(not self.quant_pv and self.v_dtype.width == 8):
                 self.e2e_freq = 8
+            elif const_expr(
+                self.head_dim_padded > 64 and not self.is_causal and not self.is_local and self.pack_gqa
+            ):
+                self.e2e_freq = 32 if mCuSeqlensQ is not None or mSeqUsedQ is not None else 10
+        if const_expr(not self.quant_pv and self.v_dtype.width == 8):
             self.force_e2e = True
-        if const_expr(
-            self.head_dim_padded > 64 and not self.is_causal and not self.is_local
-            and self.pack_gqa and not self.force_e2e
-        ):
-            self.e2e_freq = 32 if mCuSeqlensQ is not None or mSeqUsedQ is not None else 10
 
         use_2cta_instrs = self.mma_tiler_qk[0] == 256
         assert use_2cta_instrs == False, "Two-CTA instructions not supported yet"
