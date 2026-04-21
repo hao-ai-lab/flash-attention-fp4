@@ -596,8 +596,8 @@ def evaluate_polynomial(x: Float32, poly: Tuple[Float32, ...], *, loc=None, ip=N
     return out
 
 
-@cute.jit
 @dsl_user_op
+@cute.jit
 def evaluate_polynomial_2(x: Float32, y: Float32, poly: Tuple[Float32, ...], *, loc=None, ip=None) -> Tuple[Float32, Float32]:
     deg = len(poly) - 1
     out = (poly[deg], poly[deg])

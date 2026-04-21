@@ -2980,7 +2980,7 @@ class FlashAttentionForwardSm100:
             # Exp2 with softmax scale and sp1 scaling
             softmax.apply_exp2_convert(
                 tSrS_t2r,
-                e2e=mask_fn is None and self.head_dim_padded <= 128,
+                e2e=self.head_dim_padded <= 128 and (mask_fn is None or os.getenv("FA4_FORCE_E2E","0")=="1"),
                 e2e_freq=self.e2e_freq,
                     e2e_start_frg=self.e2e_start_frg,
             )
@@ -3024,13 +3024,13 @@ class FlashAttentionForwardSm100:
                         softmax,
                         tSrS_t2r,
                         tSrP_r2t,
-                        e2e=mask_fn is None and self.head_dim_padded <= 128,
+                        e2e=self.head_dim_padded <= 128 and (mask_fn is None or os.getenv("FA4_FORCE_E2E","0")=="1"),
                         e2e_freq=self.e2e_freq,
                     )
                 else:
                     softmax.apply_exp2_convert(
                         tSrS_t2r,
-                        e2e=mask_fn is None and self.head_dim_padded <= 128,
+                        e2e=self.head_dim_padded <= 128 and (mask_fn is None or os.getenv("FA4_FORCE_E2E","0")=="1"),
                         e2e_freq=self.e2e_freq,
                     e2e_start_frg=self.e2e_start_frg,
                     )
@@ -3040,7 +3040,7 @@ class FlashAttentionForwardSm100:
                     tSrS_t2r,
                     tSrP_r2t,
                     converted_scale=1.0,
-                    e2e=mask_fn is None and self.head_dim_padded <= 128,
+                    e2e=self.head_dim_padded <= 128 and (mask_fn is None or os.getenv("FA4_FORCE_E2E","0")=="1"),
                     e2e_freq=self.e2e_freq,
                     e2e_start_frg=self.e2e_start_frg,
                 )
