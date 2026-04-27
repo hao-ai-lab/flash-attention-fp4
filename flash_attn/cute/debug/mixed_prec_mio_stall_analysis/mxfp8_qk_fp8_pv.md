@@ -65,10 +65,38 @@ regardless of P conversion method (explicit `packed_float_to_ue4m3` or
 generic `.to()`). Yet NCU shows 3× more stall_mio samples for FP8 (44K
 vs 15K), all on MUFU.EX2.
 
-The e2e fix resolves it empirically by replacing some MUFU with
-polynomial ALU, which forces the compiler into a different scheduling
-pattern. The remaining 2.3% gap (7.47 vs 7.30 ms with auto e2e) is the
-emulation's ALU overhead.
+Per-instruction PC sampling reveals the mechanism — a **compiler
+scheduling difference**, not a runtime contention effect:
+
+BF16 MUFU stall profile (**bimodal**): a few MUFUs inside the burst of
+32 have very high `stall_mio` (1517, 1451, 1125) and low `stall_wait`.
+MUFUs outside the burst have low mio and moderate wait. Most MUFUs run
+freely — total mio samples = 15K.
+
+FP8 MUFU stall profile (**uniform**): every MUFU has `stall_mio`≈600
+AND `stall_wait`≈900. No concentration. The compiler spread MUFUs more
+evenly across the loop body, so every MUFU faces moderate MIO contention
+instead of a few paying all of it. Total mio samples = 44K.
+
+| metric | BF16 top MUFU | FP8 top MUFU |
+|---|---|---|
+| stall_mio | 1517 | 630 |
+| stall_wait | 420 | 950 |
+| stall_not_selected | 213 | 0 |
+| total samples | 2256 | 1671 |
+
+BF16's concentrated burst pays a high per-MUFU MIO cost but leaves most
+MUFUs free (high `!sel` = they don't even compete for issue). FP8's
+even spread means every MUFU faces contention — fewer per-MUFU stalls
+but across ALL 259 MUFUs → higher total. This is a ptxas scheduling
+artifact: different code paths (F2FP.BF16 vs F2FP.E4M3, STTM.x16 vs
+STTM.x8) lead to different register allocation and instruction ordering
+that happen to distribute MUFUs differently.
+
+The e2e fix works by replacing ~40% of MUFUs with polynomial ALU,
+reducing total MIO-class instructions enough that even the uniform
+distribution doesn't saturate. The remaining 2.3% gap (7.47 vs 7.30 ms)
+is the emulation's ALU overhead.
 
 ### NCU stall breakdown
 
