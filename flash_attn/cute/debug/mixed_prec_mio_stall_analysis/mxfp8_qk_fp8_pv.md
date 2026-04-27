@@ -1,312 +1,141 @@
-# FA4 FP8/MXFP8/NVFP4 QK + FP8 PV — status
+# FA4 block-scaled QK + FP8 PV — MIO stall analysis
 
-Tracks: block-scaled and pure-FP8 QK + PV paths in our kernel
-(`flash_fwd_sm100_fp4.py` for block-scaled; `flash_fwd_sm100.py` for pure FP8
-when `FA4_ALLOW_PURE_FP8_QK=1`). Benchmarks compare against upstream FA4 PR 2109
-at `hao-ai-lab/flash-attention-fp4:pr2109-mixed-dtype` (local clone at
-`/tmp/pr2109-mixed-dtype`).
-
-## Current performance
+## Performance table
 
 Shape `(1, 32768, 24, 128)`, non-causal, `triton.do_bench rep=25 warmup=10`,
-fresh compile (cache disabled). Re-measured 2026-04-21 with `e2e_freq`
-tuning for FP8 PV modes. `CUDA_VISIBLE_DEVICES=2` to avoid GPU contention.
+`CUDA_VISIBLE_DEVICES=2`. Measured 2026-04-21 on commit `51d3966c`.
 
-| kernel | QK | PV | e2e | ms | TFLOPs | ms vs BF16 |
+| kernel | QK | PV | e2e | ms | TFLOPs | vs BF16 |
 |---|---|---|---|---|---|---|
-| pr2109 | BF16  | BF16 | — | 11.23 | 1175 | baseline |
-| pr2109 | FP8   | BF16 | — |  8.14 | 1620 | −27%  |
-| pr2109 | FP8   | FP8  | — |  6.76 | 1951 | −40%  |
+| pr2109 | BF16  | BF16 | on (freq=10) | 11.23 | 1175 | baseline |
+| pr2109 | FP8   | BF16 | on (freq=10) |  8.14 | 1620 | −27% |
+| pr2109 | FP8   | FP8  | on (freq=10) |  6.76 | 1951 | −40% |
 | ours   | BF16  | BF16 | off |  9.44 | 1398 | baseline |
-| ours   | FP8   | BF16 | off |  7.99 | 1651 | −15%  |
-| ours   | FP8   | FP8  | off |  7.35 | 1795 | −22%  |
-| ours   | NVFP4 | BF16 | off |  7.41 | 1780 | −22%  |
-| ours   | NVFP4 | FP8  | off |  7.72 | 1708 | −18% (↓ from NVFP4+BF16) |
-| ours   | NVFP4 | FP8  | **freq=8** | **7.50** | **1759** | **−21%** |
-| ours   | MXFP8 | BF16 | off |  7.89 | 1672 | −16%  |
-| ours   | MXFP8 | FP8  | off |  7.93 | 1663 | −16% (↓ from MXFP8+BF16) |
-| ours   | MXFP8 | FP8  | **freq=7** | **7.40** | **1784** | **−22%** |
+| ours   | FP8   | BF16 | off |  7.99 | 1651 | −15% |
+| ours   | FP8   | FP8  | off |  7.35 | 1795 | −22% |
+| ours   | NVFP4 | BF16 | off |  7.30 | 1808 | −23% |
+| ours   | NVFP4 | FP8  | **auto (freq=8)** | **7.47** | **1766** | **−21%** |
+| ours   | MXFP8 | BF16 | off |  7.61 | 1734 | −19% |
+| ours   | MXFP8 | FP8  | **auto (freq=8)** | **7.77** | **1699** | −18% |
+| ours   | MXFP8 | FP8  | manual freq=7 | **7.40** | **1784** | **−22%** |
 
-### e2e_freq tuning results (FA4_FORCE_E2E=1)
+e2e = exp2 emulation. Auto-enabled for FP8 PV at freq=8 (`51d3966c`).
+Override: `FA4_E2E_FREQ=N` (frequency), `FA4_FORCE_E2E=1` (force on for BF16).
 
-| mode | off | freq=4 | freq=6 | freq=7 | freq=8 | freq=9 | freq=10 | freq=12 | freq=16 |
-|---|---|---|---|---|---|---|---|---|---|
-| NVFP4+BF16 | **7.41** | — | 13.24 | — | 13.33 | — | 8.23 | 9.38 | 9.79 |
-| NVFP4+FP8 | 7.72 | 10.38 | 8.32 | 7.61 | **7.50** | 9.06 | 8.92 | 9.94 | 9.79 |
-| MXFP8+BF16 | **7.89** | — | 13.35 | — | 13.54 | — | 9.00 | 9.65 | — |
-| MXFP8+FP8 | 7.93 | — | 8.39 | **7.40** | 7.64 | 9.12 | 9.03 | 9.93 | — |
+## Root cause: MUFU.EX2 saturates MIO pipe on FP8 PV
 
-**FP8 PV benefits from e2e_freq=7–8**: breaks MUFU.EX2 bursts on MIO pipe.
-**BF16 PV is hurt by e2e** (up to 1.8× slower) — BF16 path has no MIO
-pressure from MUFU bursts, so the emulation's extra ALU work is pure overhead.
+On SM100, MUFU.EX2 (hardware exp2) dispatches through the **MIO pipe**,
+which also handles shared memory loads, special math, and dynamic branches.
 
-Optimal config: enable e2e ONLY when V is FP8, with freq=8 (NVFP4) or
-freq=7 (MXFP8).
+NCU PC sampling (`ncu --set full`, `--page source --csv`, `stall_mio`
+column) confirms **99% of MIO stall samples land on MUFU.EX2**.
 
-### Key observations
+FP8 PV MMA (`kind::f8f6f4`) runs at 2× the throughput of BF16 (`kind::f16`).
+The softmax loop therefore iterates faster: the next iteration's MUFU burst
+fires before the MIO pipe drains from the previous one → sustained
+saturation. BF16's slower PV MMA gives MIO time to drain between
+iterations — same MUFU burst pattern, but spread further apart in wall time.
 
-- **Our BF16 baseline (9.44 ms) is stronger than pr2109's (11.23 ms)** —
-  our softmax / scheduling / pipelining is tuned; theirs is closer to the
-  CUTLASS-default baseline.
-- **Pure FP8 path:** both kernels speed up from BF16, pr2109 by more
-  relative to their weaker baseline. In absolute TFLOPs pr2109 is ~9%
-  ahead (1951 vs 1795).
-- **Block-scaled + FP8 PV no longer regresses** with e2e tuning:
-  NVFP4+FP8 at 7.50 ms beats NVFP4+BF16 at 7.41 ms... almost. MXFP8+FP8
-  at 7.40 ms beats MXFP8+BF16 at 7.89 ms by 6%.
+### NCU stall breakdown
 
-## FP8 PV speedup: why pr2109 benefits more than ours
+| mode | long_sb | mio | wait | cyc/inst | ms |
+|---|---|---|---|---|---|
+| ours NVFP4 / BF16             | 6,860K |     394K | 2,883K |  9.53 | 11.91 |
+| ours NVFP4 / FP8 (no e2e)    | 6,290K | **1,129K** | 3,517K | 10.23 | 12.60 |
+| ours NVFP4 / FP8 **(e2e=8)** | 7,228K |    **40K** | 1,959K | **7.06** | **12.22** |
+| ours MXFP8 / FP8 **(e2e=7)** | 6,820K |    **30K** | 1,991K | **6.89** | **12.08** |
+| pr2109 FP8 / FP8             | 2,771K |     267K | 2,239K |  6.90 | 10.83 |
 
-**Q:** pr2109 shows a large speedup from BF16 PV → FP8 PV. Our kernel's pure
-FP8 path also speeds up, but our block-scaled QK + FP8 PV combo does not.
-Why?
+With e2e=7, our MXFP8+FP8 achieves `cyc/inst=6.89` — matching pr2109's 6.90.
 
-**A:** Two separate effects.
+### Why e2e fixes it
 
-### 1. Relative vs absolute gains
+The exp2 emulation (`utils.ex2_emulation_2`) replaces some MUFU.EX2 with a
+polynomial evaluation (FMAX + FADD + FMA×3). These ALU/FMA instructions do
+NOT go through MIO, so they create natural breaks in the MUFU burst.
 
-pr2109's BF16 baseline is weaker (11.23 ms) so the absolute ms saved by
-switching to FP8 MMA is larger. Ours is already running BF16 at 8.98 ms, so
-the headroom left for FP8 is smaller. In absolute TFLOPs both kernels land
-within 9% of each other on the pure-FP8 path (pr2109 1951 vs ours 1794),
-meaning neither is leaving a massive factor on the table.
+Without e2e, our softmax SASS has bursts of **17–21 consecutive MUFU.EX2**.
+With e2e=8 the max burst drops to ~5, matching pr2109's pattern.
 
-Derived:
+### Why e2e hurts BF16 PV
 
-| kernel | BF16 FLOPs/s  | FP8 FLOPs/s  | speedup |
-|---|---|---|---|
-| pr2109 | 1175 TF | 1951 TF | 1.66× |
-| ours   | 1470 TF | 1794 TF | 1.22× |
+| NVFP4+BF16 | ms | total inst | long_sb | mio | cyc/inst |
+|---|---|---|---|---|---|
+| e2e=off | **7.30** | 3,077M | 6,858K | 395K | 9.53 |
+| e2e=10 | 8.23 | **3,990M (+30%)** | **9,380K (+37%)** | 27K | 8.24 |
+| e2e=16 | 9.79 | 3,707M (+20%) | **11,494K (+68%)** | 50K | 10.27 |
 
-The smaller relative gain in ours is **not** from ours having a worse
-pure-FP8 path — it's from ours having a better BF16 starting point.
+BF16 PV is **long_scoreboard-bound, not MIO-bound**. e2e adds ~30% more
+instructions (polynomial ALU work) that increase long_sb (+37%) because the
+emulated exp2 has higher latency than MUFU.EX2 (~8+ cycles polynomial chain
+vs ~4 cycles MUFU). MIO drops to near-zero but that was never the
+bottleneck — net effect is slower.
 
-### 2. NCU stall analysis: MUFU.EX2 bursts on MIO pipe
+### e2e_freq sweep
 
-Per-warp avg stall contribution (`inst/warp`, single-shot NCU on
-`(1, 32768, 24, 128)`). 99% of stall_mio samples land on MUFU.EX2 —
-exp2 instructions that dispatch through the MIO pipe on SM100.
+| mode | off | freq=4 | freq=6 | freq=7 | freq=8 | freq=9 | freq=10 | freq=12 |
+|---|---|---|---|---|---|---|---|---|
+| NVFP4+BF16 | **7.30** | — | 13.24 | — | 13.33 | — | 8.23 | 9.38 |
+| NVFP4+FP8 | 7.72 | 10.38 | 8.32 | 7.61 | **7.50** | 9.06 | 8.92 | 9.94 |
+| MXFP8+BF16 | **7.61** | — | 13.35 | — | 13.54 | — | 9.00 | 9.65 |
+| MXFP8+FP8 | 7.93 | — | 8.39 | **7.40** | 7.64 | 9.12 | 9.03 | 9.93 |
 
-| mode | long_sb | mio_throttle | wait | cyc/inst | ms | SM% |
-|---|---|---|---|---|---|---|
-| ours BF16 / BF16              | 8,508K |     264K | 2,878K | 10.64 | 13.54 | 78.0% |
-| ours FP8 / BF16               | 7,107K |     259K | 2,956K |  9.46 | 12.32 | 79.0% |
-| ours NVFP4 / BF16             | 6,860K |     394K | 2,883K |  9.53 | 11.91 | 81.5% |
-| ours NVFP4 / FP8              | 6,290K | **1,129K** | 3,517K | 10.23 | 12.60 | 76.8% |
-| ours NVFP4 / FP8 **e2e=8**   | 7,228K |    **40K** | 1,959K | **7.06** | **12.22** | 51.9% |
-| ours MXFP8 / BF16             | 7,341K |     335K | 2,879K |  9.80 | — | — |
-| ours MXFP8 / FP8              | 6,758K |     890K | 3,519K | 10.41 | — | — |
-| ours MXFP8 / FP8 **e2e=7**   | 6,820K |    **30K** | 1,991K | **6.89** | **12.08** | 52.9% |
-| ours pure FP8 / FP8           | 6,339K |     510K | 2,880K |  8.89 | 11.98 | 80.9% |
-| pr2109 BF16 / BF16            | 5,765K |     168K | 2,997K |  9.99 | 15.87 | 65.2% |
-| pr2109 FP8 / BF16             | 3,739K |     128K | 2,238K |  6.83 | 12.51 | 64.5% |
-| pr2109 FP8 / FP8              | 2,771K |     267K | 2,239K |  6.90 | 10.83 | 73.3% |
+Sweet spot: freq=8 for NVFP4+FP8, freq=7 for MXFP8+FP8.
+Auto-default is freq=8 for both (good enough; manual freq=7 gives extra
+~3% for MXFP8).
 
-With e2e tuning: MXFP8+FP8 achieves **cyc/inst=6.89**, matching pr2109's
-6.90. MIO throttle drops from 890K → 30K (97% reduction).
-
-**Note:** when `pv_mode='fp8'` the benchmark passes `mSFV=None`, so
-`self.quant_pv = (mSFV is not None) = False`. PV uses `make_trivial_tiled_mma`
-(pure `MmaFP8Op`) — **no SFV and no SFP** plumbing in this config. The cost
-below is not from PV scale factors.
-
-**Interpretation**:
-- **pr2109's FP8 PV win is bandwidth-driven.** V's per-stage byte count halves
-  (BF16 → FP8), which drops the long-scoreboard wait by ~1M cyc/inst (consumer
-  warps stop stalling on V arrival). mio_throttle barely moves (+139K). Net
-  cyc/inst is flat, but SM throughput jumps 64.5% → 73.3% because the unused
-  cycles now get spent on productive instructions.
-- **Ours pure FP8 / FP8 also wins** for the same bandwidth reason: long_sb
-  drops ~2M cyc/inst, mio_throttle rises only modestly (+246K). Net cyc/inst
-  falls 1.75 — FP8 PV is unambiguously good here.
-- **Ours block-scaled QK + FP8 PV regresses** because mio_throttle spikes by
-  **+735K (NVFP4)** or **+555K (MXFP8)**, wiping out the bandwidth gain.
-
-#### What is actually loading MIO (confirmed by knob-toggling)
-
-Two components combine:
-
-**1. Narrower P tmem-store atom for FP8 P (Rep=8 vs 16).** P is emitted to
-TMEM via `tcgen05.St32x32bOp(Repetition(N))`. Our default is Rep=16 for BF16
-P and Rep=8 for FP8 P. Direct measurement at this shape with NVFP4 QK:
-
-| FA4_FP8_PV_TMEM_STORE_REP | ms   | mio_throttle | long_sb | cyc/inst |
-|---|---|---|---|---|
-| 8 (default for FP8 V)     | 12.60 | 1,129K | 6,290K | 10.23 |
-| 16 (BF16-style)           | 16.98 |    46K | 12,387K | 13.96 |
-
-Rep=8 issues 2× as many tmem-store atoms per tile — that's where the MIO
-pressure on the FP8 V path comes from. It's still a clear overall win over
-Rep=16 (−4.4 ms) because Rep=16 stalls waiting on long-scoreboard instead.
-
-**2. SFQ / SFK smem → register reads.** Block-scaled QK's per-MMA
-scale-factor reads from SMEM go through the MIO pipe. On the NVFP4+BF16
-path, the P tmem-store is wide (Rep=16) so MIO has slack and SFQ/SFK reads
-don't throttle. On the NVFP4+FP8 path, the narrower Rep=8 tmem-store is
-already loading MIO; adding the SFQ/SFK reads on top saturates it.
-
-Evidence: the ONLY structural difference between ours-pure-FP8/FP8 (mio
-510K) and ours-NVFP4+FP8 (mio 1,129K) is SFQ/SFK plumbing — both use FP8 V,
-both use Rep=8, both use `MmaFP8Op` for PV. The +619K gap between them is
-attributable to SFQ/SFK on MIO.
-
-`sm__inst_executed_pipe_lsu.sum` is nearly identical across NVFP4+BF16 vs
-NVFP4+FP8 (13.19M vs 13.17M); the MIO jump comes from **queue contention**,
-not from more instructions issuing.
-
-Knob sweeps that did NOT move the dial (confirming it's not any of these):
-- `FA4_FP8_PV_KV_STAGE_CAP ∈ {0, 4, 6, 8}` — flat at 12.60 ms / mio 1,129K.
-- `FA4_FP8_PV_USE_EXPLICIT_PACK × FA4_FP8_PV_USE_FUSED_PACK` all four
-  combos — flat at ~12.90 ms / mio ~1,046K.
-- `FA4_FP8_PV_ZERO_FILL_REGS ∈ {0, 1}` — flat.
-
-#### Why pr2109's MIO stays low
-
-pr2109 has zero scale-factor plumbing. Its Rep=8 FP8-P tmem-store does load
-MIO (rises 128K → 267K for the BF16 → FP8 PV switch), but without the
-SFQ/SFK reads competing, MIO has plenty of slack — the rise is a
-rounding-error +139K cyc/inst, not +735K.
-
-#### Fixing the block-scaled QK + FP8 PV regression — hypotheses tested
-
-Tested on 2026-04-17 via NCU knob sweeps on `(1, 32768, 24, 128)`:
-
-**Ruled out:**
-
-1. **SFQK TMEM placement.** `FA4_SFQK_TMEM_SLOT=s|o|o_stagger` knob
-   relocates SFQ/SFK TMEM columns. `o` breaks correctness (collides with
-   O acc); `o_stagger` is correct but NCU mio_throttle & duration
-   identical to baseline "s". SFQK `tcgen05.cp` already overlaps with
-   MMA per `figures/pipeline.png` — placement is not on the critical path.
-
-2. **SFQK SMEM→TMEM copies.** `FA4_DEBUG_SKIP_SFQ_S2T=1` +
-   `FA4_DEBUG_SKIP_SFK_S2T=1` (skip the copies entirely, result is
-   garbage but runtime remains valid) does NOT reduce mio_throttle
-   (stays at 1,129K for NVFP4+FP8). The `tcgen05.cp` path is not the
-   MIO consumer.
-
-3. **Batching SFQ/SFK LDS reads.** `sm__sass_inst_executed_op_shared_ld.sum`
-   is **identical (6,291,900)** across all 5 modes tested (fp8/fp8,
-   nvfp4/bf16, nvfp4/fp8, mxfp8/bf16, mxfp8/fp8). LDS count does not
-   explain mio_throttle variance. STS count is 6,488K (pure FP8) vs
-   6,685K (any block-scaled, +196K for SF plumbing) — same delta for
-   BF16 or FP8 PV, so STS isn't the FP8-PV-specific cost either.
-
-**Identified but unresolved:**
-
-- **SASS-confirmed root cause: `F2FP.E4M3.PACK_AB_MERGE_C` serialization.**
-  Clean SASS comparison (from freshly-compiled cubins with lineinfo):
-
-  | cubin | F2FP.E4M3 (MERGE_C) | F2FP.BF16 (PACK_AB) | MUFU | total |
-  |---|---|---|---|---|
-  | NVFP4+FP8 | **128** (hot: P→FP8) | 128 (cold: O→BF16) | 259 | 3400 |
-  | NVFP4+BF16 | 0 | **256** (128 hot + 128 cold) | 259 | 3440 |
-
-  Both cubins have 128 F2FP in the softmax hot loop for P conversion.
-  But **`F2FP.BF16.PACK_AB` writes independent registers** (the MIO pipe
-  can pipeline them freely), while **`F2FP.E4M3.PACK_AB_MERGE_C` creates
-  a read-after-write dependency chain** — the second F2FP reads the
-  register written by the first. Each pair of E4M3 instructions must
-  serialize on the MIO pipe, halving its effective throughput.
-
-  Neither `FA4_FP8_PV_USE_EXPLICIT_PACK` nor the generic `.to()` path
-  avoids this — the compiler lowers both to the same MERGE_C SASS.
-  Attempted replacement with PRMT-based pack (two independent F2FP →
-  PRMT combine on ALU) reduced MIO by only 6% (1,129K → 1,066K) and
-  hurt total duration because the compiler partially folded the PRMT
-  back to MERGE_C.
-
-  **This is a hardware-level cost**: packing 4 FP8 into one u32
-  requires two serial F2FP passes — the architecture does not offer a
-  single-instruction 4-way FP8 pack.
-
-- **Rep=8 tmem-store amplifies the effect.** NVFP4+FP8 uses
-  `St32x32bOp(Repetition(8))` for P tmem-store (vs Rep=16 for BF16 P).
-  Rep=8 issues 2× as many tmem r2t stores per tile. Combined with
-  the serialized F2FP, the MIO pipe is under sustained pressure from
-  both sources simultaneously.
-
-### 3. Why pr2109 extracts more from FP8 on long seqlens
-
-pr2109's FP8 QK already captures most of the speedup: BF16→FP8 QK alone
-takes 11.23 → 8.14 ms (−27%). Adding FP8 V compounds to 6.76 ms (additional
-−17%). IPC stays at 2.18 across both — the FP8 QK pipeline is the main
-win; FP8 V is a second, smaller compounding factor from the MMA throughput
-doubling on pure FP8 PV kind.
-
-Our kernel can't test the equivalent mixed (FP8 QK + BF16 PV) config yet —
-that requires the same K-aliases-V SMEM surgery we applied to pr2109
-(pending on our kernel).
-
-## How to run
-
-### Our kernel pure FP8/FP8 (no block-scale)
+## How to profile MIO stalls
 
 ```bash
-FA4_ALLOW_PURE_FP8_QK=1 CUTE_DSL_ENABLE_TVM_FFI=1 python -c "
-import torch
-from flash_attn.cute.interface import flash_attn_func
-b,s,h,d = 1,32768,24,128
-q = torch.randn(b,s,h,d,device='cuda',dtype=torch.bfloat16).to(torch.float8_e4m3fn)
-k = q.clone(); v = q.clone()
-out = flash_attn_func(q,k,v,causal=False)
-print(out.shape, out.dtype)
+bash flash_attn/cute/debug/mixed_prec_mio_stall_analysis/ncu_stall_mio.sh nvfp4_fp8
+```
+
+Or manually:
+
+```bash
+# 1. Capture full profile
+ncu --profile-from-start off --target-processes all --launch-count 1 \
+  --kernel-name regex:"flash_fwd" --set full -f -o /tmp/report \
+  python <script.py>
+
+# 2. Extract stall_mio by instruction
+ncu -i /tmp/report.ncu-rep --page source --csv | python3 -c "
+import csv, sys
+from collections import defaultdict
+lines = sys.stdin.readlines()
+data = [l for l in lines if l.startswith('\"0x') or l.startswith('\"Address')]
+reader = csv.DictReader(data)
+by_op = defaultdict(int)
+for r in reader:
+    mio = int(r.get('stall_mio','0') or '0')
+    if mio > 0:
+        by_op[r.get('Source','').strip().split()[0]] += mio
+for op, cnt in sorted(by_op.items(), key=lambda x: -x[1])[:10]:
+    print(f'  {op:30s} {cnt:6d}')
 "
 ```
 
-`FA4_ALLOW_PURE_FP8_QK=1` lets `interface.py` dispatch pure FP8 Q/K/V
-directly to `FlashAttentionForwardSm100` (non-block-scaled). Without it,
-interface.py gates FP8 Q/K through the block-scaled MXFP8 path.
-
-### Block-scaled NVFP4 / MXFP8
+## How to run
 
 ```bash
+# Block-scaled NVFP4/MXFP8 + FP8 PV (auto e2e)
 CUTE_DSL_ENABLE_TVM_FFI=1 python -m flash_attn.cute.benchmarks.bench_fp4 \
-  --quant_v --qk_mode {nvfp4|mxfp8} --pv_mode {bf16|fp8}
+  --pv_mode fp8 --qk_mode {nvfp4|mxfp8}
+
+# Override e2e freq
+FA4_E2E_FREQ=7 CUTE_DSL_ENABLE_TVM_FFI=1 python -m flash_attn.cute.benchmarks.bench_fp4 \
+  --pv_mode fp8 --qk_mode mxfp8
+
+# Pure FP8/FP8 (no block-scale)
+FA4_ALLOW_PURE_FP8_QK=1 CUTE_DSL_ENABLE_TVM_FFI=1 python <bench_script.py>
 ```
-
-### pr2109 FP8 QK + BF16 PV (mixed-dtype)
-
-```bash
-cd /tmp/pr2109-mixed-dtype
-CUTE_DSL_ENABLE_TVM_FFI=1 python bench_mixed.py --shape 1 32768 24 128
-```
-
-Kernel is on `hao-ai-lab/flash-attention-fp4:pr2109-mixed-dtype @ 65cbcc8a`.
-
-## Implementation notes (all merged)
-
-- `FlashAttentionForwardSm100.__init__` accepts NVFP4 (FP4 + E4M3 + sfv=16)
-  and MXFP8 (FP8 + E8M0 + sfv=32). SF SMEM uses `self.sf_dtype`.
-- PTX helpers in `blackwell_helpers.py` pick MMA kind per op: `.kind::f16`,
-  pure FP8, `.kind::mxf8f6f4…`, or `.kind::mxf4nvf4…`.
-- Pure-FP8 PV: softmax writes FP8 P directly via `packed_float_to_ue4m3`
-  (FP32 → E4M3 fused pack, avoids the 128× `cvt.u32.u16` detour).
-- Underflow handling for pure FP8 PV uses the pr2109-style
-  `max_offset=8 / p_log2_offset=8` pattern with LSE correction.
-- P TMEM store uses `St32x32bOp(Repetition(8))` for FP8-P; Repetition(16)
-  for BF16-P (keyed on v_dtype).
-- MXFP8 SFQ TMEM slot moved off `tmem_o_offset` to `tmem_s_offset` to stop
-  colliding with the O accumulator (fixed 2026-04-15, commit `9456a3de`).
-- MXFP8 block-scaled QK defaults to the generic `cute.gemm` helper;
-  `FA4_MXFP8_USE_INLINE_PTX=1` to toggle to the per-shape inline helper
-  (faster on short-seqlen, slower on long-d; generic is safer default).
 
 ## Known open items
 
-- **Our FP8 QK + BF16 PV mixed path** — requires K-aliases-V SMEM aliasing
-  pattern in `flash_fwd_sm100.py` (same fix applied to pr2109). Not yet
-  ported to ours.
-- **Block-scaled + FP8 PV long-d regression** — structural (SFV plumbing
-  adds ~10K F2FP stalls). Would need SFV fusion into the PV descriptor or
-  a dedicated MXF8-PV atom to close.
-- **Pure-FP8/FP8 ~9% gap to pr2109** — scheduling/IPC gap (1.69 vs 2.18).
-  Their kernel issues more instructions per cycle; ours spends ~4.5 cyc/inst
-  in L1TEX scoreboard stalls vs theirs fewer. Fixable but non-trivial.
-
-## Repo branches
-
-- `hao-ai-lab/flash-attention-fp4:mixed_precision` — ours with
-  `FA4_ALLOW_PURE_FP8_QK` gate, MXFP8 fix, FP8 PV fused exp2+pack.
-- `hao-ai-lab/flash-attention-fp4:pr2109-mixed-dtype` — upstream pr2109
-  kernel with FP8 QK + BF16 PV mixed-dtype enabled.
+- **Pure-FP8/FP8 ~9% gap to pr2109** (1795 vs 1951 TF) — pr2109 uses
+  2-CTA instructions (`UTCQMMA.2CTA` + `UTCBAR.2CTA.MULTICAST`) which our
+  fp4 kernel doesn't support yet. Their 2-CTA path generates 2× more
+  `SYNCS.EXCH.64` synchronization points that naturally break MUFU bursts,
+  explaining their lower MIO baseline even without targeted e2e tuning.
+- **MXFP8+FP8 optimal freq=7 vs auto freq=8** — 7.40 vs 7.77 ms. Could
+  auto-detect based on `sf_vec_size` (32 for MXFP8 vs 16 for NVFP4).
