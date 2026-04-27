@@ -22,19 +22,43 @@ Shape `(1, 32768, 24, 128)`, non-causal, `triton.do_bench rep=25 warmup=10`,
 e2e = exp2 emulation. Auto-enabled for FP8 PV at freq=8 (`51d3966c`).
 Override: `FA4_E2E_FREQ=N` (frequency), `FA4_FORCE_E2E=1` (force on for BF16).
 
-## Root cause: MUFU.EX2 saturates MIO pipe on FP8 PV
+## Root cause: MMA warp's faster cycling saturates shared MIO pipe
 
 On SM100, MUFU.EX2 (hardware exp2) dispatches through the **MIO pipe**,
-which also handles shared memory loads, special math, and dynamic branches.
+which also handles shared memory loads, special math, barrier
+exchanges (`SYNCS.EXCH`), and dynamic branches.
 
 NCU PC sampling (`ncu --set full`, `--page source --csv`, `stall_mio`
-column) confirms **99% of MIO stall samples land on MUFU.EX2**.
+column) confirms **99% of MIO stall samples land on MUFU.EX2** — but
+MUFU is the *victim*, not the cause. The cause is cross-warp MIO
+contention from the MMA warp.
 
-FP8 PV MMA (`kind::f8f6f4`) runs at 2× the throughput of BF16 (`kind::f16`).
-The softmax loop therefore iterates faster: the next iteration's MUFU burst
-fires before the MIO pipe drains from the previous one → sustained
-saturation. BF16's slower PV MMA gives MIO time to drain between
-iterations — same MUFU burst pattern, but spread further apart in wall time.
+### Why FP8 PV triggers MIO saturation but BF16 doesn't
+
+Both cubins (BF16 PV and FP8 PV, without e2e) have **identical**
+MIO-class instruction counts per iteration:
+
+| static count | NVFP4+BF16 | NVFP4+FP8 |
+|---|---|---|
+| MUFU.EX2 | 259 | 259 |
+| F2FP (all) | 256 | 256 |
+| SYNCS.EXCH | 31 | 31 |
+| SYNCS.ARRIVE | 34 | 34 |
+| SYNCS.PHASECHK | 126 | 126 |
+| UTCCP | 16 | 16 |
+| MUFU avg gap | 4.0 inst | 4.0 inst |
+| MUFU back-to-back pairs | 119 | 120 |
+
+Same instructions, same scheduling. The difference is purely **runtime**:
+
+FP8 PV MMA (`kind::f8f6f4`) runs at 2× the throughput of BF16
+(`kind::f16`). The MMA warp completes each PV tile faster → cycles
+through its barrier loop faster → issues the same SYNCS/UTCBAR/UTCCP
+instructions at **2× the rate in wall time**. The MIO pipe's capacity
+is fixed. When the MMA warp's barrier traffic doubles in rate, it fills
+the MIO queue more frequently, and the softmax warp's MUFU.EX2 can't
+issue → stall_mio rises. PC sampling reports the stall on MUFU (the
+instruction trying to issue), not on the SYNCS that filled the queue.
 
 ### NCU stall breakdown
 
