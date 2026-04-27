@@ -51,14 +51,24 @@ MIO-class instruction counts per iteration:
 
 Same instructions, same scheduling. The difference is purely **runtime**:
 
-FP8 PV MMA (`kind::f8f6f4`) runs at 2× the throughput of BF16
-(`kind::f16`). The MMA warp completes each PV tile faster → cycles
-through its barrier loop faster → issues the same SYNCS/UTCBAR/UTCCP
-instructions at **2× the rate in wall time**. The MIO pipe's capacity
-is fixed. When the MMA warp's barrier traffic doubles in rate, it fills
-the MIO queue more frequently, and the softmax warp's MUFU.EX2 can't
-issue → stall_mio rises. PC sampling reports the stall on MUFU (the
-instruction trying to issue), not on the SYNCS that filled the queue.
+**Open question**: the regression is specific to our fp4 kernel. Our
+non-fp4 kernel (`flash_fwd_sm100.py`) gains cleanly from FP8 PV
+(9.44→7.35 ms), as does pr2109 (8.14→6.76 ms). In a clean pipeline,
+speeding up PV MMA while keeping softmax the same speed cannot slow
+things down — at worst the bottleneck shifts to softmax and total stays
+flat.
+
+SASS analysis shows the BF16 and FP8 cubins have identical instruction
+counts per MIO class (259 MUFU, 31 SYNCS.EXCH, 34 SYNCS.ARRIVE, same
+MUFU spacing, same 128 REG, same STACK:32). The regression persists
+regardless of P conversion method (explicit `packed_float_to_ue4m3` or
+generic `.to()`). Yet NCU shows 3× more stall_mio samples for FP8 (44K
+vs 15K), all on MUFU.EX2.
+
+The e2e fix resolves it empirically by replacing some MUFU with
+polynomial ALU, which forces the compiler into a different scheduling
+pattern. The remaining 2.3% gap (7.47 vs 7.30 ms with auto e2e) is the
+emulation's ALU overhead.
 
 ### NCU stall breakdown
 
