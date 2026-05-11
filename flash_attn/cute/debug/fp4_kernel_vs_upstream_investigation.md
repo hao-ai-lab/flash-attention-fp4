@@ -299,3 +299,37 @@ Same random seed (42), same shapes. FP4 = our quant_qk kernel, FP8 = PR#2109 bra
 **FP4 quant_qk has ~2-2.5x lower max_diff than FP8 across all shapes**, with comparable mean_diff. FP4 block-scaled with per-group scale factors preserves more dynamic range than a simple FP8 per-tensor cast.
 
 - **Command**: `CUTE_DSL_ENABLE_TVM_FFI=1 python /tmp/bench_fp4_precision.py` and `python /tmp/bench_fp8_precision.py`
+
+---
+
+## Full benchmark: fp4-rebase vs old branch (2026-05-09)
+
+Measured on B200 GPU 7 (1965 MHz), `torch.cuda.Event` timing, n=25,
+warmup=5. Commit: fp4-rebase `90772b5f` vs mixed_precision `7f488a1e`.
+
+| mode | shape | old (TF) | rebase (TF) | delta |
+|---|---|---|---|---|
+| bf16 | (4,4096) | 1354 | 1427 | **+5.4%** |
+| bf16 | (2,8192) | 1392 | 1478 | **+6.2%** |
+| bf16 | (1,16384) | 1411 | 1508 | **+6.9%** |
+| bf16 | (1,32768) | 1332 | 1435 | **+7.7%** |
+| nvfp4_bf16 | (4,4096) | 1601 | 1610 | +0.6% |
+| nvfp4_bf16 | (2,8192) | 1665 | 1666 | +0.1% |
+| nvfp4_bf16 | (1,16384) | 1698 | 1696 | −0.1% |
+| nvfp4_bf16 | (1,32768) | 1714 | 1741 | +1.6% |
+| nvfp4_fp8 | (4,4096) | 1605 | 1184 | **−26.2%** |
+| nvfp4_fp8 | (2,8192) | 1646 | 1198 | **−27.2%** |
+| nvfp4_fp8 | (1,16384) | 1665 | 1206 | **−27.6%** |
+| nvfp4_fp8 | (1,32768) | 1764 | 1272 | **−27.9%** |
+
+**Summary**: BF16 +6-8%, NVFP4+BF16 no regression, NVFP4+FP8 **−27% regression**.
+
+**NVFP4+FP8 regression root cause**: The e2e exp2 emulation that fixed MIO
+stalls on the old branch now HURTS on the rebase. Without e2e (`FA4_E2E_FREQ=999`),
+NVFP4+FP8 = 1453 TF (−18% vs old). With e2e=8, it drops to 1272 TF (−28%).
+The upstream softmax code paths cause ptxas to schedule the emulation polynomial
+differently, increasing `stall_long_sb`. Same root cause as the NVFP4+BF16
+regression that was fixed by `cute.arch.exp2` — but the e2e path has additional
+complexity (polynomial FMA chain) that is harder to fix.
+
+**Command**: `CUDA_VISIBLE_DEVICES=7 FA_ROOT=/tmp/fa_newrebase .venv/bin/python /tmp/bench_single.py <mode> <b> <s> <h> <d>`
