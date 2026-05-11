@@ -333,3 +333,22 @@ regression that was fixed by `cute.arch.exp2` — but the e2e path has additiona
 complexity (polynomial FMA chain) that is harder to fix.
 
 **Command**: `CUDA_VISIBLE_DEVICES=7 FA_ROOT=/tmp/fa_newrebase .venv/bin/python /tmp/bench_single.py <mode> <b> <s> <h> <d>`
+
+---
+
+## Final results after register tuning + e2e freq fix (2026-05-09)
+
+Commit `99dfda04` on fp4-rebase. Two fixes applied:
+1. **e2e_freq 8→9** for FP8 PV (1272→1534 TF)
+2. **Register tuning 216/48/24→192/80/48** (1534→2017 TF for FP8, same for BF16)
+
+The register change gives correction warps 80 regs (was 48), reducing register
+spills that caused the stall_long_sb increase from upstream code paths.
+
+| mode | (4,4096) | (2,8192) | (1,16384) | (1,32768) | vs old |
+|---|---|---|---|---|---|
+| bf16 | 1420 | 1469 | 1493 | 1421 | **+5-7%** |
+| nvfp4_bf16 | 1636 | 1665 | 1678 | 1696 | **±1%** |
+| nvfp4_fp8 | 1843 | 1884 | 1902 | **2017** | **+14%** |
+
+**Zero regressions. NVFP4+FP8 exceeds old branch by 14%.**
