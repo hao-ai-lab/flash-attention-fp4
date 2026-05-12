@@ -3,7 +3,7 @@
  ## <img src="https://em-content.zobj.net/source/apple/391/star-struck_1f929.png" width="32"> FP4 Flash Attention 4 on B200
 
 > [!NOTE]
-> **This is a fork of [flash-attention](https://github.com/Dao-AILab/flash-attention) with the addition of a CuTe DSL FP4/FP8 implementation of Flash Attention 4 on B200 for the [Attn-QAT](https://arxiv.org/abs/2603.00040) paper.** Supports NVFP4 and MXFP8 block-scaled QK with BF16 or FP8 PV, peaking at **2018 TFLOPS** (NVFP4+FP8) and **1948 TFLOPS** (MXFP8+FP8) on B200. See **[flash_attn/cute/README.md](flash_attn/cute/README.md)** for results and usage.
+> **This is a fork of [flash-attention](https://github.com/Dao-AILab/flash-attention) with the addition of a CuTe DSL FP4/FP8 implementation of Flash Attention 4 on B200 for the [Attn-QAT](https://arxiv.org/abs/2603.00040) paper.** Supports NVFP4 and MXFP8 block-scaled QK with BF16 or FP8 PV, achieving up to **1.31x speedup** over BF16 FA4 (2018 vs 1545 TFLOPS). Peaks at **2018 TFLOPS** (NVFP4+FP8), **1948 TFLOPS** (MXFP8+FP8), and **1920 TFLOPS** (NVFP4+BF16) on B200. See **[flash_attn/cute/README.md](flash_attn/cute/README.md)** for results and usage.
 
 ---
 
