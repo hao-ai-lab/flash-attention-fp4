@@ -4,7 +4,7 @@ import pytest
 import torch
 from torch.nn.attention.flex_attention import create_block_mask
 
-from flash_attn.cute.mask_definitions import get_mask_pair
+from mask_mod_definitions import get_mask_pair
 from flash_attn.cute.compute_block_sparsity import compute_block_sparsity
 
 
@@ -24,7 +24,7 @@ def _call_compute_block_sparsity(
     cute_mask, _ = get_mask_pair(
         mask_name, seqlen_q=seqlen_q, seqlen_k=seqlen_k, window_size=window_size
     )
-    blocksparse_tensors, torch_tensors = compute_block_sparsity(
+    torch_tensors = compute_block_sparsity(
         tile_m=tile_m,
         tile_n=tile_n,
         batch_size=batch_size,
@@ -36,8 +36,8 @@ def _call_compute_block_sparsity(
         device="cuda",
         use_fast_sampling=use_fast_sampling,
     )
-    full_block_cnt, full_block_idx, mask_block_cnt, mask_block_idx = torch_tensors
-    return full_block_cnt, full_block_idx, mask_block_cnt, mask_block_idx
+    mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx, *_ = torch_tensors
+    return mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx
 
 
 def _compare_block_sparsity(
@@ -51,57 +51,99 @@ def _compare_block_sparsity(
     full_block_idx_ref,
     batch_size,
     nheads,
+    seqlen_q,
+    seqlen_k,
+    tile_m,
+    tile_n,
 ):
-    """Compare block sparsity against reference. Returns (all_match, error_msg)."""
+    """Compare block sparsity against reference, handling boundary block semantics.
+
+    PyTorch treats OOB regions as masked, so boundary blocks with all in-bounds
+    elements unmasked appear as "partial" in PyTorch but "full" in CuTe.
+
+    This applies to BOTH boundary m_blocks (OOB q_idx) and boundary n_blocks (OOB kv_idx).
+    """
     if not isinstance(mask_block_cnt, torch.Tensor):
         return False, f"mask_block_cnt is not a tensor: {type(mask_block_cnt)}"
 
     n_blocks_q = mask_block_cnt.shape[2]
-    mask_cnt_match = torch.all(mask_block_cnt == mask_block_cnt_ref).item()
-    full_cnt_match = torch.all(full_block_cnt == full_block_cnt_ref).item()
 
-    if not mask_cnt_match or not full_cnt_match:
-        error_msg = []
-        if not mask_cnt_match:
-            error_msg.append("Mask counts mismatch")
-            diff = (mask_block_cnt != mask_block_cnt_ref).nonzero(as_tuple=False)
-            if len(diff) > 0:
-                b, h, m = diff[0].tolist()
-                error_msg.append(
-                    f"  First mismatch at [{b},{h},{m}]: "
-                    f"got {mask_block_cnt[b, h, m].item()}, "
-                    f"expected {mask_block_cnt_ref[b, h, m].item()}"
-                )
-        if not full_cnt_match:
-            error_msg.append("Full counts mismatch")
-            diff = (full_block_cnt != full_block_cnt_ref).nonzero(as_tuple=False)
-            if len(diff) > 0:
-                b, h, m = diff[0].tolist()
-                error_msg.append(
-                    f"  First mismatch at [{b},{h},{m}]: "
-                    f"got {full_block_cnt[b, h, m].item()}, "
-                    f"expected {full_block_cnt_ref[b, h, m].item()}"
-                )
-        return False, "\n".join(error_msg)
+    # Identify boundary blocks
+    last_m_block = (seqlen_q - 1) // tile_m
+    last_n_block = (seqlen_k - 1) // tile_n
+    m_is_boundary = seqlen_q % tile_m != 0
+    n_is_boundary = seqlen_k % tile_n != 0
 
-    # Compare indices
+    def is_boundary_n_block(n_block):
+        return n_is_boundary and n_block == last_n_block
+
+    def is_boundary_m_block(m_block):
+        return m_is_boundary and m_block == last_m_block
+
     for b in range(batch_size):
         for h in range(nheads):
             for m in range(n_blocks_q):
-                num_mask = mask_block_cnt[b, h, m].item()
-                num_full = full_block_cnt[b, h, m].item()
+                cute_mask_cnt = mask_block_cnt[b, h, m].item()
+                cute_full_cnt = full_block_cnt[b, h, m].item()
+                ref_mask_cnt = mask_block_cnt_ref[b, h, m].item()
+                ref_full_cnt = full_block_cnt_ref[b, h, m].item()
 
-                if num_mask > 0:
-                    mask_indices = mask_block_idx[b, h, m, :num_mask].sort()[0]
-                    mask_indices_ref = mask_block_idx_ref[b, h, m, :num_mask].sort()[0]
-                    if not (mask_indices == mask_indices_ref).all():
-                        return False, f"Mask indices mismatch at [{b},{h},{m}]"
+                cute_mask_set = set(mask_block_idx[b, h, m, :cute_mask_cnt].tolist())
+                cute_full_set = set(full_block_idx[b, h, m, :cute_full_cnt].tolist())
+                ref_mask_set = set(mask_block_idx_ref[b, h, m, :ref_mask_cnt].tolist())
+                ref_full_set = set(full_block_idx_ref[b, h, m, :ref_full_cnt].tolist())
 
-                if num_full > 0:
-                    full_indices = full_block_idx[b, h, m, :num_full].sort()[0]
-                    full_indices_ref = full_block_idx_ref[b, h, m, :num_full].sort()[0]
-                    if not (full_indices == full_indices_ref).all():
-                        return False, f"Full indices mismatch at [{b},{h},{m}]"
+                # A block is "boundary-affected" if EITHER the m_block OR n_block is at boundary
+                def is_boundary_affected(n_block):
+                    return is_boundary_m_block(m) or is_boundary_n_block(n_block)
+
+                # Blocks that are full in CuTe but not in ref
+                full_in_cute_not_ref = cute_full_set - ref_full_set
+
+                for n_block in full_in_cute_not_ref:
+                    if not is_boundary_affected(n_block):
+                        return False, (
+                            f"Non-boundary block mismatch at [{b},{h},{m}]: "
+                            f"n_block {n_block} is full in CuTe but not in ref"
+                        )
+                    # Boundary-affected: CuTe says full, ref should say partial
+                    if n_block not in ref_mask_set:
+                        # Check if ref skipped it entirely (all masked)
+                        # This is valid for boundary blocks
+                        pass
+
+                # Blocks that are partial in CuTe but full in ref (would be a bug)
+                partial_in_cute_full_in_ref = cute_mask_set & ref_full_set
+                if partial_in_cute_full_in_ref:
+                    return False, (
+                        f"Block mismatch at [{b},{h},{m}]: "
+                        f"n_blocks {sorted(partial_in_cute_full_in_ref)} are partial in CuTe but full in ref"
+                    )
+
+                # Check non-boundary blocks match exactly
+                non_boundary_cute_full = {
+                    n for n in cute_full_set if not is_boundary_affected(n)
+                }
+                non_boundary_ref_full = {
+                    n for n in ref_full_set if not is_boundary_affected(n)
+                }
+                if non_boundary_cute_full != non_boundary_ref_full:
+                    return False, (
+                        f"Non-boundary full block mismatch at [{b},{h},{m}]: "
+                        f"CuTe={sorted(non_boundary_cute_full)}, ref={sorted(non_boundary_ref_full)}"
+                    )
+
+                non_boundary_cute_mask = {
+                    n for n in cute_mask_set if not is_boundary_affected(n)
+                }
+                non_boundary_ref_mask = {
+                    n for n in ref_mask_set if not is_boundary_affected(n)
+                }
+                if non_boundary_cute_mask != non_boundary_ref_mask:
+                    return False, (
+                        f"Non-boundary partial block mismatch at [{b},{h},{m}]: "
+                        f"CuTe={sorted(non_boundary_cute_mask)}, ref={sorted(non_boundary_ref_mask)}"
+                    )
 
     return True, ""
 
@@ -122,6 +164,7 @@ SEQLEN_PAIRS = [
     (1024, 1024),
     (2048, 2048),
     (4096, 4096),
+    (8192, 8192),
     # Large unaligned
     (1000, 1000),
     (2000, 2000),
@@ -173,7 +216,7 @@ def test_fixed_length_masks(
     """Test fixed-length masks."""
     seqlen_unaligned = (seqlen_q % tile_m != 0) or (seqlen_k % tile_n != 0)
 
-    full_block_cnt, full_block_idx, mask_block_cnt, mask_block_idx = (
+    mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx = (
         _call_compute_block_sparsity(
             batch_size,
             nheads,
@@ -182,6 +225,7 @@ def test_fixed_length_masks(
             tile_m,
             tile_n,
             mask_name,
+            use_fast_sampling=False,
         )
     )
 
@@ -205,6 +249,17 @@ def test_fixed_length_masks(
         *_,
     ) = block_mask.as_tuple()
 
+    print("CuTe results:")
+    print(f"    mask_block_cnt: {mask_block_cnt}")
+    print(f"    full_block_cnt: {full_block_cnt}")
+    print(f"    mask_block_idx: {mask_block_idx}")
+    print(f"    full_block_idx: {full_block_idx}")
+    print("Torch results:")
+    print(f"    mask_block_cnt: {mask_block_cnt_ref}")
+    print(f"    full_block_cnt: {full_block_cnt_ref}")
+    print(f"    mask_block_idx: {mask_block_idx_ref}")
+    print(f"    full_block_idx: {full_block_idx_ref}")
+
     all_match, error_msg = _compare_block_sparsity(
         mask_block_cnt,
         mask_block_idx,
@@ -216,10 +271,11 @@ def test_fixed_length_masks(
         full_block_idx_ref,
         batch_size,
         nheads,
+        seqlen_q,
+        seqlen_k,
+        tile_m,
+        tile_n,
     )
-
-    if seqlen_unaligned and not all_match:
-        pytest.skip(f"Skipping at seqlen extreme: {error_msg}")
     assert all_match, f"Mismatch: {error_msg}"
 
 
@@ -240,9 +296,7 @@ def test_parameterized_masks(
     if mask_name == "sliding_window" and seqlen_q > seqlen_k:
         pytest.skip("Sliding window not supported for seqlen_q > seqlen_k")
 
-    seqlen_unaligned = (seqlen_q % tile_m != 0) or (seqlen_k % tile_n != 0)
-
-    full_block_cnt, full_block_idx, mask_block_cnt, mask_block_idx = (
+    mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx = (
         _call_compute_block_sparsity(
             batch_size,
             nheads,
@@ -288,10 +342,12 @@ def test_parameterized_masks(
         full_block_idx_ref,
         batch_size,
         nheads,
+        seqlen_q,
+        seqlen_k,
+        tile_m,
+        tile_n,
     )
 
-    if seqlen_unaligned and not all_match:
-        pytest.skip(f"Skipping at seqlen extreme: {error_msg}")
     assert all_match, f"Mismatch: {error_msg}"
 
 
@@ -310,7 +366,7 @@ def test_edge_cases(seqlen_q, seqlen_k, tile_m, tile_n):
     batch_size, nheads = 1, 1
     seqlen_unaligned = (seqlen_q % tile_m != 0) or (seqlen_k % tile_n != 0)
 
-    full_block_cnt, full_block_idx, mask_block_cnt, mask_block_idx = (
+    mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx = (
         _call_compute_block_sparsity(
             batch_size,
             nheads,
@@ -353,10 +409,11 @@ def test_edge_cases(seqlen_q, seqlen_k, tile_m, tile_n):
         full_block_idx_ref,
         batch_size,
         nheads,
+        seqlen_q,
+        seqlen_k,
+        tile_m,
+        tile_n,
     )
-
-    if seqlen_unaligned and not all_match:
-        pytest.skip(f"Skipping at seqlen extreme: {error_msg}")
     assert all_match, f"Mismatch: {error_msg}"
 
 
@@ -371,7 +428,7 @@ def test_fast_sampling(seqlen_q, seqlen_k, tile_m, tile_n, nheads, mask_name):
     batch_size = 1
     seqlen_unaligned = (seqlen_q % tile_m != 0) or (seqlen_k % tile_n != 0)
 
-    full_block_cnt, full_block_idx, mask_block_cnt, mask_block_idx = (
+    mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx = (
         _call_compute_block_sparsity(
             batch_size,
             nheads,
@@ -415,8 +472,391 @@ def test_fast_sampling(seqlen_q, seqlen_k, tile_m, tile_n, nheads, mask_name):
         full_block_idx_ref,
         batch_size,
         nheads,
+        seqlen_q,
+        seqlen_k,
+        tile_m,
+        tile_n,
     )
 
-    if seqlen_unaligned and not all_match:
-        pytest.skip(f"Skipping at seqlen extreme: {error_msg}")
     assert all_match, f"Mismatch: {error_msg}"
+
+
+def _compare_block_sparsity_varlen(
+    mask_block_cnt,
+    mask_block_idx,
+    full_block_cnt,
+    full_block_idx,
+    cu_total_m_blocks,
+    cu_block_idx_offsets,
+    seqlens_q,
+    seqlens_k,
+    nheads,
+    tile_m,
+    tile_n,
+    mask_name,
+    window_size=None,
+):
+    """Compare varlen block sparsity against per-sequence fixed-length references."""
+    batch_size = len(seqlens_q)
+    cu_m = cu_total_m_blocks.cpu().tolist()
+    cu_n = cu_block_idx_offsets.cpu().tolist()
+
+    for b in range(batch_size):
+        sq, sk = seqlens_q[b], seqlens_k[b]
+        num_m = (sq + tile_m - 1) // tile_m
+        num_n = (sk + tile_n - 1) // tile_n
+        m_off = cu_m[b]
+        n_off = cu_n[b]
+
+        _, mask_mod_flex = get_mask_pair(
+            mask_name, seqlen_q=sq, seqlen_k=sk, window_size=window_size
+        )
+        block_mask = create_block_mask(
+            mask_mod_flex,
+            B=1,
+            H=nheads,
+            Q_LEN=sq,
+            KV_LEN=sk,
+            device="cuda",
+            BLOCK_SIZE=(tile_m, tile_n),
+        )
+        _, _, ref_mask_cnt, ref_mask_idx, ref_full_cnt, ref_full_idx, *_ = (
+            block_mask.as_tuple()
+        )
+
+        for h in range(nheads):
+            for m in range(num_m):
+                global_m = m_off + m
+                n_base = n_off + m * num_n
+
+                vl_mask_cnt = mask_block_cnt[h, global_m].item()
+                vl_full_cnt = full_block_cnt[h, global_m].item()
+                vl_mask_set = set(
+                    mask_block_idx[h, n_base : n_base + vl_mask_cnt].tolist()
+                )
+                vl_full_set = set(
+                    full_block_idx[h, n_base : n_base + vl_full_cnt].tolist()
+                )
+
+                r_mask_cnt = ref_mask_cnt[0, h, m].item()
+                r_full_cnt = ref_full_cnt[0, h, m].item()
+                r_mask_set = set(ref_mask_idx[0, h, m, :r_mask_cnt].tolist())
+                r_full_set = set(ref_full_idx[0, h, m, :r_full_cnt].tolist())
+
+                last_m_block = (sq - 1) // tile_m
+                last_n_block = (sk - 1) // tile_n
+                m_is_boundary = sq % tile_m != 0 and m == last_m_block
+                n_is_boundary = sk % tile_n != 0
+
+                def is_boundary_affected(
+                    n_block,
+                    _m_bnd=m_is_boundary,
+                    _n_bnd=n_is_boundary,
+                    _ln=last_n_block,
+                ):
+                    return _m_bnd or (_n_bnd and n_block == _ln)
+
+                non_boundary_vl_full = {
+                    n for n in vl_full_set if not is_boundary_affected(n)
+                }
+                non_boundary_ref_full = {
+                    n for n in r_full_set if not is_boundary_affected(n)
+                }
+                if non_boundary_vl_full != non_boundary_ref_full:
+                    return False, (
+                        f"Varlen full block mismatch at batch={b}, head={h}, m_block={m} "
+                        f"(sq={sq}, sk={sk}): "
+                        f"varlen={sorted(non_boundary_vl_full)}, ref={sorted(non_boundary_ref_full)}"
+                    )
+
+                non_boundary_vl_mask = {
+                    n for n in vl_mask_set if not is_boundary_affected(n)
+                }
+                non_boundary_ref_mask = {
+                    n for n in r_mask_set if not is_boundary_affected(n)
+                }
+                if non_boundary_vl_mask != non_boundary_ref_mask:
+                    return False, (
+                        f"Varlen partial block mismatch at batch={b}, head={h}, m_block={m} "
+                        f"(sq={sq}, sk={sk}): "
+                        f"varlen={sorted(non_boundary_vl_mask)}, ref={sorted(non_boundary_ref_mask)}"
+                    )
+
+    return True, ""
+
+
+# ---- Varlen test configurations ----
+
+VARLEN_SEQLEN_CONFIGS = [
+    # (seqlens_q, seqlens_k) - lists of per-batch lengths
+    # Uniform lengths (should match fixed-length behavior)
+    ([128, 128], [128, 128]),
+    ([256, 256], [256, 256]),
+    # Different lengths per batch
+    ([64, 128], [64, 128]),
+    ([128, 256], [128, 256]),
+    ([256, 512], [256, 512]),
+    ([64, 128, 256], [64, 128, 256]),
+    # Unaligned
+    ([113, 203], [113, 203]),
+    ([127, 255], [127, 255]),
+    ([100, 200, 300], [100, 200, 300]),
+    # Asymmetric Q/K
+    ([128, 256], [256, 128]),
+    ([64, 128], [128, 256]),
+    # Single element sequences
+    ([1, 128], [1, 128]),
+    ([64, 1], [64, 1]),
+    # Large spread
+    ([32, 512, 128], [32, 512, 128]),
+    ([1024, 64], [1024, 64]),
+]
+
+
+def _generate_varlen_inputs(
+    seqlens_q,
+    seqlens_k,
+    tile_m,
+    tile_n,
+    device="cuda",
+):
+    """Generate cu_seqlens and cu_total_*_blocks for a varlen batch.
+
+    Args:
+        seqlens_q: list of per-batch query sequence lengths
+        seqlens_k: list of per-batch key sequence lengths
+        tile_m, tile_n: tile sizes
+    Returns:
+        cu_seqlens_q, cu_seqlens_k, cu_total_m_blocks, cu_block_idx_offsets
+    """
+    batch_size = len(seqlens_q)
+    assert len(seqlens_k) == batch_size
+
+    cu_seqlens_q = [0]
+    cu_seqlens_k = [0]
+    cu_total_m_blocks = [0]
+    cu_block_idx_offsets = [0]
+
+    for b in range(batch_size):
+        cu_seqlens_q.append(cu_seqlens_q[-1] + seqlens_q[b])
+        cu_seqlens_k.append(cu_seqlens_k[-1] + seqlens_k[b])
+        num_m = (seqlens_q[b] + tile_m - 1) // tile_m
+        num_n = (seqlens_k[b] + tile_n - 1) // tile_n
+        cu_total_m_blocks.append(cu_total_m_blocks[-1] + num_m)
+        cu_block_idx_offsets.append(cu_block_idx_offsets[-1] + num_m * num_n)
+
+    return (
+        torch.tensor(cu_seqlens_q, device=device, dtype=torch.int32),
+        torch.tensor(cu_seqlens_k, device=device, dtype=torch.int32),
+        torch.tensor(cu_total_m_blocks, device=device, dtype=torch.int32),
+        torch.tensor(cu_block_idx_offsets, device=device, dtype=torch.int32),
+    )
+
+
+def _call_compute_block_sparsity_varlen(
+    seqlens_q,
+    seqlens_k,
+    nheads,
+    tile_m,
+    tile_n,
+    mask_name,
+    window_size=None,
+    aux_tensors=None,
+    use_fast_sampling=False,
+):
+    """Call compute_block_sparsity with varlen inputs."""
+    batch_size = len(seqlens_q)
+    # Use max seqlens for mask_mod compilation (the kernel uses per-batch seqlens at runtime)
+    max_seqlen_q = max(seqlens_q)
+    max_seqlen_k = max(seqlens_k)
+
+    cute_mask, _ = get_mask_pair(
+        mask_name, seqlen_q=max_seqlen_q, seqlen_k=max_seqlen_k, window_size=window_size
+    )
+
+    cu_seqlens_q, cu_seqlens_k, cu_total_m_blocks, cu_block_idx_offsets = (
+        _generate_varlen_inputs(seqlens_q, seqlens_k, tile_m, tile_n)
+    )
+
+    torch_tensors = compute_block_sparsity(
+        tile_m=tile_m,
+        tile_n=tile_n,
+        batch_size=batch_size,
+        num_heads=nheads,
+        seqlen_q=max_seqlen_q,
+        seqlen_k=max_seqlen_k,
+        mask_mod=cute_mask,
+        aux_tensors=aux_tensors,
+        device="cuda",
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        cu_total_m_blocks=cu_total_m_blocks,
+        cu_block_idx_offsets=cu_block_idx_offsets,
+        use_fast_sampling=use_fast_sampling,
+    )
+    mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx, *_ = torch_tensors
+    return (
+        mask_block_cnt,
+        mask_block_idx,
+        full_block_cnt,
+        full_block_idx,
+        cu_total_m_blocks,
+        cu_block_idx_offsets,
+    )
+
+
+@pytest.mark.parametrize("seqlens_q,seqlens_k", VARLEN_SEQLEN_CONFIGS)
+@pytest.mark.parametrize("tile_m,tile_n", [(64, 64), (128, 128), (64, 128), (128, 64)])
+@pytest.mark.parametrize("nheads", [1, 4])
+@pytest.mark.parametrize("mask_name", ["causal", "block_diagonal"])
+def test_varlen(seqlens_q, seqlens_k, tile_m, tile_n, nheads, mask_name):
+    """Test variable-length sequence support."""
+    (
+        mask_block_cnt,
+        mask_block_idx,
+        full_block_cnt,
+        full_block_idx,
+        cu_total_m_blocks,
+        cu_block_idx_offsets,
+    ) = _call_compute_block_sparsity_varlen(
+        seqlens_q, seqlens_k, nheads, tile_m, tile_n, mask_name
+    )
+
+    all_match, error_msg = _compare_block_sparsity_varlen(
+        mask_block_cnt,
+        mask_block_idx,
+        full_block_cnt,
+        full_block_idx,
+        cu_total_m_blocks,
+        cu_block_idx_offsets,
+        seqlens_q,
+        seqlens_k,
+        nheads,
+        tile_m,
+        tile_n,
+        mask_name,
+    )
+    assert all_match, f"Mismatch: {error_msg}"
+
+
+@pytest.mark.parametrize(
+    "seqlens_q,seqlens_k",
+    [
+        ([128, 128], [128, 128]),
+        ([64, 128, 256], [64, 128, 256]),
+        ([100, 200], [100, 200]),
+    ],
+)
+@pytest.mark.parametrize("tile_m,tile_n", [(64, 64), (128, 128)])
+@pytest.mark.parametrize("nheads", [1])
+@pytest.mark.parametrize(
+    "mask_name,window_size",
+    [("causal", None), ("sliding_window", 64), ("sliding_window", 256)],
+)
+def test_varlen_parameterized_masks(
+    seqlens_q, seqlens_k, tile_m, tile_n, nheads, mask_name, window_size
+):
+    """Test varlen with parameterized masks."""
+    # Skip sliding window when any seqlen_q > seqlen_k
+    if mask_name == "sliding_window" and any(
+        sq > sk for sq, sk in zip(seqlens_q, seqlens_k)
+    ):
+        pytest.skip("Sliding window not supported for seqlen_q > seqlen_k")
+
+    (
+        mask_block_cnt,
+        mask_block_idx,
+        full_block_cnt,
+        full_block_idx,
+        cu_total_m_blocks,
+        cu_block_idx_offsets,
+    ) = _call_compute_block_sparsity_varlen(
+        seqlens_q, seqlens_k, nheads, tile_m, tile_n, mask_name, window_size=window_size
+    )
+
+    all_match, error_msg = _compare_block_sparsity_varlen(
+        mask_block_cnt,
+        mask_block_idx,
+        full_block_cnt,
+        full_block_idx,
+        cu_total_m_blocks,
+        cu_block_idx_offsets,
+        seqlens_q,
+        seqlens_k,
+        nheads,
+        tile_m,
+        tile_n,
+        mask_name,
+        window_size=window_size,
+    )
+    assert all_match, f"Mismatch: {error_msg}"
+
+
+@pytest.mark.parametrize("nheads", [1, 4])
+@pytest.mark.parametrize("tile_m,tile_n", [(64, 64), (128, 128)])
+def test_varlen_matches_fixed_length(nheads, tile_m, tile_n):
+    """Verify that varlen with uniform sequence lengths produces identical
+    results to the fixed-length path."""
+    seqlen_q, seqlen_k = 256, 256
+    batch_size = 3
+    mask_name = "causal"
+
+    # Fixed-length result
+    fixed_mask_cnt, fixed_mask_idx, fixed_full_cnt, fixed_full_idx = (
+        _call_compute_block_sparsity(
+            batch_size, nheads, seqlen_q, seqlen_k, tile_m, tile_n, mask_name
+        )
+    )
+
+    # Varlen with uniform lengths
+    seqlens_q = [seqlen_q] * batch_size
+    seqlens_k = [seqlen_k] * batch_size
+    (
+        vl_mask_cnt,
+        vl_mask_idx,
+        vl_full_cnt,
+        vl_full_idx,
+        cu_total_m_blocks,
+        cu_block_idx_offsets,
+    ) = _call_compute_block_sparsity_varlen(
+        seqlens_q, seqlens_k, nheads, tile_m, tile_n, mask_name
+    )
+
+    num_m = (seqlen_q + tile_m - 1) // tile_m
+    num_n = (seqlen_k + tile_n - 1) // tile_n
+    cu_m = cu_total_m_blocks.cpu().tolist()
+    cu_n = cu_block_idx_offsets.cpu().tolist()
+
+    for b in range(batch_size):
+        for h in range(nheads):
+            for m in range(num_m):
+                global_m = cu_m[b] + m
+                n_base = cu_n[b] + m * num_n
+
+                # Counts should match
+                assert (
+                    vl_mask_cnt[h, global_m].item() == fixed_mask_cnt[b, h, m].item()
+                ), f"Mask count mismatch at b={b}, h={h}, m={m}"
+                assert (
+                    vl_full_cnt[h, global_m].item() == fixed_full_cnt[b, h, m].item()
+                ), f"Full count mismatch at b={b}, h={h}, m={m}"
+
+                mc = vl_mask_cnt[h, global_m].item()
+                fc = vl_full_cnt[h, global_m].item()
+                vl_mask_set = set(vl_mask_idx[h, n_base : n_base + mc].tolist())
+                vl_full_set = set(vl_full_idx[h, n_base : n_base + fc].tolist())
+                fixed_mask_set = set(fixed_mask_idx[b, h, m, :mc].tolist())
+                fixed_full_set = set(fixed_full_idx[b, h, m, :fc].tolist())
+
+                assert vl_mask_set == fixed_mask_set, (
+                    f"Mask idx mismatch at b={b}, h={h}, m={m}: "
+                    f"varlen={sorted(vl_mask_set)}, fixed={sorted(fixed_mask_set)}"
+                )
+                assert vl_full_set == fixed_full_set, (
+                    f"Full idx mismatch at b={b}, h={h}, m={m}: "
+                    f"varlen={sorted(vl_full_set)}, fixed={sorted(fixed_full_set)}"
+                )
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
