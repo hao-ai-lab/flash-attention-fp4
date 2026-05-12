@@ -1,33 +1,95 @@
-# FlashAttention-4 (CuTeDSL)
+# FP4 Flash Attention 4 (FA4) on Blackwell
 
-FlashAttention-4 is a CuTeDSL-based implementation of FlashAttention for Hopper and Blackwell GPUs.
+CuTe DSL implementation of FP4 block-scaled flash attention for NVIDIA Blackwell GPUs (sm100a/sm103a). Supports two modes:
+- **QK quantization** (`--quant_qk`, default): Q and K quantized to NVFP4 E2M1 or MXFP8 E4M3 with block scale factors. V can be BF16 or FP8. Peaks at **2018 TFLOPS** (NVFP4+FP8) and **1948 TFLOPS** (MXFP8+FP8).
+- **QKVP quantization** (`--quant_v`): additionally quantizes the softmax output P and V to NVFP4 with on-the-fly group-wise P quantization. Currently **slower than BF16** (0.84–0.95x) due to hardware limitations: the softmax exp (MUFU instruction) has the same throughput as on H100, but B200 MMA throughput doubles, making softmax warp the bottleneck (See [FA4 paper](https://arxiv.org/abs/2603.05451)). The added P quantization + scale factor R->SMEM->TMEM copy increases critical-path latency.
+We speculate that on B300 and Rubin (w/ FP16 softmax) the QKVP quantization will be faster than BF16.
+
+## Results — QK Quantization
+
+Block-scaled QK attention with BF16 or FP8 PV (triton `do_bench`, B200):
+
+| Config | NVFP4+BF16 | NVFP4+FP8 | MXFP8+FP8 | BF16 ref |
+|--------|-----------|----------|----------|---------|
+| b=1 s=256 h=16 d=128 | 34 | 39 | 40 | 35 |
+| b=1 s=1024 h=16 d=128 | 418 | 416 | 414 | 380 |
+| b=4 s=4096 h=16 d=128 | 1789 | 1875 | 1801 | 1479 |
+| b=1 s=32768 h=16 d=128 | **1920** | **2016** | **1942** | 1543 |
+| b=4 s=4096 h=32 d=128 | 1826 | 1920 | 1851 | 1471 |
+| b=1 s=4096 h=12 d=128 | 1081 | 1118 | 1070 | 940 |
+| **b=1 s=32768 h=12 d=128** ¹ | **1823** | **1913** | **1846** | 1508 |
+| b=1 s=4096 h=24 d=128 | 1482 | 1548 | 1480 | 1274 |
+| **b=1 s=32768 h=24 d=128** | **1887** | **2018** | **1948** | 1545 |
+| b=1 s=32768 h=24 d=64 | 919 | 986 | — | 949 |
+
+All values in TFLOPS. Peak: **NVFP4+FP8 2018 TF**, **MXFP8+FP8 1948 TF**.
+
+¹ Matches [Wan2.1-T2V-1.3B](https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B-Diffusers) inference (480×832 video, 81 frames → latent seqlen 32760, nheads=12, headdim=128).
+
+Per-call precision: cosine similarity ≥ 0.99 (block-scaled QK vs BF16 reference).
+
+## Results — QKV Quantization (quant_v)
+
+Additionally quantizes softmax output P and V to FP4. The PV GEMM uses block-scaled MMA with on-the-fly P quantization (`scale_groupwise`) and SFP R2S copy. **Currently slower than BF16** because the softmax warp is the pipeline bottleneck — P quantization adds to the critical path.
+
+| Config | FP4 QKV (ms) | BF16 (ms) | Speedup |
+|--------|-------------|-----------|---------|
+| b=1 s=256 h=16 d=128 | 0.028 | 0.039 | 1.42x ² |
+| b=1 s=1024 h=16 d=128 | 0.027 | 0.041 | 1.52x ² |
+| b=4 s=4096 h=16 d=128 | 1.287 | 1.217 | 0.95x |
+| b=1 s=4096 h=12 d=128 | 0.435 | 0.336 | 0.77x |
+| **b=1 s=32768 h=12 d=128** | **13.693** | **12.775** | **0.93x** |
+| b=1 s=4096 h=24 d=128 | 0.538 | 0.486 | 0.90x |
+| b=1 s=32768 h=24 d=128 | 27.053 | 22.617 | 0.84x |
+
+² Small shapes are faster due to reduced memory traffic, but the slowdown at large shapes reflects the softmax bottleneck.
 
 ## Installation
 
-```sh
-pip install flash-attn-4
+### Editable Install
+
+```bash
+pip install -e .
 ```
 
-If you're on CUDA 13, install with the `cu13` extra for best performance:
+### Fixing Editable Install Import Issues
 
-```sh
-pip install "flash-attn-4[cu13]"
+If you have a non-editable `flash-attn` package installed, Python may import from the installed package instead of your local editable installation.
+
+**Solution:** Run the fix script once after installation:
+
+```bash
+python fix_editable_import.py
 ```
 
-## Usage
+**Verify it's working:**
 
-```python
-from flash_attn.cute import flash_attn_func, flash_attn_varlen_func
-
-out = flash_attn_func(q, k, v, causal=True)
+```bash
+python -c "import flash_attn.cute.interface; print(flash_attn.cute.interface.__file__)"
 ```
 
-## Development
+## Benchmarking
 
-```sh
-git clone https://github.com/Dao-AILab/flash-attention.git
-cd flash-attention
-pip install -e "flash_attn/cute[dev]"       # CUDA 12.x
-pip install -e "flash_attn/cute[dev,cu13]"  # CUDA 13.x (e.g. B200)
-pytest tests/cute/
+```bash
+cd examples/python/CuTeDSL/blackwell/flash-attention/flash_attn/cute
+CUTE_DSL_ENABLE_TVM_FFI=1 python benchmarks/bench_fp4.py          # QK quantized
+CUTE_DSL_ENABLE_TVM_FFI=1 python benchmarks/bench_fp4.py --quant_v # QKV quantized
+CUTE_DSL_ENABLE_TVM_FFI=1 python benchmarks/bench_fp4.py --debug   # correctness test
+```
+
+## Pipeline Graph (scale factor TMEM overlap schedule)
+![pipeline graph](figures/pipeline.png)
+
+## Citation
+If you find our FP4 kernel useful, please cite:
+```
+@misc{zhang2026attnqat4bitattentionquantizationaware,
+      title={Attn-QAT: 4-Bit Attention With Quantization-Aware Training}, 
+      author={Peiyuan Zhang and Matthew Noto and Wenxuan Tan and Chengquan Jiang and Will Lin and Wei Zhou and Hao Zhang},
+      year={2026},
+      eprint={2603.00040},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2603.00040}, 
+}
 ```
