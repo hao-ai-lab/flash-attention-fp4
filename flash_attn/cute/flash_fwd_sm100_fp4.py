@@ -15,6 +15,7 @@
 
 import enum
 import math
+import os
 from typing import Type, Tuple, Callable, Optional, Literal
 from functools import partial
 from dataclasses import dataclass
@@ -22,7 +23,7 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Int32, const_expr, Float8E4M3FN, Float4E2M1FN
+from cutlass import Float32, Int32, const_expr, Float8E4M3FN, Float8E5M2, Float8E8M0FNU, Float4E2M1FN
 from cutlass.cute.nvgpu import cpasync
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
@@ -58,6 +59,29 @@ from flash_attn.cute.tile_scheduler import (
     ParamsBase,
 )
 
+# === TUNING KNOBS ===
+# Keys: (is_causal: bool, head_dim_padded: int)
+# FP4 kernel is always 1-CTA. SM103 not supported (block-scaled MMA is SM100 only).
+# Values:
+#   e2e_freq: int — exp2 emulation frequency (0=all hardware exp2)
+#   e2e_start_frg: int — fragment index to start emulation from
+#   num_regs_softmax: int — register count for softmax warps (multiple of 8)
+#   num_regs_correction: int — register count for correction warps (multiple of 8)
+#   num_regs_other: derived as 512 - num_regs_softmax * 2 - num_regs_correction
+_FP4_TUNING_CONFIG = {
+    # BF16 PV: e2e_freq=16 verified via bench_fp4.py (1921 TF peak).
+    (False, 128): {"e2e_freq": 16, "e2e_start_frg": 1, "num_regs_softmax": 192, "num_regs_correction": 80, "enable_e2e": True},
+    (True, 128):  {"e2e_freq": 16, "e2e_start_frg": 1, "num_regs_softmax": 192, "num_regs_correction": 80, "enable_e2e": True},
+}
+# FP8 PV overrides: when v_dtype.width == 8 and quant_pv == False
+_FP4_FP8PV_TUNING_CONFIG = {
+    # FP8 PV: e2e_freq=9 verified via bench_fp4.py (2018 TF peak).
+    (False, 128): {"e2e_freq": 9, "e2e_start_frg": 0},
+    (True, 128):  {"e2e_freq": 9, "e2e_start_frg": 0},
+}
+# === END TUNING KNOBS ===
+
+
 class NamedBarrierFwd(enum.IntEnum):
     Epilogue = enum.auto()  # starts from 1 as barrier 0 is reserved for sync_threads()
 #     WarpSchedulerWG1 = enum.auto()
@@ -91,7 +115,10 @@ class FlashAttentionForwardSm100:
         sf_dtype: Optional[Type[cutlass.Numeric]] = None,
         sf_vec_size: Optional[int] = None,
     ):
-        assert sf_vec_size == 16 and sf_dtype == cutlass.Float8E4M3FN, "Only support NVFP4 for now"
+        assert (sf_dtype, sf_vec_size) in {
+            (cutlass.Float8E4M3FN, 16),
+            (cutlass.Float8E8M0FNU, 32),
+        }, f"Unsupported block-scaled configuration: sf_dtype={sf_dtype}, sf_vec_size={sf_vec_size}"
         self.use_tma_KV = not paged_kv_non_tma
         # self.dtype = dtype
         # padding head_dim to a multiple of 16 as k_block_size
@@ -199,37 +226,63 @@ class FlashAttentionForwardSm100:
         # vec buffer for row_max & row_sum
         self.tmem_vec_offset = self.tmem_s_offset
 
+        _tune_key = (self.is_causal, self.head_dim_padded)
+        self._tune = _FP4_TUNING_CONFIG.get(_tune_key, {})
         if self.head_dim_padded < 96:
             self.num_regs_softmax = 200
             self.num_regs_correction = 64
             self.num_regs_other = 48
+        elif "num_regs_softmax" in self._tune:
+            self.num_regs_softmax = self._tune["num_regs_softmax"]
+            self.num_regs_correction = self._tune["num_regs_correction"]
+            self.num_regs_other = 512 - self.num_regs_softmax * 2 - self.num_regs_correction
         else:
-            # self.num_regs_softmax = 192 if self.is_causal or self.is_local else 184
-            self.num_regs_softmax = 216
-            # self.num_regs_softmax = 176
-            # self.num_regs_correction = 96
-            # self.num_regs_correction = 80
-            # self.num_regs_correction = 64 if self.is_causal or self.is_local else 80
-            self.num_regs_correction = 48
-            # self.num_regs_other = 32
-            # self.num_regs_other = 64
-            # self.num_regs_other = 80
-            self.num_regs_other = 24
-            # self.num_regs_other = 96 if self.is_causal or self.is_local else 80
-            # self.num_regs_other = 64 if self.is_causal or self.is_local else 80
+            self.num_regs_softmax = 192
+            self.num_regs_correction = 80
+            self.num_regs_other = 512 - self.num_regs_softmax * 2 - self.num_regs_correction
         self.num_regs_empty = 24
         self.buffer_align_bytes = 1024
         
         # Scale factor parameters for block-scaled quantization (FP4)
         self.sf_dtype = sf_dtype
         self.sf_vec_size = sf_vec_size
+        self.debug_skip_sfq_s2t = os.getenv("FA4_DEBUG_SKIP_SFQ_S2T", "0") == "1"
+        # FA4_SFQK_TMEM_SLOT: "s" (default staggered-S), "o" (o-offsets),
+        # "o_stagger" (staggered-O). Experiment knob for SFQK TMEM placement.
+        self.sfqk_tmem_slot = os.getenv("FA4_SFQK_TMEM_SLOT", "s")
+        self.debug_skip_sfk_s2t = os.getenv("FA4_DEBUG_SKIP_SFK_S2T", "0") == "1"
+        self.debug_force_generic_mxfp8_qk = os.getenv("FA4_DEBUG_FORCE_GENERIC_MXFP8_QK", "0") == "1"
+        # Force MXFP8 QK through the inline-PTX helper for perf A/B. Measured
+        # after the tmem_s_offset SFQ collision fix:
+        #   MXFP8+BF16 (1,32768,24,128): inline 1718 TF, generic 1670 TF (+2.9%)
+        #   MXFP8+BF16 (1,32768,12,128): inline 1643 TF, generic 1650 TF (tie)
+        # Mixed results; keep default generic, toggleable for per-shape tuning.
+        self.debug_mxfp8_use_inline_ptx = os.getenv("FA4_MXFP8_USE_INLINE_PTX", "0") == "1"
+        self.fp8_pv_use_explicit_pack = os.getenv("FA4_FP8_PV_USE_EXPLICIT_PACK", "1") == "1"
+        # e2e (exp2 emulation) interleaving config — env vars read here,
+        # applied in __call__ where v_dtype/quant_pv are known.
+        _e2e_freq_env = os.getenv("FA4_E2E_FREQ")
+        self._e2e_freq_override = int(_e2e_freq_env) if _e2e_freq_env else None
+        self.e2e_freq = self._e2e_freq_override if self._e2e_freq_override is not None else self._tune.get("e2e_freq", 16)
+        self.e2e_start_frg = int(os.getenv("FA4_E2E_START_FRG", str(self._tune.get("e2e_start_frg", 0))))
+        # e2e helps NVFP4 (sf_vec_size=16) but hurts MXFP8 (sf_vec_size=32) for BF16 PV
+        self.force_e2e = self._tune.get("enable_e2e", False) and self.sf_vec_size == 16
+        # Fused exp2 + packed E4M3 conversion. A/B'd against the 2-pass baseline
+        # on (1, 32768, 24, 128) MXFP8+FP8 at parity (~1663 TFLOPS both ways) —
+        # the DSL's IR fuser likely achieves the same register schedule. Kept
+        # behind a flag so it can be revisited on shapes where the 2-pass cost
+        # is more exposed.
+        self.fp8_pv_use_fused_pack = os.getenv("FA4_FP8_PV_USE_FUSED_PACK", "0") == "1"
+        self.fp8_pv_zero_fill_regs = os.getenv("FA4_FP8_PV_ZERO_FILL_REGS", "1") == "1"
         self.mma_inst_bits_k = 256
         if self.sf_vec_size == 16:
-            # Tiling degree along k dimension
-            self.mma_inst_tile_k = self.head_dim_padded // (self.mma_inst_bits_k // 8 * 2) # each k tile is 256 bits, NVFP4 is half a byte
-            # TODO(Wenxuan): increase q_stage and kv_stage for more pipelining
+            # NVFP4 / MXF4NVF4: 256-bit operand tile covers 64 logical K elements.
+            self.mma_inst_tile_k = self.head_dim_padded // (self.mma_inst_bits_k // 8 * 2)
+        elif self.sf_vec_size == 32:
+            # MXFP8: 256-bit operand tile covers 32 logical K elements.
+            self.mma_inst_tile_k = self.head_dim_padded // (self.mma_inst_bits_k // 8)
         else:
-            raise ValueError(f"Only support NVFP4 for now")
+            raise ValueError(f"Unsupported sf_vec_size={self.sf_vec_size}")
 
     def _setup_attributes(self):
         """Set up configurations and parameters for the FMHA kernel operation.
@@ -285,6 +338,17 @@ class FlashAttentionForwardSm100:
             num_kv_staged_fields += 1  # sSFV
         smem_kv_per_stage += num_kv_staged_fields * 128
         self.kv_stage = (smem_budget - smem_fixed) // smem_kv_per_stage
+        # Pure FP8 PV should not keep increasing KV pipeline depth just because V is smaller.
+        # Keep a local env override so we can sweep end-to-end performance without
+        # editing the scheduling code for every experiment.
+        fp8_pv_kv_stage_cap_env = os.getenv("FA4_FP8_PV_KV_STAGE_CAP")
+        fp8_pv_kv_stage_cap = (
+            int(fp8_pv_kv_stage_cap_env)
+            if fp8_pv_kv_stage_cap_env is not None
+            else (4 if self.head_dim_v_padded >= 128 else 0)
+        )
+        if const_expr(not self.quant_pv and self.v_dtype.width == 8 and fp8_pv_kv_stage_cap > 0):
+            self.kv_stage = min(self.kv_stage, fp8_pv_kv_stage_cap)
         # For hdim 192,128, we don't have enough smem to store all 3 stages of KV:
         # 128 x 192 x 2 bytes x 3 stages = 144KB, and we need 96KB for Q.
         # Instead we store smem as [smem_large, smem_small, smem_large], where smem_large is
@@ -454,12 +518,22 @@ class FlashAttentionForwardSm100:
             raise TypeError(f"Type mismatch: {self.q_dtype} != {self.v_dtype} (V quantization requires matching dtype)")
         self._setup_attributes()
         self.use_tma_O = self.arch >= 90 and mCuSeqlensQ is None and mSeqUsedQ is None
-        # This can be tuned
-        self.e2e_freq = 16
-        if const_expr(
-            self.head_dim_padded > 64 and not self.is_causal and not self.is_local and self.pack_gqa
-        ):
-            self.e2e_freq = 32 if mCuSeqlensQ is not None or mSeqUsedQ is not None else 10
+        # Apply FP8 PV tuning overrides when v_dtype is FP8
+        if const_expr(not self.quant_pv and self.v_dtype.width == 8):
+            _fp8_tune = _FP4_FP8PV_TUNING_CONFIG.get(
+                (self.is_causal, self.head_dim_padded), {}
+            )
+            if const_expr(self._e2e_freq_override is None and "e2e_freq" in _fp8_tune):
+                # NVFP4 FP8: freq=9, MXFP8 FP8: freq=10
+                _fp8_default = _fp8_tune["e2e_freq"] if self.sf_vec_size == 16 else 10
+                self.e2e_freq = _fp8_default
+                self.e2e_start_frg = _fp8_tune.get("e2e_start_frg", self.e2e_start_frg)
+            self.force_e2e = True
+        elif const_expr(self._e2e_freq_override is None):
+            if const_expr(
+                self.head_dim_padded > 64 and not self.is_causal and not self.is_local and self.pack_gqa
+            ):
+                self.e2e_freq = 32 if mCuSeqlensQ is not None or mSeqUsedQ is not None else self._tune.get("e2e_freq", 10)
 
         use_2cta_instrs = self.mma_tiler_qk[0] == 256
         assert use_2cta_instrs == False, "Two-CTA instructions not supported yet"
@@ -556,19 +630,23 @@ class FlashAttentionForwardSm100:
         sfv_smem_layout_staged = None
         sfp_smem_layout_staged = None
         # # (((Atom_Inst_M, Rest_M),(Atom_Inst_K, Rest_K)), MMA_M, MMA_K, STAGE)
+        # Always thread our computed mma_inst_tile_k through. Default is 4 in the
+        # helper, which only happens to match MXFP8 d=128. MXFP8 d=64 needs 2 and
+        # was failing to compile via TMA SFQ atom shape mismatch.
+        sf_layout_kwargs = {"mma_tile_inst_k": self.mma_inst_tile_k}
         sfq_smem_layout_staged = make_smem_layout_sfa(
             tiled_mma_qk,
             self.mma_tiler_qk,
             self.sf_vec_size,
             self.q_stage,
-            mma_tile_inst_k=self.mma_inst_tile_k,
+            **sf_layout_kwargs,
         )
         sfk_smem_layout_staged = make_smem_layout_sfb(
             tiled_mma_qk,
             self.mma_tiler_qk,
             self.sf_vec_size,
             self.kv_stage,
-            mma_tile_inst_k=self.mma_inst_tile_k,
+            **sf_layout_kwargs,
         )
         # Create P scale factor layout for P*V operation (P is the A matrix)
         if const_expr(self.quant_pv):
@@ -577,7 +655,7 @@ class FlashAttentionForwardSm100:
                 self.mma_tiler_pv,
                 self.sf_vec_size,
                 self.q_stage,
-                mma_tile_inst_k=self.mma_inst_tile_k,
+                **sf_layout_kwargs,
             )
 
             sfv_smem_layout_staged = make_smem_layout_sfb(
@@ -585,7 +663,7 @@ class FlashAttentionForwardSm100:
                 self.mma_tiler_pv,
                 self.sf_vec_size,
                 self.kv_stage,
-                mma_tile_inst_k=self.mma_inst_tile_k,
+                **sf_layout_kwargs,
             )
         
         if const_expr(not self.same_hdim_kv_padded):
@@ -773,7 +851,7 @@ class FlashAttentionForwardSm100:
                 self.k_major_mode,
                 self.sf_dtype,
                 self.sf_vec_size,
-                self.cta_group,
+                cute.nvgpu.tcgen05.CtaGroup.ONE,
                 mma_inst_shape_mnk_sfb_qk[:2],
             )
             cluster_layout_sfb_vmnk = cute.tiled_divide(
@@ -822,7 +900,7 @@ class FlashAttentionForwardSm100:
                 self.v_major_mode,
                 self.sf_dtype,
                 self.sf_vec_size,
-                self.cta_group,
+                cute.nvgpu.tcgen05.CtaGroup.ONE,
                 mma_inst_shape_mnk_sfb_pv[:2],
                 p_source,
             )
@@ -931,7 +1009,24 @@ class FlashAttentionForwardSm100:
         self.mbar_sfpv_load_offset = self.mbar_sfqk_load_offset + self.q_stage
         self.mbar_total = self.mbar_sfpv_load_offset + self.q_stage
         # self.mbar_total = self.mbar_P_full_2_offset + self.q_stage
-        self.mbar_p_split = lambda k: (k // 4 * 3 if cutlass.const_expr(self.v_dtype.width >= 8) else k // 2 )
+        # Pure FP8 PV benefits from releasing P to the PV MMA earlier than the
+        # FP4 quantized path; keep env overrides for additional tuning sweeps.
+        fp8_pv_split_num = int(os.getenv("FA4_FP8_PV_P_SPLIT_NUM", "1"))
+        fp8_pv_split_den = int(os.getenv("FA4_FP8_PV_P_SPLIT_DEN", "2"))
+        fp8_pv_small_d = self.head_dim_v_padded <= 64
+        self.mbar_p_split = lambda k: (
+            max(
+                1,
+                min(
+                    k - 1,
+                    k
+                    * (3 if cutlass.const_expr(fp8_pv_small_d) else fp8_pv_split_num)
+                    // (4 if cutlass.const_expr(fp8_pv_small_d) else fp8_pv_split_den),
+                ),
+            )
+            if cutlass.const_expr(self.v_dtype.width == 8 and k > 1) else
+            ((k // 4 * 3) if cutlass.const_expr(self.v_dtype.width > 8) else k // 2)
+        )
         sO_size = cute.cosize(sO_layout) if const_expr(not self.overlap_sO_sQ) else 1
         sQ_size = (
             cute.cosize(sQ_layout) if const_expr(not self.overlap_sO_sQ) else
@@ -974,19 +1069,19 @@ class FlashAttentionForwardSm100:
             ]
             # Scale factor shared memory (if block-scaled quantization is used)
             sSFQ: cute.struct.Align[
-                cute.struct.MemRange[cute.Float8E4M3FN, sfq_smem_size],
+                cute.struct.MemRange[self.sf_dtype, sfq_smem_size],
                 self.buffer_align_bytes,
             ]
             sSFK: cute.struct.Align[
-                cute.struct.MemRange[cute.Float8E4M3FN, sfk_smem_size],
+                cute.struct.MemRange[self.sf_dtype, sfk_smem_size],
                 self.buffer_align_bytes,
             ]
             sSFP: cute.struct.Align[
-                cute.struct.MemRange[cute.Float8E4M3FN, sfp_smem_size],
+                cute.struct.MemRange[self.sf_dtype, sfp_smem_size],
                 self.buffer_align_bytes,
             ]
             sSFV: cute.struct.Align[
-                cute.struct.MemRange[cute.Float8E4M3FN, sfv_smem_size],
+                cute.struct.MemRange[self.sf_dtype, sfv_smem_size],
                 self.buffer_align_bytes,
             ]
         
@@ -1358,26 +1453,48 @@ class FlashAttentionForwardSm100:
             )
             for stage in range(2)
         ]
-        # Setup scale factor TMEM tensors and S2T copy operations
-        # Use the TMEM region immediately following the accumulator (O tensor)
-
-        # sf_tmem_ptr = cute.make_ptr(self.sf_dtype, 0, mem_space=cute.AddressSpace.tmem, assumed_align=16)
-
+        # Setup scale factor TMEM tensors and S2T copy operations.
+        # For QK, park the block-scaled metadata on the opposite S stage so it
+        # doesn't alias the accumulator tile currently being produced.
         align = 16 # required for tcgen05.cp 4x32dp128bit TODO: may be just 4, 4 * 32 = 128 bits
-        # find_tmem_tensor_col_offset returns u32 columns; convert to sf_dtype elements
-        sf_dtype_per_u32 = 32 // self.sf_dtype.width
         tCtSFQs = [None] * self.q_stage
         tCtSFKs = [None] * self.q_stage
         if const_expr(self.quant_qk):
-            # Use recast_ptr to correctly convert Float32 column offsets to sf_dtype pointers.
-            # tmem_s_offset values are in TMEM column units (= Float32 element units).
-            # Directly using make_ptr(sf_dtype, offset) would interpret offset as sf_dtype elements,
-            # placing the pointer at column offset/4 instead of column offset.
-            sfq_tmem_ptrs = [cute.recast_ptr(
-                            cute.make_ptr(Float32, self.tmem_s_offset[self.q_stage - 1 - stage], # shuffle to minimize dependency
-                            mem_space=cute.AddressSpace.tmem, assumed_align=align),
-                            dtype=self.sf_dtype) for stage in range(self.q_stage)
-                            ]
+            # SFQK tmem placement experiment (FA4_SFQK_TMEM_SLOT env):
+            #   "s"  (default) — use tmem_s_offset (staggered): SF for stage k
+            #                    lives where S for stage (q_stage-1-k) lives.
+            #                    Safe by construction; current baseline.
+            #   "o"            — use tmem_o_offset slots. Frees S's tmem from
+            #                    SFQK traffic so softmax warp + SFQK MMA copy
+            #                    don't compete. Risk: collides with O acc.
+            #   "o_stagger"    — o offsets with opposite-stage staggering
+            #                    (stage k → tmem_o_offset[q_stage-1-k]).
+            if const_expr(self.sfqk_tmem_slot == "o"):
+                sfq_base_offsets = self.tmem_o_offset
+                sfq_stage_order = tuple(range(self.q_stage))
+            elif const_expr(self.sfqk_tmem_slot == "o_stagger"):
+                sfq_base_offsets = self.tmem_o_offset
+                sfq_stage_order = tuple(
+                    self.q_stage - 1 - stage for stage in range(self.q_stage)
+                )
+            else:  # "s" default — original staggered S-offset
+                sfq_base_offsets = self.tmem_s_offset
+                sfq_stage_order = tuple(
+                    self.q_stage - 1 - stage for stage in range(self.q_stage)
+                )
+            sfq_tmem_ptrs_f32 = [
+                cute.make_ptr(
+                    Float32,
+                    sfq_base_offsets[sfq_stage_order[stage]],
+                    mem_space=cute.AddressSpace.tmem,
+                    assumed_align=align,
+                )
+                for stage in range(self.q_stage)
+            ]
+            sfq_tmem_ptrs = [
+                cute.recast_ptr(sfq_tmem_ptrs_f32[stage], dtype=self.sf_dtype)
+                for stage in range(self.q_stage)
+            ]
 
             # (MMA, MMA_M, MMA_K)
             tCtSFQ_layout = blockscaled_utils.make_tmem_layout_sfa(
@@ -1389,9 +1506,15 @@ class FlashAttentionForwardSm100:
             tCtSFQs = [cute.make_tensor(sfq_tmem_ptrs[stage], tCtSFQ_layout) for stage in range(self.q_stage)]
 
             # Make SFK tmem tensor
-            sfq_col_offset = tcgen05.find_tmem_tensor_col_offset(tCtSFQs[0])
-            sfq_offset = math.ceil(sfq_col_offset * sf_dtype_per_u32 / align) * align
-            sfk_tmem_ptrs = [sfq_tmem_ptrs[stage] + sfq_offset for stage in range(self.q_stage)]
+            # TMEM offsets are expressed in u32 columns. Match the dense
+            # blockscaled kernels instead of deriving a smaller offset from the
+            # recast FP8 tensor view.
+            sf_atom_mn = 32
+            sfq_tmem_cols = (self.mma_tiler_qk[0] // sf_atom_mn) * self.mma_inst_tile_k
+            sfk_tmem_ptrs = [
+                cute.recast_ptr(sfq_tmem_ptrs_f32[stage] + sfq_tmem_cols, dtype=self.sf_dtype)
+                for stage in range(self.q_stage)
+            ]
 
             # (MMA, MMA_N, MMA_K)
             tCtSFK_layout = blockscaled_utils.make_tmem_layout_sfb(
@@ -1420,7 +1543,12 @@ class FlashAttentionForwardSm100:
             )
             tCtSFPs = [cute.make_tensor(sfp_tmem_ptrs[stage], tCtSFP_layout) for stage in range(self.q_stage)]
             
-            # Make SFV tmem tensor
+            # Make SFV tmem tensor.
+            # find_tmem_tensor_col_offset returns u32 cols; sfp_tmem_ptrs are
+            # typed as `self.sf_dtype` (1 byte for E4M3/E8M0), so we convert
+            # u32 cols → SF-element offset via `sf_dtype_per_u32 = 32 / sf_width`.
+            # Both E4M3 and E8M0 are 8 bits → 4 SFs per u32 col.
+            sf_dtype_per_u32 = 32 // self.sf_dtype.width
             sfp_offset = math.ceil(tcgen05.find_tmem_tensor_col_offset(tCtSFPs[0]) * sf_dtype_per_u32 / align) * align
             sfv_tmem_ptrs = [sfp_tmem_ptrs[stage] + sfp_offset for stage in range(self.q_stage)]
 
@@ -1975,28 +2103,56 @@ class FlashAttentionForwardSm100:
             tSrQs = (tSrQ[None, None, None, 0], tSrQ[None, None, None, 0])
 
         qk_mma_op, pv_mma_op = tiled_mma_qk.op, tiled_mma_pv.op
-        gemm_Si = [
-            partial(
-                sm100_utils.gemm_ptx_partial_fp4,
-                # sm100_utils.gemm_ptx_partial,
-                qk_mma_op,
-                self.tmem_s_offset[stage],
-                tSrQs[stage],
-                sA=sQ[None, None, None, stage],
-                zero_init=True,
-                tScaleA=tCtSFQs[stage],
-                tScaleB=tCtSFKs[stage],
-            ) if const_expr(self.quant_qk) else 
-            partial(
-                sm100_utils.gemm_ptx_partial,
-                qk_mma_op,
-                self.tmem_s_offset[stage],
-                tSrQs[stage],
-                sA=sQ[None, None, None, stage],
-                zero_init=True,
-            )
-            for stage in range(self.q_stage)
-        ]
+        if const_expr(self.quant_qk):
+            # For MXFP8 QK the generic cute.gemm path is slightly faster than
+            # our inline-PTX helper (+1-5% across shapes, +4.5% on
+            # (1,32768,24,128)) because the helper's per-K SF-address
+            # plumbing adds register pressure. Use generic by default for
+            # block-scaled FP8; keep inline-PTX for NVFP4 where it wins.
+            # The debug flag lets us force generic on NVFP4 too for A/B tests.
+            if const_expr(
+                self.debug_force_generic_mxfp8_qk
+                or (qk_mma_op.a_dtype in (Float8E4M3FN, Float8E5M2)
+                    and not self.debug_mxfp8_use_inline_ptx)
+            ):
+                gemm_Si = [
+                    partial(
+                        sm100_utils.gemm_blockscaled_generic,
+                        tiled_mma_qk,
+                        tStSs[stage],
+                        tSrQs[stage],
+                        tScaleA=tCtSFQs[stage],
+                        tScaleB=tCtSFKs[stage],
+                        zero_init=True,
+                    )
+                    for stage in range(self.q_stage)
+                ]
+            else:
+                gemm_Si = [
+                    partial(
+                        sm100_utils.gemm_ptx_partial_fp4,
+                        qk_mma_op,
+                        self.tmem_s_offset[stage],
+                        tSrQs[stage],
+                        sA=sQ[None, None, None, stage],
+                        zero_init=True,
+                        tScaleA=tCtSFQs[stage],
+                        tScaleB=tCtSFKs[stage],
+                    )
+                    for stage in range(self.q_stage)
+                ]
+        else:
+            gemm_Si = [
+                partial(
+                    sm100_utils.gemm_ptx_partial,
+                    qk_mma_op,
+                    self.tmem_s_offset[stage],
+                    tSrQs[stage],
+                    sA=sQ[None, None, None, stage],
+                    zero_init=True,
+                )
+                for stage in range(self.q_stage)
+            ]
         gemm_Pi = [
             partial(
                 sm100_utils.gemm_ptx_partial_fp4,
@@ -2113,19 +2269,21 @@ class FlashAttentionForwardSm100:
                         cute.arch.mbarrier_wait(mbar_ptr + self.mbar_sfqk_load_offset + stage, mma_sfqk_producer_phase)
                         _, _, tCtSFQ_compact_s2t = tiled_copy_s2t_sfq_staged[stage]
                         tCsSFQ_compact_s2t_staged = tCsSFQ_compact_s2t[None, None, None, None, stage]
-                        cute.copy(
-                            tiled_copy_s2t_sfq,
-                            tCsSFQ_compact_s2t_staged,
-                            tCtSFQ_compact_s2t,
-                        )
+                        if const_expr(not self.debug_skip_sfq_s2t):
+                            cute.copy(
+                                tiled_copy_s2t_sfq,
+                                tCsSFQ_compact_s2t_staged,
+                                tCtSFQ_compact_s2t,
+                            )
 
                         _, _, tCtSFK_compact_s2t = tiled_copy_s2t_sfk_staged[stage]
                         tCsSFK_compact_s2t_staged = tCsSFK_compact_s2t[None, None, None, None, mma_kv_consumer_state.index]
-                        cute.copy(
-                            tiled_copy_s2t_sfk,
-                            tCsSFK_compact_s2t_staged,
-                            tCtSFK_compact_s2t,
-                        )
+                        if const_expr(not self.debug_skip_sfk_s2t):
+                            cute.copy(
+                                tiled_copy_s2t_sfk,
+                                tCsSFK_compact_s2t_staged,
+                                tCtSFK_compact_s2t,
+                            )
 
                     # 3. gemm
                     # tiled_mma_qk = sm100_utils.gemm(tiled_mma_qk, tStSs[stage], tSrQs[stage], tSrKi, zero_init=True)
@@ -2237,18 +2395,20 @@ class FlashAttentionForwardSm100:
                             tCsSFQ_compact_s2t_staged = tCsSFQ_compact_s2t[None, None, None, None, stage]
                             sm100_utils.tcgen05_after_thread_sync()
                             cute.arch.mbarrier_wait(mbar_ptr + self.mbar_sfqk_load_offset + stage, mma_sfqk_producer_phase)
-                            cute.copy(
-                                tiled_copy_s2t_sfq,
-                                tCsSFQ_compact_s2t_staged,
-                                tCtSFQ_compact_s2t,
-                            )
+                            if const_expr(not self.debug_skip_sfq_s2t):
+                                cute.copy(
+                                    tiled_copy_s2t_sfq,
+                                    tCsSFQ_compact_s2t_staged,
+                                    tCtSFQ_compact_s2t,
+                                )
                             _, _, tCtSFK_compact_s2t = tiled_copy_s2t_sfk_staged[stage]
                             tCsSFK_compact_s2t_staged = tCsSFK_compact_s2t[None, None, None, None, mma_kv_consumer_state.index]
-                            cute.copy(
-                                tiled_copy_s2t_sfk,
-                                tCsSFK_compact_s2t_staged,
-                                tCtSFK_compact_s2t,
-                            )
+                            if const_expr(not self.debug_skip_sfk_s2t):
+                                cute.copy(
+                                    tiled_copy_s2t_sfk,
+                                    tCsSFK_compact_s2t_staged,
+                                    tCtSFK_compact_s2t,
+                                )
 
                         sK_cur = sK[None, None, None, Ki_index]
                         if const_expr(self.uneven_kv_smem):
@@ -2402,8 +2562,19 @@ class FlashAttentionForwardSm100:
         thr_tmem_store_scale = tcgen05.make_tmem_copy(tmem_store_scale_atom, tStScale).get_slice(tidx)
 
         tStScale_r2t = thr_tmem_store_scale.partition_D(tStScale)
+        fp8_pv_store_rep = int(os.getenv("FA4_FP8_PV_TMEM_STORE_REP", "8"))
+        fp8_pv_default_store_rep = 4 if self.head_dim_v_padded <= 64 else 8
         tmem_store_atom = cute.make_copy_atom(
-            tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(16 if const_expr(not self.quant_pv) else 8)),
+            tcgen05.copy.St32x32bOp(
+                tcgen05.copy.Repetition(
+                    fp8_pv_store_rep if const_expr(
+                        not self.quant_pv and self.v_dtype.width == 8 and "FA4_FP8_PV_TMEM_STORE_REP" in os.environ
+                    ) else
+                    fp8_pv_default_store_rep if const_expr(not self.quant_pv and self.v_dtype.width == 8) else
+                    8 if const_expr(self.quant_pv) else
+                    16
+                )
+            ),
             Float32,
         )
         thr_tmem_store = tcgen05.make_tmem_copy(tmem_store_atom, tStP).get_slice(tidx)
@@ -2428,7 +2599,7 @@ class FlashAttentionForwardSm100:
             seqlen = SeqlenInfoCls(batch_idx)
             n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx, num_splits)
 
-            mask = AttentionMaskCls(seqlen.seqlen_q, seqlen.seqlen_k)
+            mask = AttentionMaskCls(seqlen)
             shared_mask_kwargs = dict(
                 m_block=self.q_stage * m_block + stage,
                 thr_mma=thr_mma_qk,
@@ -2455,11 +2626,18 @@ class FlashAttentionForwardSm100:
             else:
                 mask_fn_none = None
 
+            fp8_pv_p_log2_offset = float(
+                os.getenv(
+                    "FA4_FP8_PV_P_LOG2_OFFSET",
+                    "0.0" if self.head_dim_v_padded <= 64 else "8.0",
+                )
+            )
             softmax = SoftmaxSm100.create(
                 softmax_scale_log2,
                 rescale_threshold=8.0,
                 # rescale_threshold=8.0 if const_expr(self.q_dtype.width == 16) else 0.0, # (Wenxuan) disable skipping rescale until FP4 precision is verified
                 softmax_scale=softmax_scale,
+                p_log2_offset=fp8_pv_p_log2_offset if const_expr(not self.quant_pv and self.v_dtype.width == 8) else 0.0,
                 quant_pv=self.quant_pv,
                 compute_sp1=self.compute_sp1,
             )
@@ -2667,6 +2845,63 @@ class FlashAttentionForwardSm100:
                 tSrP_u32_view[k] = packed_e2m1
 
     @cute.jit
+    def _apply_exp2_pack_fp8(
+        self,
+        softmax,
+        tSrS: cute.Tensor,
+        tSrP: cute.Tensor,
+        e2e: cutlass.Constexpr[bool] = False,
+        e2e_freq: cutlass.Constexpr[int] = 16,
+    ):
+        """Per-fragment interleaved exp2 + packed E4M3.
+
+        Processes one fragment at a time: exp2 all elements in the fragment,
+        then F2FP pack that fragment, before moving to the next. This
+        interleaves MUFU.EX2 (MIO pipe) with F2FP (also MIO) per fragment,
+        preventing long back-to-back MUFU bursts that saturate MIO dispatch.
+        """
+        assert self.v_dtype == Float8E4M3FN, "only E4M3 packed path implemented"
+        frg_tile = min(32, cute.size(tSrS))
+        frg_cnt = cute.size(tSrS) // frg_tile
+        tSrS_frg = cute.logical_divide(tSrS, cute.make_layout(frg_tile))
+        tSrP_frg = cute.logical_divide(tSrP, cute.make_layout(frg_tile))
+        for j in cutlass.range_constexpr(frg_cnt):
+            for k in cutlass.range_constexpr(0, frg_tile, 2):
+                tSrS_frg[k, j] = cute.arch.exp2(tSrS_frg[k, j])
+                tSrS_frg[k + 1, j] = cute.arch.exp2(tSrS_frg[k + 1, j])
+            u32_view = cute.recast_tensor(tSrP_frg[None, j], cute.Int32)
+            for k in cutlass.range_constexpr(0, cute.size(u32_view, mode=[0])):
+                u32_view[k] = packed_float_to_ue4m3(
+                    tSrS_frg[k * 4, j],
+                    tSrS_frg[k * 4 + 1, j],
+                    tSrS_frg[k * 4 + 2, j],
+                    tSrS_frg[k * 4 + 3, j],
+                )
+
+    @cute.jit
+    def _pack_fp8(self, tSrP_f32: cute.Tensor, tSrP: cute.Tensor):
+        # Pack FP32 probabilities directly into FP8 lanes so the pure-FP8 PV path
+        # avoids the generic elementwise convert-and-pack sequence.
+        if const_expr(self.v_dtype == Float8E4M3FN):
+            tSrP_f32_frag = cute.logical_divide(tSrP_f32, cute.make_layout(4))
+            tSrP_frag = cute.logical_divide(tSrP, cute.make_layout(4))
+            for i in cutlass.range_constexpr(0, cute.size(tSrP_frag, mode=[1])):
+                tSrP_u32_view = cute.recast_tensor(tSrP_frag[None, i], cute.Int32)
+                for k in cutlass.range_constexpr(0, cute.size(tSrP_u32_view, mode=[0])):
+                    tSrP_u32_view[k] = packed_float_to_ue4m3(
+                        tSrP_f32_frag[k * 4, i],
+                        tSrP_f32_frag[k * 4 + 1, i],
+                        tSrP_f32_frag[k * 4 + 2, i],
+                        tSrP_f32_frag[k * 4 + 3, i],
+                    )
+        else:
+            # Keep the generic path for E5M2 until we add a dedicated pack helper.
+            softmax_like = cute.logical_divide(tSrP, cute.make_layout(min(32, cute.size(tSrP))))
+            src_like = cute.logical_divide(tSrP_f32, cute.make_layout(min(32, cute.size(tSrP_f32))))
+            for j in cutlass.range_constexpr(cute.size(src_like, mode=[1])):
+                softmax_like[None, j].store(src_like[None, j].load().to(tSrP.element_type))
+
+    @cute.jit
     def softmax_step(
         self,
         mma_si_consumer_phase: Int32,
@@ -2711,6 +2946,7 @@ class FlashAttentionForwardSm100:
         5. Computing row sums for normalization
         6. Coordinating pipeline synchronization between different processing stages
         """
+        pure_fp8_pv = const_expr(not self.quant_pv and self.v_dtype.width == 8)
         tilePlikeFP32 = self.mma_tiler_qk[1] // Float32.width * self.v_dtype.width
         tScS = thr_mma_qk.partition_C(cute.make_identity_tensor(self.mma_tiler_qk[:2]))
         tScScale = cute.composition(tScS, cute.make_layout((self.m_block_size, 1)))
@@ -2765,6 +3001,11 @@ class FlashAttentionForwardSm100:
                 mbar_ptr + mbar_s0_s1_sequence_offset + stage * 4, s0_s1_sequence_phase
             )
         tSrP_r2t_f32 = cute.make_fragment(thr_tmem_store.partition_S(tScP).shape, Float32)
+        # The FP8 P path recasts this Float32 backing storage into packed FP8 lanes.
+        # Zero-initialize first so any padding / partially covered bytes cannot leak
+        # stale register contents into the TMEM store on later configs.
+        if const_expr(self.fp8_pv_zero_fill_regs):
+            tSrP_r2t_f32.fill(0.0)
         tSrP_r2t = cute.make_tensor(
             cute.recast_ptr(tSrP_r2t_f32.iterator, dtype=self.v_dtype),
             tSrS_t2r.layout, # shape of S owned by this thread
@@ -2775,41 +3016,70 @@ class FlashAttentionForwardSm100:
             # Exp2 with softmax scale and sp1 scaling
             softmax.apply_exp2_convert(
                 tSrS_t2r,
-                e2e=mask_fn is None and self.head_dim_padded <= 128,
+                e2e=self.force_e2e,
                 e2e_freq=self.e2e_freq,
+                    e2e_start_frg=self.e2e_start_frg,
             )
             # update_row_sum BEFORE scale_groupwise so it uses original P values
             softmax.update_row_sum(tSrS_t2r.load(), acc_scale, is_first)
             tSrPSF_f32 = softmax.compute_group_max(tSrS_t2r, sf_size=self.sf_vec_size)
-            tSrPSF = cute.make_rmem_tensor(tSrPSF_f32.layout, cute.Float8E4M3FN)
+            tSrPSF = cute.make_rmem_tensor(tSrPSF_f32.layout, self.sf_dtype)
             softmax.scale_groupwise(tSrS_t2r, tSrPSF_f32, sf_size=self.sf_vec_size)
             self._quant_fp4(tSrS_t2r, tSrPSF_f32, tSrP_r2t, tSrPSF)
             # R2S: Copy tSrPSF (registers) to sSFP (shared memory).
-            # The SFP smem layout is BlockScaledBasicChunk(16) tile_to_shape((M=128, K=128)),
-            # giving byte offsets:
-            #   byte = (m%32)*16 + ((m//32)%4)*4 + (k_block%4) + (k_block//4)*512
-            # Each softmax thread holds 1 M row (lane_id within warp = row in [0,32),
-            # warp_id within softmax warpgroup = row block in [0,4)) and 8 K groups.
-            # The first 4 K groups land at +0,+1,+2,+3 within the row's atom; the
-            # next 4 land at +512,+513,+514,+515 (rest_k stride).
+            # The SFP smem layout is BlockScaledBasicChunk(sf_vec_size).layout
+            # tile_to_shape((M=128, K=128)). The atom is ((32,4),(sf_vec,4))
+            # with stride ((16,4),(0,1)) — those strides are independent of
+            # sf_vec_size, so `base_offset = lane_id*16 + (warp_id%4)*4` is
+            # correct for both NVFP4 (sf_vec=16) and MXFP8 (sf_vec=32).
+            # What changes is the K-group count per row:
+            #   sf_vec=16, K=128 → 8 SFs per row → 4 inner + 2 outer (rest_k stride 512)
+            #   sf_vec=32, K=128 → 4 SFs per row → 4 inner + 1 outer (no rest_k)
             if const_expr(sSFP is not None):
                 thread_idx = thr_tmem_load.thr_idx
                 lane_id = thread_idx % 32
                 warp_id = thread_idx // 32
                 base_offset = lane_id * 16 + (warp_id % 4) * 4
-                sfp_thread_layout = cute.make_layout((4, 2), stride=(1, 512))
+                # PV is (M=128, N=head_dim_v, K=n_block_size). SFP scales the
+                # P (=A) operand along the K dim, so per-row SF count is
+                # n_block_size // sf_vec_size.
+                k_groups_per_row = const_expr(self.mma_tiler_pv[2] // self.sf_vec_size)
+                k_inner = const_expr(min(k_groups_per_row, 4))
+                k_outer = const_expr(k_groups_per_row // k_inner)
+                # cute.cosize of one atom = 512 bytes for both sf_vec sizes.
+                sfp_thread_layout = cute.make_layout((k_inner, k_outer), stride=(1, 512))
                 sSFP_stage_ptr = sSFP[None, None, None, stage].iterator
                 sSFP_thread = cute.make_tensor(sSFP_stage_ptr + base_offset, sfp_thread_layout)
-                tSrPSF_2d = cute.logical_divide(tSrPSF, cute.make_layout(4))
+                tSrPSF_2d = cute.logical_divide(tSrPSF, cute.make_layout(k_inner))
                 cute.autovec_copy(tSrPSF_2d, sSFP_thread)
         else:
             # softmax.scale_apply_exp2_convert(tSrS_t2r, row_max, tSrP_r2t)
-            softmax.apply_exp2_convert(
-                tSrS_t2r,
-                tSrP_r2t,
-                e2e=mask_fn is None and self.head_dim_padded <= 128,
-                e2e_freq=self.e2e_freq,
-            )
+            if const_expr(pure_fp8_pv and self.v_dtype == Float8E4M3FN and self.fp8_pv_use_explicit_pack):
+                if const_expr(self.fp8_pv_use_fused_pack):
+                    self._apply_exp2_pack_fp8(
+                        softmax,
+                        tSrS_t2r,
+                        tSrP_r2t,
+                        e2e=self.force_e2e,
+                        e2e_freq=self.e2e_freq,
+                    )
+                else:
+                    softmax.apply_exp2_convert(
+                        tSrS_t2r,
+                        e2e=self.force_e2e,
+                        e2e_freq=self.e2e_freq,
+                    e2e_start_frg=self.e2e_start_frg,
+                    )
+                    self._pack_fp8(tSrS_t2r, tSrP_r2t)
+            else:
+                softmax.apply_exp2_convert(
+                    tSrS_t2r,
+                    tSrP_r2t,
+                    converted_scale=1.0,
+                    e2e=self.force_e2e,
+                    e2e_freq=self.e2e_freq,
+                    e2e_start_frg=self.e2e_start_frg,
+                )
         # Sequence barrier arrive
         if const_expr(self.s0_s1_barrier):
             cute.arch.mbarrier_arrive(mbar_ptr + mbar_s0_s1_sequence_offset + (1 - stage) * 4)
@@ -3082,7 +3352,15 @@ class FlashAttentionForwardSm100:
                     row_sum, row_max, acc_O_mn_row_is_zero_or_nan = stats[stage]
                     LN2 = math.log(2.0)
                     lse = (
-                        (row_max * softmax_scale_log2 + utils.log2f(row_sum)) * LN2
+                        (
+                            row_max * softmax_scale_log2
+                            + utils.log2f(row_sum)
+                            - (
+                                fp8_pv_p_log2_offset
+                                if const_expr(not self.quant_pv and self.v_dtype.width == 8)
+                                else 0.0
+                            )
+                        ) * LN2
                         if not acc_O_mn_row_is_zero_or_nan
                         else -Float32.inf
                     )
@@ -3669,4 +3947,3 @@ class FlashAttentionForwardSm100:
             constant_q_idx=q_idx_logical,
             qhead_per_kvhead=self.qhead_per_kvhead if cutlass.const_expr(self.pack_gqa) else 1,
         )
-
