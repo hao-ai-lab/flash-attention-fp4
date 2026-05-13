@@ -77,10 +77,10 @@ _FP4_TUNING_CONFIG = {
 # FP8 PV overrides: when v_dtype.width == 8 and quant_pv == False
 _FP4_FP8PV_TUNING_CONFIG = {
     # NVFP4+FP8: freq=9, MXFP8+FP8: freq=10. Verified via bench_fp4.py (2018/1948 TF peak).
-    (False, 128): {"ex2_emu_freq": 9, "ex2_emu_start_frg": 0, "mxfp8_ex2_emu_freq": 10},
-    (True, 128):  {"ex2_emu_freq": 9, "ex2_emu_start_frg": 0, "mxfp8_ex2_emu_freq": 10},
-    (False, 64):  {"ex2_emu_freq": 16, "ex2_emu_start_frg": 0, "mxfp8_ex2_emu_freq": 10},
-    (True, 64):   {"ex2_emu_freq": 16, "ex2_emu_start_frg": 0, "mxfp8_ex2_emu_freq": 10},
+    (False, 128): {"ex2_emu_freq": 9, "ex2_emu_start_frg": 0, "ex2_emu_freq_sf32": 10},
+    (True, 128):  {"ex2_emu_freq": 9, "ex2_emu_start_frg": 0, "ex2_emu_freq_sf32": 10},
+    (False, 64):  {"ex2_emu_freq": 16, "ex2_emu_start_frg": 0, "ex2_emu_freq_sf32": 10},
+    (True, 64):   {"ex2_emu_freq": 16, "ex2_emu_start_frg": 0, "ex2_emu_freq_sf32": 10},
 }
 # === END TUNING KNOBS ===
 
@@ -511,7 +511,7 @@ class FlashAttentionForwardSm100:
                 (self.is_causal, self.head_dim_padded), {}
             )
             if const_expr("ex2_emu_freq" in _fp8_tune):
-                self.ex2_emu_freq = _fp8_tune["ex2_emu_freq"] if self.sf_vec_size == 16 else _fp8_tune.get("mxfp8_ex2_emu_freq", 10)
+                self.ex2_emu_freq = _fp8_tune["ex2_emu_freq"] if self.sf_vec_size == 16 else _fp8_tune.get("ex2_emu_freq_sf32", 10)
                 self.ex2_emu_start_frg = _fp8_tune.get("ex2_emu_start_frg", self.ex2_emu_start_frg)
 
         use_2cta_instrs = self.mma_tiler_qk[0] == 256
