@@ -63,21 +63,24 @@ from flash_attn.cute.tile_scheduler import (
 # Keys: (is_causal: bool, head_dim_padded: int)
 # FP4 kernel is always 1-CTA. SM103 not supported (block-scaled MMA is SM100 only).
 # Values:
-#   e2e_freq: int — exp2 emulation frequency (0=all hardware exp2)
-#   e2e_start_frg: int — fragment index to start emulation from
+#   ex2_emu_freq: int — exp2 emulation frequency (0=all hardware exp2)
+#   ex2_emu_start_frg: int — fragment index to start emulation from
 #   num_regs_softmax: int — register count for softmax warps (multiple of 8)
 #   num_regs_correction: int — register count for correction warps (multiple of 8)
 #   num_regs_other: derived as 512 - num_regs_softmax * 2 - num_regs_correction
 _FP4_TUNING_CONFIG = {
-    # BF16 PV: e2e_freq=16 verified via bench_fp4.py (1921 TF peak).
-    (False, 128): {"e2e_freq": 16, "e2e_start_frg": 1, "num_regs_softmax": 192, "num_regs_correction": 80, "enable_e2e": True},
-    (True, 128):  {"e2e_freq": 16, "e2e_start_frg": 1, "num_regs_softmax": 192, "num_regs_correction": 80, "enable_e2e": True},
+    # BF16 PV: ex2_emu_freq=16 verified via bench_fp4.py (1921 TF peak).
+    # Only applied for NVFP4 (sf_vec_size=16); MXFP8 BF16 uses freq=0.
+    (False, 128): {"ex2_emu_freq": 16, "ex2_emu_start_frg": 1, "num_regs_softmax": 192, "num_regs_correction": 80},
+    (True, 128):  {"ex2_emu_freq": 16, "ex2_emu_start_frg": 1, "num_regs_softmax": 192, "num_regs_correction": 80},
 }
 # FP8 PV overrides: when v_dtype.width == 8 and quant_pv == False
 _FP4_FP8PV_TUNING_CONFIG = {
-    # FP8 PV: e2e_freq=9 verified via bench_fp4.py (2018 TF peak).
-    (False, 128): {"e2e_freq": 9, "e2e_start_frg": 0},
-    (True, 128):  {"e2e_freq": 9, "e2e_start_frg": 0},
+    # NVFP4+FP8: freq=9, MXFP8+FP8: freq=10. Verified via bench_fp4.py (2018/1948 TF peak).
+    (False, 128): {"ex2_emu_freq": 9, "ex2_emu_start_frg": 0, "mxfp8_ex2_emu_freq": 10},
+    (True, 128):  {"ex2_emu_freq": 9, "ex2_emu_start_frg": 0, "mxfp8_ex2_emu_freq": 10},
+    (False, 64):  {"ex2_emu_freq": 16, "ex2_emu_start_frg": 0, "mxfp8_ex2_emu_freq": 10},
+    (True, 64):   {"ex2_emu_freq": 16, "ex2_emu_start_frg": 0, "mxfp8_ex2_emu_freq": 10},
 }
 # === END TUNING KNOBS ===
 
@@ -259,21 +262,12 @@ class FlashAttentionForwardSm100:
         # Mixed results; keep default generic, toggleable for per-shape tuning.
         self.debug_mxfp8_use_inline_ptx = os.getenv("FA4_MXFP8_USE_INLINE_PTX", "0") == "1"
         self.fp8_pv_use_explicit_pack = os.getenv("FA4_FP8_PV_USE_EXPLICIT_PACK", "1") == "1"
-        # e2e (exp2 emulation) interleaving config — env vars read here,
-        # applied in __call__ where v_dtype/quant_pv are known.
-        _e2e_freq_env = os.getenv("FA4_E2E_FREQ")
-        self._e2e_freq_override = int(_e2e_freq_env) if _e2e_freq_env else None
-        self.e2e_freq = self._e2e_freq_override if self._e2e_freq_override is not None else self._tune.get("e2e_freq", 16)
-        self.e2e_start_frg = int(os.getenv("FA4_E2E_START_FRG", str(self._tune.get("e2e_start_frg", 0))))
-        # e2e helps NVFP4 (sf_vec_size=16) but hurts MXFP8 (sf_vec_size=32) for BF16 PV
-        self.force_e2e = self._tune.get("enable_e2e", False) and self.sf_vec_size == 16
-        # Fused exp2 + packed E4M3 conversion. A/B'd against the 2-pass baseline
-        # on (1, 32768, 24, 128) MXFP8+FP8 at parity (~1663 TFLOPS both ways) —
-        # the DSL's IR fuser likely achieves the same register schedule. Kept
-        # behind a flag so it can be revisited on shapes where the 2-pass cost
-        # is more exposed.
+        # exp2 emulation: NVFP4 BF16 uses freq from tuning config, MXFP8 BF16 disables (freq=0)
+        _ex2_freq = self._tune.get("ex2_emu_freq", 0)
+        self.ex2_emu_freq = _ex2_freq if self.sf_vec_size == 16 else 0
+        self.ex2_emu_start_frg = self._tune.get("ex2_emu_start_frg", 0)
         self.fp8_pv_use_fused_pack = os.getenv("FA4_FP8_PV_USE_FUSED_PACK", "0") == "1"
-        self.fp8_pv_zero_fill_regs = os.getenv("FA4_FP8_PV_ZERO_FILL_REGS", "1") == "1"
+        self.fp8_pv_zero_fill_regs = True
         self.mma_inst_bits_k = 256
         if self.sf_vec_size == 16:
             # NVFP4 / MXF4NVF4: 256-bit operand tile covers 64 logical K elements.
@@ -338,15 +332,8 @@ class FlashAttentionForwardSm100:
             num_kv_staged_fields += 1  # sSFV
         smem_kv_per_stage += num_kv_staged_fields * 128
         self.kv_stage = (smem_budget - smem_fixed) // smem_kv_per_stage
-        # Pure FP8 PV should not keep increasing KV pipeline depth just because V is smaller.
-        # Keep a local env override so we can sweep end-to-end performance without
-        # editing the scheduling code for every experiment.
-        fp8_pv_kv_stage_cap_env = os.getenv("FA4_FP8_PV_KV_STAGE_CAP")
-        fp8_pv_kv_stage_cap = (
-            int(fp8_pv_kv_stage_cap_env)
-            if fp8_pv_kv_stage_cap_env is not None
-            else (4 if self.head_dim_v_padded >= 128 else 0)
-        )
+        # Pure FP8 PV: cap KV pipeline depth to 4 for hdim >= 128.
+        fp8_pv_kv_stage_cap = 4 if self.head_dim_v_padded >= 128 else 0
         if const_expr(not self.quant_pv and self.v_dtype.width == 8 and fp8_pv_kv_stage_cap > 0):
             self.kv_stage = min(self.kv_stage, fp8_pv_kv_stage_cap)
         # For hdim 192,128, we don't have enough smem to store all 3 stages of KV:
@@ -523,17 +510,9 @@ class FlashAttentionForwardSm100:
             _fp8_tune = _FP4_FP8PV_TUNING_CONFIG.get(
                 (self.is_causal, self.head_dim_padded), {}
             )
-            if const_expr(self._e2e_freq_override is None and "e2e_freq" in _fp8_tune):
-                # NVFP4 FP8: freq=9, MXFP8 FP8: freq=10
-                _fp8_default = _fp8_tune["e2e_freq"] if self.sf_vec_size == 16 else 10
-                self.e2e_freq = _fp8_default
-                self.e2e_start_frg = _fp8_tune.get("e2e_start_frg", self.e2e_start_frg)
-            self.force_e2e = True
-        elif const_expr(self._e2e_freq_override is None):
-            if const_expr(
-                self.head_dim_padded > 64 and not self.is_causal and not self.is_local and self.pack_gqa
-            ):
-                self.e2e_freq = 32 if mCuSeqlensQ is not None or mSeqUsedQ is not None else self._tune.get("e2e_freq", 10)
+            if const_expr("ex2_emu_freq" in _fp8_tune):
+                self.ex2_emu_freq = _fp8_tune["ex2_emu_freq"] if self.sf_vec_size == 16 else _fp8_tune.get("mxfp8_ex2_emu_freq", 10)
+                self.ex2_emu_start_frg = _fp8_tune.get("ex2_emu_start_frg", self.ex2_emu_start_frg)
 
         use_2cta_instrs = self.mma_tiler_qk[0] == 256
         assert use_2cta_instrs == False, "Two-CTA instructions not supported yet"
@@ -2850,8 +2829,6 @@ class FlashAttentionForwardSm100:
         softmax,
         tSrS: cute.Tensor,
         tSrP: cute.Tensor,
-        e2e: cutlass.Constexpr[bool] = False,
-        e2e_freq: cutlass.Constexpr[int] = 16,
     ):
         """Per-fragment interleaved exp2 + packed E4M3.
 
@@ -3013,12 +2990,10 @@ class FlashAttentionForwardSm100:
 
 
         if const_expr(self.quant_pv):
-            # Exp2 with softmax scale and sp1 scaling
             softmax.apply_exp2_convert(
                 tSrS_t2r,
-                e2e=self.force_e2e,
-                e2e_freq=self.e2e_freq,
-                    e2e_start_frg=self.e2e_start_frg,
+                ex2_emu_freq=self.ex2_emu_freq,
+                ex2_emu_start_frg=self.ex2_emu_start_frg,
             )
             # update_row_sum BEFORE scale_groupwise so it uses original P values
             softmax.update_row_sum(tSrS_t2r.load(), acc_scale, is_first)
@@ -3060,25 +3035,20 @@ class FlashAttentionForwardSm100:
                         softmax,
                         tSrS_t2r,
                         tSrP_r2t,
-                        e2e=self.force_e2e,
-                        e2e_freq=self.e2e_freq,
                     )
                 else:
                     softmax.apply_exp2_convert(
                         tSrS_t2r,
-                        e2e=self.force_e2e,
-                        e2e_freq=self.e2e_freq,
-                    e2e_start_frg=self.e2e_start_frg,
+                        ex2_emu_freq=self.ex2_emu_freq,
+                        ex2_emu_start_frg=self.ex2_emu_start_frg,
                     )
                     self._pack_fp8(tSrS_t2r, tSrP_r2t)
             else:
                 softmax.apply_exp2_convert(
                     tSrS_t2r,
                     tSrP_r2t,
-                    converted_scale=1.0,
-                    e2e=self.force_e2e,
-                    e2e_freq=self.e2e_freq,
-                    e2e_start_frg=self.e2e_start_frg,
+                    ex2_emu_freq=self.ex2_emu_freq,
+                    ex2_emu_start_frg=self.ex2_emu_start_frg,
                 )
         # Sequence barrier arrive
         if const_expr(self.s0_s1_barrier):
