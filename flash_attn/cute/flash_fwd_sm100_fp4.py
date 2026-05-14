@@ -63,7 +63,9 @@ from flash_attn.cute.tile_scheduler import (
 # Keys: (is_causal: bool, head_dim_padded: int)
 # FP4 kernel is always 1-CTA.
 # Values:
-#   ex2_emu_freq: int — exp2 emulation frequency (0=all hardware exp2)
+#   ex2_emu_freq: int — exp2 emulation period; higher = more hardware MUFU.EX2,
+#       fewer ALU-emulated exp2. 0 = all hardware. With ex2_emu_res=4, freq=N
+#       means N-4 of every N positions use MUFU and 4 use polynomial emulation.
 #   ex2_emu_start_frg: int — fragment index to start emulation from
 #   num_regs_softmax: int — register count for softmax warps (multiple of 8)
 #   num_regs_correction: int — register count for correction warps (multiple of 8)
