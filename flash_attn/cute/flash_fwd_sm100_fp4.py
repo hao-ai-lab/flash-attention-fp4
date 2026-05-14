@@ -61,7 +61,7 @@ from flash_attn.cute.tile_scheduler import (
 
 # === TUNING KNOBS ===
 # Keys: (is_causal: bool, head_dim_padded: int)
-# FP4 kernel is always 1-CTA. SM103 not supported (block-scaled MMA is SM100 only).
+# FP4 kernel is always 1-CTA.
 # Values:
 #   ex2_emu_freq: int — exp2 emulation frequency (0=all hardware exp2)
 #   ex2_emu_start_frg: int — fragment index to start emulation from
