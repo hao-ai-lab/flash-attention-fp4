@@ -931,14 +931,10 @@ def _flash_attn_fwd(
         # Add scale factor tensors if using the block-scaled SM100 kernel
         if use_blockscaled_impl:
             compile_args.extend([mSFQ_tensor, mSFK_tensor, mSFV_tensor])
-        # Add q/k shapes for the block-scaled kernel (it always builds tensors from pointer + shape)
-        if use_blockscaled_impl:
-            if fp4_qk:
-                sym_q_shape = tuple(cutlass.Int32(0) for _ in q_ptr_shape)
-                sym_k_shape = tuple(cutlass.Int32(0) for _ in k_ptr_shape)
-            else:
-                sym_q_shape = tuple(cutlass.Int32(0) for _ in range(len(q_tensor.shape)))
-                sym_k_shape = tuple(cutlass.Int32(0) for _ in range(len(k_tensor.shape)))
+        # Add q/k shapes ONLY when using make_ptr path (FP4 Q/K)
+        if use_blockscaled_impl and fp4_qk:
+            sym_q_shape = tuple(cutlass.Int32(0) for _ in q_ptr_shape)
+            sym_k_shape = tuple(cutlass.Int32(0) for _ in k_ptr_shape)
             compile_args.extend([sym_q_shape, sym_k_shape])
             if fp4_v:
                 sym_v_shape = tuple(cutlass.Int32(0) for _ in v_ptr_shape)
@@ -999,8 +995,8 @@ def _flash_attn_fwd(
     # Add scale factor tensors if using the block-scaled SM100 kernel
     if use_blockscaled_impl:
         call_args.extend([mSFQ, mSFK, mSFV])
-    # Add q/k shapes for the block-scaled kernel
-    if use_blockscaled_impl:
+    # Add q/k shapes ONLY for FP4 Q/K (make_ptr path)
+    if use_blockscaled_impl and fp4_qk:
         call_args.extend([q_ptr_shape, k_ptr_shape])
         if fp4_v:
             call_args.append(v_ptr_shape)
