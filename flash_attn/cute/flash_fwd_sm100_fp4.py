@@ -131,6 +131,16 @@ class FlashAttentionForwardSm100:
             (cutlass.Float8E4M3FN, 16),
             (cutlass.Float8E8M0FNU, 32),
         }, f"Unsupported block-scaled configuration: sf_dtype={sf_dtype}, sf_vec_size={sf_vec_size}"
+        # Block-scaled MMA requires K >= sf_vec_size * 4 (the atom K count is a
+        # hardware constant of 4 instruction tiles per scale factor atom).
+        # For MXFP8 (sf_vec_size=32): minimum headdim = 128.
+        # For NVFP4 (sf_vec_size=16): minimum headdim = 64.
+        min_headdim = sf_vec_size * 4
+        assert head_dim >= min_headdim, (
+            f"Block-scaled MMA with sf_vec_size={sf_vec_size} requires "
+            f"head_dim >= {min_headdim}, but got head_dim={head_dim}. "
+            f"MXFP8 (sf_vec_size=32) does not support headdim < 128."
+        )
         self.use_tma_KV = not paged_kv_non_tma
         # self.dtype = dtype
         # padding head_dim to a multiple of 16 as k_block_size
