@@ -738,9 +738,9 @@ def _flash_attn_fwd(
             else:
                 raise ValueError(f"Invalid scale factor dtype: {sf_dtype}")
         
-        # For torch FP4 tensors: use make_ptr path (kernel builds tensor from pointer + shape)
-        # For cute tensors or non-FP4 torch tensors: use to_cute_tensor as before
-        if fp4_qk:
+        # Block-scaled Q/K: always use make_ptr path (kernel builds tensor from pointer + shape)
+        # This handles both FP4 (float4_e2m1fn_x2) and MXFP8 (float8_e4m3fn) uniformly
+        if use_blockscaled_impl:
             from cutlass.cute.runtime import make_ptr
             q_tensor = make_ptr(qk_ab_dtype, 0, cute.AddressSpace.gmem, assumed_align=16)
             k_tensor = make_ptr(qk_ab_dtype, 0, cute.AddressSpace.gmem, assumed_align=16)
@@ -815,7 +815,7 @@ def _flash_attn_fwd(
                 if sf_dtype is None:
                     sf_dtype = cutlass.Float8E4M3FN  # Default scale factor dtype for FP4
                 # Validate dtype and scale factor combinations
-                ab_dtype = q_tensor.value_type if fp4_qk else q_tensor.element_type
+                ab_dtype = qk_ab_dtype
                 if not force_fp4_impl and not is_valid_dtypes_and_scale_factor_vec_size(ab_dtype, sf_dtype, sf_vec_size):
                     raise ValueError(
                         f"Invalid dtype combination: ab_dtype={ab_dtype}, "
@@ -931,8 +931,8 @@ def _flash_attn_fwd(
         # Add scale factor tensors if using the block-scaled SM100 kernel
         if use_blockscaled_impl:
             compile_args.extend([mSFQ_tensor, mSFK_tensor, mSFV_tensor])
-        # Add q/k shapes ONLY when using make_ptr path (FP4 Q/K)
-        if use_blockscaled_impl and fp4_qk:
+        # Add q/k shapes for all block-scaled modes (make_ptr path)
+        if use_blockscaled_impl:
             sym_q_shape = tuple(cutlass.Int32(0) for _ in q_ptr_shape)
             sym_k_shape = tuple(cutlass.Int32(0) for _ in k_ptr_shape)
             compile_args.extend([sym_q_shape, sym_k_shape])
@@ -957,7 +957,7 @@ def _flash_attn_fwd(
             expected_count_shape=expected_count_shape,
             expected_index_shape=expected_index_shape,
         )
-    if fp4_qk:
+    if use_blockscaled_impl:
         from cutlass.cute.runtime import make_ptr as _make_ptr
         q_data_ptr = q.data_ptr() if hasattr(q, 'data_ptr') else q.iterator.data_ptr
         k_data_ptr = k.data_ptr() if hasattr(k, 'data_ptr') else k.iterator.data_ptr
@@ -995,8 +995,8 @@ def _flash_attn_fwd(
     # Add scale factor tensors if using the block-scaled SM100 kernel
     if use_blockscaled_impl:
         call_args.extend([mSFQ, mSFK, mSFV])
-    # Add q/k shapes ONLY for FP4 Q/K (make_ptr path)
-    if use_blockscaled_impl and fp4_qk:
+    # Add q/k shapes for all block-scaled modes (make_ptr path)
+    if use_blockscaled_impl:
         call_args.extend([q_ptr_shape, k_ptr_shape])
         if fp4_v:
             call_args.append(v_ptr_shape)
