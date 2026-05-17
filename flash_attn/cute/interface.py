@@ -821,6 +821,15 @@ def _flash_attn_fwd(
                         f"Invalid dtype combination: ab_dtype={ab_dtype}, "
                         f"sf_dtype={sf_dtype}, sf_vec_size={sf_vec_size}"
                     )
+                # Block-scaled MMA atom K = sf_vec_size * 4 (hardware constant).
+                # headdim must be >= this minimum for TMA SF layout to tile properly.
+                _min_headdim_blockscaled = sf_vec_size * 4
+                if not force_fp4_impl and head_dim < _min_headdim_blockscaled:
+                    raise ValueError(
+                        f"Block-scaled MMA with sf_vec_size={sf_vec_size} requires "
+                        f"head_dim >= {_min_headdim_blockscaled}, but got head_dim={head_dim}. "
+                        f"MXFP8 (sf_vec_size=32) does not support headdim < 128."
+                    )
                 fa_fwd = FlashAttentionForwardSm100FP4(
                     head_dim,
                     head_dim_v,
