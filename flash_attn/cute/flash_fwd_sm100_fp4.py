@@ -141,6 +141,12 @@ class FlashAttentionForwardSm100:
             f"head_dim >= {min_headdim}, but got head_dim={head_dim}. "
             f"MXFP8 (sf_vec_size=32) does not support headdim < 128."
         )
+        if is_varlen_q:
+            raise NotImplementedError("Block-scaled attention does not support variable-length sequences (varlen)")
+        if paged_kv_non_tma:
+            raise NotImplementedError("Block-scaled attention does not support paged KV cache")
+        if is_split_kv:
+            raise NotImplementedError("Block-scaled attention does not support SplitKV")
         self.use_tma_KV = not paged_kv_non_tma
         # self.dtype = dtype
         # padding head_dim to a multiple of 16 as k_block_size
