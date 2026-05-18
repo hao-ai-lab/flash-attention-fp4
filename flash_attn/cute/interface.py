@@ -959,8 +959,8 @@ def _flash_attn_fwd(
         )
     if use_blockscaled_impl:
         from cutlass.cute.runtime import make_ptr as _make_ptr
-        q_data_ptr = q.data_ptr() if hasattr(q, 'data_ptr') else q.iterator.data_ptr
-        k_data_ptr = k.data_ptr() if hasattr(k, 'data_ptr') else k.iterator.data_ptr
+        q_data_ptr = q.data_ptr() if hasattr(q, 'data_ptr') and callable(q.data_ptr) else int(q.iterator)
+        k_data_ptr = k.data_ptr() if hasattr(k, 'data_ptr') and callable(k.data_ptr) else int(k.iterator)
         q_call = _make_ptr(qk_ab_dtype, q_data_ptr, cute.AddressSpace.gmem, assumed_align=16)
         k_call = _make_ptr(qk_ab_dtype, k_data_ptr, cute.AddressSpace.gmem, assumed_align=16)
     else:

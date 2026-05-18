@@ -438,6 +438,9 @@ def create_blockscaled_attention_tensors(batch, seqlen_q, seqlen_k, nheads, nhea
         torch.cuda.synchronize()
 
     if return_torch:
+        # For FP8 V: convert int8 backing to torch.float8_e4m3fn so interface recognizes it
+        if pv_mode == "fp8" and v_torch_underlying is not None and v_torch_underlying.dtype == torch.int8:
+            v_torch_underlying = v_torch_underlying.view(torch.float8_e4m3fn)
         return (q_torch_underlying, k_torch_underlying, v_torch_underlying, q_sf_torch_underlying, k_sf_torch_underlying, v_sf_torch_underlying,
                 q_ref, k_ref, v_ref)
     else:
@@ -527,7 +530,7 @@ def main(ab_dtype, sf_dtype, sf_vec_size, pv_mode="bf16", pv_fp8_dtype=cutlass.F
         (q_fp4, k_fp4, v_tensor, q_sf, k_sf, v_sf, 
             q_ref, k_ref, v_ref) = create_blockscaled_attention_tensors(
             batch_size, seqlen_q, seqlen, nheads, nheads_kv, 
-            headdim, headdim_v, device, dtype_gen, pv_mode=pv_mode, return_torch=False,
+            headdim, headdim_v, device, dtype_gen, pv_mode=pv_mode, return_torch=True,
             ab_dtype=ab_dtype, sf_dtype=sf_dtype, sf_vec_size=sf_vec_size,
             pv_fp8_dtype=pv_fp8_dtype, debug=debug
         )
