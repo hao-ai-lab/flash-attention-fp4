@@ -530,7 +530,7 @@ def main(ab_dtype, sf_dtype, sf_vec_size, pv_mode="bf16", pv_fp8_dtype=cutlass.F
         (q_fp4, k_fp4, v_tensor, q_sf, k_sf, v_sf, 
             q_ref, k_ref, v_ref) = create_blockscaled_attention_tensors(
             batch_size, seqlen_q, seqlen, nheads, nheads_kv, 
-            headdim, headdim_v, device, dtype_gen, pv_mode=pv_mode, return_torch=True,
+            headdim, headdim_v, device, dtype_gen, pv_mode=pv_mode, return_torch=False,
             ab_dtype=ab_dtype, sf_dtype=sf_dtype, sf_vec_size=sf_vec_size,
             pv_fp8_dtype=pv_fp8_dtype, debug=debug
         )
@@ -647,11 +647,16 @@ def main(ab_dtype, sf_dtype, sf_vec_size, pv_mode="bf16", pv_fp8_dtype=cutlass.F
             try:
                 fp4_cmp = fp4_out[0] if isinstance(fp4_out, tuple) else fp4_out
                 ref_cmp = ref_out[0] if isinstance(ref_out, tuple) else ref_out
-                abs_diff = (fp4_cmp.float() - ref_cmp.float()).abs()
+                fp4_f = fp4_cmp.float()
+                ref_f = ref_cmp.float()
+                abs_diff = (fp4_f - ref_f).abs()
                 has_nan = fp4_cmp.isnan().any().item()
                 max_diff = abs_diff.max().item()
                 mean_diff = abs_diff.mean().item()
-                print(f"  FP4 vs ref: max_diff={max_diff:.4f}, mean_diff={mean_diff:.6f}, has_nan={has_nan}")
+                cos_sim = torch.nn.functional.cosine_similarity(
+                    fp4_f.flatten().unsqueeze(0), ref_f.flatten().unsqueeze(0)
+                ).item()
+                print(f"  FP4 vs ref: cos_sim={cos_sim:.6f}, max_diff={max_diff:.4f}, mean_diff={mean_diff:.6f}, has_nan={has_nan}")
                 # FP4 quantization error: max_diff~2-3, mean_diff~0.03-0.09 with SF=1.0
                 if debug:
                     torch.testing.assert_close(fp4_cmp, ref_cmp, atol=1e-2, rtol=1e-2)
