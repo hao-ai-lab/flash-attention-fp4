@@ -3345,12 +3345,16 @@ class FlashAttentionForwardSm100:
                     )
                     row_sum, row_max, acc_O_mn_row_is_zero_or_nan = stats[stage]
                     LN2 = math.log(2.0)
+                    _fp8_pv_offset = float(os.getenv(
+                        "FA4_FP8_PV_P_LOG2_OFFSET",
+                        "0.0" if self.head_dim_v_padded <= 64 else "8.0",
+                    ))
                     lse = (
                         (
                             row_max * softmax_scale_log2
                             + utils.log2f(row_sum)
                             - (
-                                fp8_pv_p_log2_offset
+                                _fp8_pv_offset
                                 if const_expr(not self.quant_pv and self.v_dtype.width == 8)
                                 else 0.0
                             )
