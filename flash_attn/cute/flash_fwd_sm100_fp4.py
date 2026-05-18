@@ -458,11 +458,11 @@ class FlashAttentionForwardSm100:
         self.quant_pv = const_expr(mSFV is not None)
         assert not (not self.quant_qk and self.quant_pv)
 
-        # Assume all strides are divisible by 128 bits except the last stride
         def _assume_strides(t):
             divby = 128 // t.element_type.width
             return tuple(
-                s if isinstance(s, int) else cute.assume(s, divby=divby)
+                s if (isinstance(s, int) or (hasattr(s, '__int__') and int(s) < divby))
+                else cute.assume(s, divby=divby)
                 for s in t.stride[:-1]
             ) + (t.stride[-1],)
         mV, mO = [

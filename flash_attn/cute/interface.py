@@ -420,6 +420,10 @@ def _flash_attn_fwd(
     if pack_gqa is None:
         pack_gqa = qhead_per_kvhead > 1
 
+    if (mSFQ is None) != (mSFK is None):
+        raise ValueError("mSFQ and mSFK must both be provided or both be None")
+    if mSFV is not None and mSFQ is None:
+        raise ValueError("mSFV requires mSFQ and mSFK to also be provided")
     use_blockscaled_impl = use_fp4 or mSFQ is not None or force_fp4_impl
 
     # Handle both torch and CUTE tensors for dtype and device
@@ -628,6 +632,11 @@ def _flash_attn_fwd(
     else:
         _key_v_dtype = torch2cute_dtype_map.get(v.dtype, cutlass.BFloat16)
     fp4_qk = use_fp4 and not is_cute_q
+    fp4_v = (
+        use_fp4 and not isinstance(v, cute.Tensor)
+        and hasattr(torch, "float4_e2m1fn_x2")
+        and v.dtype == torch.float4_e2m1fn_x2
+    )
     compile_key = (
         dtype,
         _key_v_dtype,
@@ -654,7 +663,7 @@ def _flash_attn_fwd(
         is_split_kv,
         pack_gqa,
         compute_capability,
-        page_size not in [None, 128],  # paged KV non-TMA
+        page_size not in [None, 128],
         use_fp4,
         mSFQ is not None,
         mSFK is not None,
@@ -663,16 +672,9 @@ def _flash_attn_fwd(
         _key_qk_ab_dtype,
         _key_sf_dtype,
         local,
-        fp4_qk,  # torch FP4 make_ptr path (q_ptr_shape doubles last dim)
-        is_cute_q,  # cute tensor path (empty q_ptr_shape, direct layout)
-    )
-    # FP4 V also needs the make_ptr path: dlpack reports half-headdim shape for
-    # float4_e2m1fn_x2, but the kernel needs to know the full headdim (and the
-    # K-major stride) to build SFV's TMA descriptor correctly.
-    fp4_v = (
-        use_fp4 and not isinstance(v, cute.Tensor)
-        and hasattr(torch, "float4_e2m1fn_x2")
-        and v.dtype == torch.float4_e2m1fn_x2
+        fp4_qk,
+        fp4_v,
+        is_cute_q,
     )
     # Compute q_shape, k_shape and qk_ab_dtype for pointer-based Q/K path (used by FP4 kernel).
     # Cute tensors (from cute_tensor_like) carry byte-based strides that match their data layout;
