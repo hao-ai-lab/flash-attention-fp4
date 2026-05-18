@@ -627,6 +627,7 @@ def _flash_attn_fwd(
         _key_v_dtype = v.element_type
     else:
         _key_v_dtype = torch2cute_dtype_map.get(v.dtype, cutlass.BFloat16)
+    fp4_qk = use_fp4 and not is_cute_q
     compile_key = (
         dtype,
         _key_v_dtype,
@@ -654,19 +655,17 @@ def _flash_attn_fwd(
         pack_gqa,
         compute_capability,
         page_size not in [None, 128],  # paged KV non-TMA
-        use_fp4,  # Include FP4 flag in compile key
-        mSFQ is not None,  # Include block-scaled path activation
-        mSFQ is not None,  # Include scale factor flags
+        use_fp4,
+        mSFQ is not None,
         mSFK is not None,
         mSFV is not None,
         force_fp4_impl,
-        _key_qk_ab_dtype,  # NVFP4 (Float4E2M1FN) vs MXFP8 (Float8E4M3FN/E5M2)
-        _key_sf_dtype,     # E4M3 (NVFP4) vs E8M0 (MXFP8) — was previously not in the
-                           # key; both modes shared a slot and the second silently
-                           # reused the kernel compiled for the first.
+        _key_qk_ab_dtype,
+        _key_sf_dtype,
         local,
+        fp4_qk,  # torch FP4 make_ptr path (q_ptr_shape doubles last dim)
+        is_cute_q,  # cute tensor path (empty q_ptr_shape, direct layout)
     )
-    fp4_qk = use_fp4 and not is_cute_q
     # FP4 V also needs the make_ptr path: dlpack reports half-headdim shape for
     # float4_e2m1fn_x2, but the kernel needs to know the full headdim (and the
     # K-major stride) to build SFV's TMA descriptor correctly.
