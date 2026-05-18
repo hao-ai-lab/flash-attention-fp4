@@ -295,7 +295,7 @@ Each cell: max_diff / mean_diff / cos_sim
 | (1,4096,24,128) | 0.0415 / 0.002798 / 0.9905 | 0.0381 / 0.002901 / 0.9898 | 0.0225 / 0.001107 / 0.9985 |
 | (1,32768,24,128) | 0.0151 / 0.000996 / 0.9905 | 0.0144 / 0.001032 / 0.9898 | 0.0061 / 0.000393 / 0.9985 |
 
-All modes exceed cos >= 0.99. MXFP8 is ~10x more precise (cos=0.9985) than NVFP4 (cos=0.990) due to 8-bit vs 4-bit QK quantization.
+All modes exceed cos >= 0.99. MXFP8 has lower error (cos=0.9985, max_diff ~0.005-0.05) than NVFP4 (cos=0.990, max_diff ~0.01-0.15) due to 8-bit vs 4-bit QK quantization.
 
 - **Commit**: b98b85a0 (fp4 branch), **GPU**: B200
 - **Command**: `CUDA_VISIBLE_DEVICES=5 CUTE_DSL_ENABLE_TVM_FFI=1 python3` (inline script via `flash_attn.cute.interface.flash_attn_func`)
