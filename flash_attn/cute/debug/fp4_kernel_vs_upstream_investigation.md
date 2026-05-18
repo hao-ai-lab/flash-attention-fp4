@@ -9,7 +9,7 @@
 
 ## Tasks
 
-- [ ] **1. Investigate FP8 PR #2109 TFLOPS gap**
+- [x] **1. Investigate FP8 PR #2109 TFLOPS gap** (completed — root cause identified below)
   - Even with all quant instructions commented out (lines 3200-3212), our kernel only reaches 1867 TFLOPS vs their 1950
   - Key difference: they use 2-CTA gemm instructions; we use 1-CTA
   - Verify their numbers are real by running their code if possible
@@ -215,7 +215,7 @@ Both FP4 and BF16 improved. The BF16 kernel is also slightly faster with `cute.a
 
 **Conclusion**: The "reasonable" diffs are an artifact of FP4 bounded arithmetic + softmax normalization. The output is numerically wrong but doesn't produce NaN/inf. This is expected behavior for garbage-in-bounded-out MMA pipelines.
 
-- [ ] **3. Integrate 2-CTA gemm instructions from FA4 main branch**
+- [x] **3. Integrate 2-CTA gemm instructions from FA4 main branch** (superseded — 2-CTA is slower on B200)
   - **UPDATE**: 2-CTA is slower on our B200 hardware (see Task 1 benchmarks above)
   - Main FA4 (flash_fwd_sm100.py) has full 2-CTA support on `public/main` (20+ commits ahead)
   - PR #2109 does NOT switch CTA groups — upstream already has it
@@ -318,7 +318,9 @@ Each cell: cos_sim / max_diff / mean_diff. Bench uses `cute_tensor_like` + `conv
 | (1,32768,24,128) | 0.9765 / 0.0211 / 0.001586 | 0.9758 / 0.0217 / 0.001608 | 0.9985 / 0.0056 / 0.000393 |
 | (1,32768,24,64) | 0.9755 / 0.0421 / 0.001607 | 0.9748 / 0.0402 / 0.001631 | — |
 
-MXFP8 has much lower error (cos=0.9985) than NVFP4 (cos=0.976) due to 8-bit vs 4-bit QK quantization. NVFP4 cos_sim is lower here than with adaptive per-block SF quantization (~0.99) because bench uses uniform SF=1.0 which clips values outside FP4 range.
+MXFP8 has much lower error (cos=0.9985) than NVFP4 (cos=0.976) due to 8-bit vs 4-bit QK quantization.
+
+**Bench precision context**: The bench uses `cute_tensor_like` + `convert_cute_tensor` with **uniform SF=1.0** (no per-block adaptive scaling). This is a simplified quantization that tests the kernel in isolation. With production per-block quantization (e.g., FastVideo's `nvfp4_quantize` which computes SF = amax/max_fp4 per block), NVFP4 achieves cos >= 0.99. The `cvt_sf_MKL_to_M32x4xrm_K4xrk_L` layout conversion only supports uniform SF values; per-block adaptive SF requires a different SF tensor creation path not yet in the bench.
 
 TFLOPS (peak shapes, B200):
 | Mode | Peak TFLOPS | Shape |
