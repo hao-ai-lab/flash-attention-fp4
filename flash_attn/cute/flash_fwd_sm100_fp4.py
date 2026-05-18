@@ -413,17 +413,17 @@ class FlashAttentionForwardSm100:
         For FP4, mQ/mK can be cute.Pointer with q/k_ptr_shape providing (b, s, h, d).
         The kernel builds tensors from the pointer using make_ordered_layout.
         """
-        # Build Q/K tensors from pointer/tensor + shape
-        # For pointers: mQ is a Pointer, .iterator not needed
-        # For tensors: mQ is a Tensor, use .iterator to extract pointer
-        q_iter = mQ.iterator if hasattr(mQ, 'iterator') else mQ
-        k_iter = mK.iterator if hasattr(mK, 'iterator') else mK
-        mQ = cute.make_tensor(q_iter, cute.make_ordered_layout(
-            q_ptr_shape, order=tuple(range(len(q_ptr_shape) - 1, -1, -1))
-        ))
-        mK = cute.make_tensor(k_iter, cute.make_ordered_layout(
-            k_ptr_shape, order=tuple(range(len(k_ptr_shape) - 1, -1, -1))
-        ))
+        # Build Q/K tensors from pointer + shape (make_ptr path for packed torch FP4),
+        # or use the cute tensor directly (cute_tensor_like path with byte-based strides).
+        if const_expr(len(q_ptr_shape) > 0):
+            q_iter = mQ.iterator if hasattr(mQ, 'iterator') else mQ
+            k_iter = mK.iterator if hasattr(mK, 'iterator') else mK
+            mQ = cute.make_tensor(q_iter, cute.make_ordered_layout(
+                q_ptr_shape, order=tuple(range(len(q_ptr_shape) - 1, -1, -1))
+            ))
+            mK = cute.make_tensor(k_iter, cute.make_ordered_layout(
+                k_ptr_shape, order=tuple(range(len(k_ptr_shape) - 1, -1, -1))
+            ))
         # FP4 K-major V: build from pointer with explicit (b, s, h, d) shape and
         # K-major strides (S*H*D, 1, S, S*H). The host transposes V's underlying
         # buffer so that seqlen has stride 1 in the FP4 byte buffer.

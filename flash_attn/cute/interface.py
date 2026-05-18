@@ -675,18 +675,25 @@ def _flash_attn_fwd(
         and hasattr(torch, "float4_e2m1fn_x2")
         and v.dtype == torch.float4_e2m1fn_x2
     )
-    # Compute q_shape, k_shape and qk_ab_dtype for pointer-based Q/K path (used by FP4 kernel)
+    # Compute q_shape, k_shape and qk_ab_dtype for pointer-based Q/K path (used by FP4 kernel).
+    # Cute tensors (from cute_tensor_like) carry byte-based strides that match their data layout;
+    # the kernel uses them directly via mQ.layout, so q_ptr_shape stays empty.
+    # Torch int8 tensors (from nvfp4_quantize) need make_ptr + make_ordered_layout with explicit shapes.
     if fp4_qk:
         q_ptr_shape = tuple(int(s) for s in (*q.shape[:-1], q.shape[-1] * 2))
         k_ptr_shape = tuple(int(s) for s in (*k.shape[:-1], k.shape[-1] * 2))
         qk_ab_dtype = cutlass.Float4E2M1FN
     elif is_cute_q:
-        q_ptr_shape = tuple(int(s) for s in q.shape)
-        k_ptr_shape = tuple(int(s) for s in k.shape)
+        q_ptr_shape = ()
+        k_ptr_shape = ()
         qk_ab_dtype = q.element_type
-    else:
+    elif use_blockscaled_impl:
         q_ptr_shape = tuple(int(s) for s in q.shape)
         k_ptr_shape = tuple(int(s) for s in k.shape)
+        qk_ab_dtype = torch2cute_dtype_map.get(q.dtype, cutlass.BFloat16)
+    else:
+        q_ptr_shape = ()
+        k_ptr_shape = ()
         qk_ab_dtype = torch2cute_dtype_map.get(q.dtype, cutlass.BFloat16)
     if fp4_v:
         # K-major V FP4 tensor: torch shape (b, h, d, s/2) packs 2 seqlen-adjacent
@@ -738,9 +745,9 @@ def _flash_attn_fwd(
             else:
                 raise ValueError(f"Invalid scale factor dtype: {sf_dtype}")
         
-        # Block-scaled Q/K: always use make_ptr path (kernel builds tensor from pointer + shape)
-        # This handles both FP4 (float4_e2m1fn_x2) and MXFP8 (float8_e4m3fn) uniformly
-        if use_blockscaled_impl:
+        # Block-scaled Q/K: use make_ptr when we have torch tensors (packed FP4/FP8 with
+        # explicit shape), or pass cute tensors directly (they carry their own layout).
+        if use_blockscaled_impl and not is_cute_q:
             from cutlass.cute.runtime import make_ptr
             q_tensor = make_ptr(qk_ab_dtype, 0, cute.AddressSpace.gmem, assumed_align=16)
             k_tensor = make_ptr(qk_ab_dtype, 0, cute.AddressSpace.gmem, assumed_align=16)
@@ -957,10 +964,10 @@ def _flash_attn_fwd(
             expected_count_shape=expected_count_shape,
             expected_index_shape=expected_index_shape,
         )
-    if use_blockscaled_impl:
+    if use_blockscaled_impl and not is_cute_q:
         from cutlass.cute.runtime import make_ptr as _make_ptr
-        q_data_ptr = q.data_ptr() if hasattr(q, 'data_ptr') and callable(q.data_ptr) else int(q.iterator)
-        k_data_ptr = k.data_ptr() if hasattr(k, 'data_ptr') and callable(k.data_ptr) else int(k.iterator)
+        q_data_ptr = q.data_ptr()
+        k_data_ptr = k.data_ptr()
         q_call = _make_ptr(qk_ab_dtype, q_data_ptr, cute.AddressSpace.gmem, assumed_align=16)
         k_call = _make_ptr(qk_ab_dtype, k_data_ptr, cute.AddressSpace.gmem, assumed_align=16)
     else:
