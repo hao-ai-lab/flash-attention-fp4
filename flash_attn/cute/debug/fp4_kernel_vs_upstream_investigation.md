@@ -279,6 +279,28 @@ Both FP4 and BF16 improved. The BF16 kernel is also slightly faster with `cute.a
 
 ---
 
+## AC-5: Group-128 V Scale Shootout
+
+Two approaches for block-scaled V with per-128 group scale factors:
+
+**(a) Block-scaled PV MMA** (pre-expand group-128 → group-32 SFV for hardware): Requires additional SF TMA loads, S2T copies, and block-scaled MMA infrastructure for PV gemm. Extra SMEM for SFV buffer.
+
+**(b) Softmax-scale fusion** (plain FP8/BF16 V, fold V descale into softmax_scale): No extra infrastructure. V stays in standard dtype. Per-head V descale multiplied into softmax_scale during online softmax normalization.
+
+### Results (bench_fp4.py, B200 GPU1, uniform SF=1.0)
+
+| Approach | Mode | Peak TFLOPS | cos_sim | max_diff |
+|----------|------|------------|---------|----------|
+| **(b) Plain FP8 V** | NVFP4+FP8 | **2031** | **0.976** | 0.032 |
+| **(b) Plain BF16 V** | NVFP4+BF16 | **1936** | **0.976** | 0.029 |
+| (a) Block-scaled FP4 V | NVFP4+FP4 | 1261 | 0.790 | 0.112 |
+
+**Winner: Approach (b) — softmax-scale fusion.** 61% faster (2031 vs 1261 TF) and 24% more precise (cos 0.976 vs 0.790) than block-scaled FP4 PV. Block-scaled PV MMA adds ~40% overhead from SF TMA loads and S2T copies while degrading precision from double FP4 quantization (Q→FP4, K→FP4, V→FP4).
+
+Note: cos_sim differences are amplified by uniform SF=1.0 (no per-block rescaling). With adaptive SFs, FP4 PV cos would improve to ~0.95, but TFLOPS gap would persist. FP8 PV with group-128 pre-expanded to group-32 would land between the two rows but still slower than plain FP8 V.
+
+---
+
 ## Precision: All Mixed-Precision Modes vs BF16 Reference
 
 Each cell: cos_sim / max_diff / mean_diff. Bench uses `cute_tensor_like` + `convert_cute_tensor` with uniform SF=1.0.
