@@ -450,6 +450,53 @@ def create_blockscaled_attention_tensors(batch, seqlen_q, seqlen_k, nheads, nhea
                 q_ref, k_ref, v_ref)
 
 
+def create_nvfp4_attention_tensors(batch, seqlen_q, seqlen_k, nheads, nheads_kv, headdim, headdim_v,
+                                   device='cuda', dtype_gen=torch.bfloat16, pv_mode='bf16',
+                                   pv_fp8_dtype=None):
+    """Create block-scaled attention tensors using flashinfer's nvfp4_quantize.
+
+    Uses proper per-block adaptive scale factors (SF = amax/6 per sf_vec_size=16 block),
+    producing packed float4_e2m1fn_x2 Q/K with SF in BlockScaledBasicChunk MMA layout.
+    This matches production quantization and achieves cos >= 0.99 vs BF16.
+    """
+    from flashinfer.quantization import nvfp4_quantize, SfLayout
+
+    sf_vec_size = 16
+    tile_m = 128
+
+    q_ref = torch.randn(batch, seqlen_q, nheads, headdim, device=device, dtype=torch.float32)
+    k_ref = torch.randn(batch, seqlen_k, nheads_kv, headdim, device=device, dtype=torch.float32)
+    v_ref = torch.randn(batch, seqlen_k, nheads_kv, headdim_v, device=device, dtype=torch.float32)
+
+    def _quantize_and_reshape_sf(ref, batch_, seqlen_, nheads_, headdim_):
+        t2d = ref.to(dtype_gen).reshape(batch_ * seqlen_, nheads_ * headdim_)
+        one = torch.ones(1, device=device, dtype=torch.float32)
+        fp4_data, sf_data = nvfp4_quantize(t2d, one, sfLayout=SfLayout.layout_128x4, do_shuffle=False)
+        fp4 = fp4_data.reshape(batch_, seqlen_, nheads_, headdim_ // 2).view(torch.uint8).view(torch.float4_e2m1fn_x2)
+        rest_m = seqlen_ // tile_m
+        sf_k = headdim_ // sf_vec_size
+        rest_k = sf_k // 4
+        total_m = batch_ * rest_m
+        total_k = (nheads_ * sf_k) // 4
+        sf = sf_data.reshape(total_m, total_k, 32, 4, 4)
+        sf = sf.reshape(batch_, rest_m, nheads_, rest_k, 32, 4, 4)
+        sf = sf.permute(0, 2, 1, 3, 4, 5, 6).contiguous().permute(4, 5, 2, 6, 3, 1, 0)
+        return fp4, sf
+
+    q_fp4, q_sf = _quantize_and_reshape_sf(q_ref, batch, seqlen_q, nheads, headdim)
+    k_fp4, k_sf = _quantize_and_reshape_sf(k_ref, batch, seqlen_k, nheads_kv, headdim)
+
+    # V stays in BF16/FP8 (no block-scaled PV)
+    if pv_mode == "fp8":
+        _fp8 = pv_fp8_dtype or cutlass.Float8E4M3FN
+        _torch_fp8 = torch.float8_e4m3fn if _fp8 == cutlass.Float8E4M3FN else torch.float8_e5m2
+        v_tensor = v_ref.to(dtype_gen).to(_torch_fp8)
+    else:
+        v_tensor = v_ref.to(dtype_gen)
+
+    return q_fp4, k_fp4, v_tensor, q_sf, k_sf, None, q_ref, k_ref, v_ref
+
+
 def time_fwd(func, *args, repeats=10, verbose=True, desc="", **kwargs):
     """Time forward pass via triton.testing.do_bench.
 
@@ -473,14 +520,7 @@ def time_fwd(func, *args, repeats=10, verbose=True, desc="", **kwargs):
 
 
 def main(ab_dtype, sf_dtype, sf_vec_size, pv_mode="bf16", pv_fp8_dtype=cutlass.Float8E4M3FN, debug=False, causal=False):
-    """Main benchmark function.
-    
-    Args:
-        ab_dtype: Data type for A/B matrices
-        sf_dtype: Scale factor dtype
-        sf_vec_size: Scale factor vector size
-        pv_mode: One of {'bf16', 'fp4', 'fp8'}
-    """
+    """Main benchmark function."""
     torch.manual_seed(0)
     repeats = 10
     device = 'cuda'
@@ -517,7 +557,11 @@ def main(ab_dtype, sf_dtype, sf_vec_size, pv_mode="bf16", pv_fp8_dtype=cutlass.F
     print(f"QK sf_dtype: {sf_dtype}")
     print(f"QK sf_vec_size: {sf_vec_size}")
     print("=" * 80)
-    
+
+    # Use nvfp4_quantize for NVFP4 (proper per-block SF, cos>=0.99).
+    # Fall back to cute_tensor_like for MXFP8 or FP4 PV (nvfp4_quantize only handles NVFP4).
+    use_nvfp4 = (ab_dtype == cutlass.Float4E2M1FN and pv_mode != "fp4")
+
     for batch_size, seqlen, nheads, headdim in configs:
         nheads_kv = nheads
         headdim_v = headdim
@@ -525,15 +569,20 @@ def main(ab_dtype, sf_dtype, sf_vec_size, pv_mode="bf16", pv_fp8_dtype=cutlass.F
         window_size = (None, None)
 
         print(f"\n### Batch={batch_size}, SeqLen={seqlen}, Nheads={nheads}, Headdim={headdim} ###")
-        
-        # Create block-scaled Q/K tensors plus the requested V mode.
-        (q_fp4, k_fp4, v_tensor, q_sf, k_sf, v_sf, 
-            q_ref, k_ref, v_ref) = create_blockscaled_attention_tensors(
-            batch_size, seqlen_q, seqlen, nheads, nheads_kv, 
-            headdim, headdim_v, device, dtype_gen, pv_mode=pv_mode, return_torch=False,
-            ab_dtype=ab_dtype, sf_dtype=sf_dtype, sf_vec_size=sf_vec_size,
-            pv_fp8_dtype=pv_fp8_dtype, debug=debug
-        )
+
+        if use_nvfp4:
+            (q_fp4, k_fp4, v_tensor, q_sf, k_sf, v_sf,
+                q_ref, k_ref, v_ref) = create_nvfp4_attention_tensors(
+                batch_size, seqlen_q, seqlen, nheads, nheads_kv,
+                headdim, headdim_v, device, dtype_gen, pv_mode=pv_mode,
+                pv_fp8_dtype=pv_fp8_dtype)
+        else:
+            (q_fp4, k_fp4, v_tensor, q_sf, k_sf, v_sf,
+                q_ref, k_ref, v_ref) = create_blockscaled_attention_tensors(
+                batch_size, seqlen_q, seqlen, nheads, nheads_kv,
+                headdim, headdim_v, device, dtype_gen, pv_mode=pv_mode, return_torch=False,
+                ab_dtype=ab_dtype, sf_dtype=sf_dtype, sf_vec_size=sf_vec_size,
+                pv_fp8_dtype=pv_fp8_dtype, debug=debug)
         q_sf_torch = check_tensor_for_nans(q_sf, name="q_sf")
         k_sf_torch = check_tensor_for_nans(k_sf, name="k_sf")
 
