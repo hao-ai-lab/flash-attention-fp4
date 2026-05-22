@@ -458,6 +458,8 @@ def _flash_attn_fwd(
     if is_fp8 and (q.requires_grad or k.requires_grad or v.requires_grad):
         raise NotImplementedError("FA4 CuTe FP8 backward is not supported yet (forward-only).")
     is_fp4 = hasattr(torch, "float4_e2m1fn_x2") and q.dtype == torch.float4_e2m1fn_x2
+    _q_ptr_shape = ()
+    _k_ptr_shape = ()
     out_torch_dtype = torch.bfloat16 if (is_fp8 or is_fp4 or mSFQ is not None) else q.dtype
     device = q.device
     q_batch_seqlen_shape = (batch_size, seqlen_q) if cu_seqlens_q is None else (total_q,)
