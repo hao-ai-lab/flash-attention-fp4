@@ -768,6 +768,10 @@ def _flash_attn_fwd(
         (batch_size, num_head, seqlen_q, seqlen_k) if is_fp4 else None,
     )
 
+    if is_fp4:
+        _q_ptr_shape = tuple(int(s) for s in (*q.shape[:-1], q.shape[-1] * 2))
+        _k_ptr_shape = tuple(int(s) for s in (*k.shape[:-1], k.shape[-1] * 2))
+
     if compile_key not in _flash_attn_fwd.compile_cache:
         (
             cu_seqlens_q_tensor,
@@ -791,8 +795,6 @@ def _flash_attn_fwd(
             _fp4_ab_dtype = cutlass.Float4E2M1FN
             q_tensor = _make_ptr(_fp4_ab_dtype, q.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
             k_tensor = _make_ptr(_fp4_ab_dtype, k.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
-            _q_ptr_shape = tuple(int(s) for s in (*q.shape[:-1], q.shape[-1] * 2))
-            _k_ptr_shape = tuple(int(s) for s in (*k.shape[:-1], k.shape[-1] * 2))
         else:
             q_tensor = to_cute_tensor(q)
             k_tensor = to_cute_tensor(k)
