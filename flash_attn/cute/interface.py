@@ -765,6 +765,7 @@ def _flash_attn_fwd(
         mSFQ is not None,
         _sf_vec_size if mSFQ is not None else None,
         is_fp4,
+        (batch_size, num_head, seqlen_q, seqlen_k) if is_fp4 else None,
     )
 
     if compile_key not in _flash_attn_fwd.compile_cache:
