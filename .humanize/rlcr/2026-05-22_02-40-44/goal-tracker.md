@@ -67,9 +67,9 @@ Integrate the proven block-scaled FP4/FP8 flash attention kernel (`flash_fwd_sm1
 | Task | Target AC | Status | Tag | Owner | Notes |
 |------|-----------|--------|-----|-------|-------|
 | task1: S2T reproducer (standalone vs inline) | AC-7 | completed | analyze | claude | Identified P dtype as NaN root cause |
-| task2: Fix S2T MLIR + NaN | AC-2 | in_progress | coding | claude | MLIR fixed, NaN fixed (P dtype), cos=0.44 remaining |
-| task3: Verify SF TMA loading | AC-2 | in_progress | coding | claude | S2T makes cos worse (0.44 vs 0.61 without S2T) |
-| task4: NVFP4+BF16 end-to-end | AC-2 | blocked | coding | claude | Blocked on S2T cos issue |
+| task2: Fix S2T MLIR + NaN | AC-2 | completed | coding | claude | NaN→0.44→0.93 via P-dtype + make_ptr + key fixes |
+| task3: Verify SF TMA loading | AC-2 | completed | coding | claude | SF loads correct. S2T improves cos 0.61→0.93 |
+| task4: NVFP4+BF16 end-to-end | AC-2 | in_progress | coding | claude | cos=0.98@s256, 0.93@s4096 (target 0.99). Interface SF issue |
 | task5: FP8 V path | AC-3 | pending | coding | claude | Depends on task4 |
 | task6: MXFP8 QK path | AC-4 | pending | coding | claude | Depends on task4 |
 | task7: Verify softmax fusion (approach b) | AC-5 | pending | coding | claude | Depends on task5 |
