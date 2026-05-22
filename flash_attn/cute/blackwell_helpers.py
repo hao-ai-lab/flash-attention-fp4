@@ -3,13 +3,11 @@ from typing import Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32, Boolean, const_expr, Float32
-from cutlass.cutlass_dsl import T
+from cutlass import Int32, Float32, Boolean, const_expr, Float8E4M3FN, Float8E5M2, Float4E2M1FN
 from cutlass.cute.nvgpu import tcgen05
 from cutlass._mlir.dialects import llvm
 
 import flash_attn.cute.mma_sm100_desc as sm100_desc
-from flash_attn.cute.utils import parse_swizzle_from_pointer
 
 
 def _tcgen05_mma_kind(op: cute.nvgpu.tcgen05.mma.MmaOp) -> str:
@@ -408,7 +406,6 @@ def gemm_ptx_partial(
     # acc_offset: Int32 = 0,
     tA_addr: Optional[Int32] = None,
     cta_group: int = 1,
-    pre_mbar_tiles: Optional[cutlass.Constexpr[int]] = None,
 ) -> None:
     # acc_tmem_addr += acc_offset
     is_ts = op.a_src == cute.nvgpu.tcgen05.OperandSource.TMEM
@@ -534,12 +531,10 @@ def gemm_ptx_partial(
         ]
         if const_expr(mbar_ptr is not None):
             assert mbar_phase is not None, "mbar_phase must be provided when mbar_ptr is not None"
-            if const_expr(pre_mbar_tiles is not None):
-                split_arrive_idx = pre_mbar_tiles
-            elif const_expr(split_arrive is not None):
-                split_arrive_idx = split_arrive // op.shape_mnk[2]
-            else:
-                split_arrive_idx = cute.size(tCrA.shape[2]) // 4 * 3
+            assert split_arrive is not None, (
+                "split_arrive must be provided when mbar_ptr is not None"
+            )
+            split_arrive_idx = split_arrive // op.shape_mnk[2]
             input_args.append(mbar_ptr.toint().ir_value())
             input_args.append(Int32(mbar_phase).ir_value())
             mbar_wait_str = (
@@ -1116,11 +1111,6 @@ def gemm_ptx_precomputed_varname(
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
         )
-
-
-# ---------------------------------------------------------------------------
-# FP4/MXFP8 block-scaled MMA helpers
-# ---------------------------------------------------------------------------
 
 
 def _is_pure_fp8_mma(op: cute.nvgpu.tcgen05.mma.MmaOp) -> bool:
