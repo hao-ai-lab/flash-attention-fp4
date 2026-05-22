@@ -410,8 +410,8 @@ class FlashAttentionForwardSm100:
     @cute.jit
     def __call__(
         self,
-        mQ: cute.Tensor,  # (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
-        mK: cute.Tensor,  # (b_k, s_k, h_k, d) or (total_k, h_k, d) if there is cu_seqlens_k or (num_pages, page_size, h_k, d) if there is page_table
+        mQ,  # cute.Tensor or cute.Pointer for FP4
+        mK,  # cute.Tensor or cute.Pointer for FP4
         mV: cute.Tensor,  # (b_k, s_k, h_k, dv) or (total_k, h_k, dv) if there is cu_seqlens_k or (num_pages, page_size, h_k, dv) if there is page_table
         mO: cute.Tensor,  # (b, s_q, h, dv) or (total_q, h, dv) if there is cu_seqlens_q
         mLSE: Optional[cute.Tensor],
@@ -430,22 +430,21 @@ class FlashAttentionForwardSm100:
         mSFQ: Optional[cute.Tensor] = None,
         mSFK: Optional[cute.Tensor] = None,
         mSFV: Optional[cute.Tensor] = None,
+        q_ptr_shape: tuple = (),
+        k_ptr_shape: tuple = (),
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
-        """Execute the Fused Multi-Head Attention operation on the provided tensors.
-
-        This method prepares the input tensors for processing, validates their shapes and types,
-        configures the computation parameters, and launches the CUDA kernel.
-
-        The method handles:
-        1. Tensor layout transformations for specific memory access patterns
-        2. Validation of tensor shapes and data types
-        3. Initialization of hardware-specific parameters and memory layouts
-        4. Configuration of TMA (Tensor Memory Access) operations
-        5. Grid and work scheduling computation
-        6. Kernel launch with appropriate parameters
-        """
+        """Execute the Fused Multi-Head Attention operation on the provided tensors."""
+        if const_expr(len(q_ptr_shape) > 0):
+            q_iter = mQ.iterator if hasattr(mQ, 'iterator') else mQ
+            k_iter = mK.iterator if hasattr(mK, 'iterator') else mK
+            mQ = cute.make_tensor(q_iter, cute.make_ordered_layout(
+                q_ptr_shape, order=tuple(range(len(q_ptr_shape) - 1, -1, -1))
+            ))
+            mK = cute.make_tensor(k_iter, cute.make_ordered_layout(
+                k_ptr_shape, order=tuple(range(len(k_ptr_shape) - 1, -1, -1))
+            ))
         # setup static attributes before smem/grid/tma computation
         self.q_dtype = mQ.element_type
         self.k_dtype = mK.element_type

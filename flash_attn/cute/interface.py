@@ -495,7 +495,10 @@ def _flash_attn_fwd(
             "q_descale/k_descale/v_descale are only supported for FP8 inputs"
         )
 
-    dtype = torch2cute_dtype_map[q.dtype]
+    if is_fp4 or mSFQ is not None:
+        dtype = cutlass.BFloat16
+    else:
+        dtype = torch2cute_dtype_map[q.dtype]
     if is_fp8:
         assert arch // 10 == 10, "FP8 is only supported on SM100 (compute capability 10.x) for FA4 CuTe."
     use_block_sparsity = block_sparse_tensors is not None
@@ -779,9 +782,20 @@ def _flash_attn_fwd(
             if page_table is not None
             else None
         )
-        q_tensor, k_tensor, v_tensor, o_tensor = [
-            to_cute_tensor(t) for t in (q, k, v, out if not is_split_kv else out_partial)
-        ]
+        if is_fp4:
+            from cutlass.cute.runtime import make_ptr as _make_ptr
+            _fp4_ab_dtype = cutlass.Float4E2M1FN
+            q_tensor = _make_ptr(_fp4_ab_dtype, q.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
+            k_tensor = _make_ptr(_fp4_ab_dtype, k.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
+            _q_ptr_shape = tuple(int(s) for s in (*q.shape[:-1], q.shape[-1] * 2))
+            _k_ptr_shape = tuple(int(s) for s in (*k.shape[:-1], k.shape[-1] * 2))
+        else:
+            q_tensor = to_cute_tensor(q)
+            k_tensor = to_cute_tensor(k)
+            _q_ptr_shape = ()
+            _k_ptr_shape = ()
+        v_tensor = to_cute_tensor(v)
+        o_tensor = to_cute_tensor(out if not is_split_kv else out_partial)
         if is_split_kv:
             lse_tensor = to_cute_tensor(lse_partial, assumed_align=4)
         elif lse is not None:
@@ -1031,6 +1045,12 @@ def _flash_attn_fwd(
             ])
             if arch // 10 in [10, 11]:
                 compile_args.extend([mSFQ_tensor, mSFK_tensor, mSFV_tensor])
+                if is_fp4:
+                    _sym_q_shape = tuple(cutlass.Int32(0) for _ in _q_ptr_shape)
+                    _sym_k_shape = tuple(cutlass.Int32(0) for _ in _k_ptr_shape)
+                    compile_args.extend([_sym_q_shape, _sym_k_shape])
+                else:
+                    compile_args.extend([(), ()])
             compile_args.append(current_stream)
             _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
                 *compile_args, options="--enable-tvm-ffi"
@@ -1047,8 +1067,9 @@ def _flash_attn_fwd(
             if qv_call is not None:
                 qv_call = qv_call.view(torch.uint8)
         if is_fp4:
-            q_call = q_call.view(torch.uint8)
-            k_call = k_call.view(torch.uint8)
+            from cutlass.cute.runtime import make_ptr as _make_ptr_rt
+            q_call = _make_ptr_rt(cutlass.Float4E2M1FN, q_call.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
+            k_call = _make_ptr_rt(cutlass.Float4E2M1FN, k_call.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
         descale_tensors = (
             DescaleTensors(q_descale=q_descale, k_descale=k_descale, v_descale=v_descale)
             if q_descale is not None or k_descale is not None or v_descale is not None
@@ -1108,6 +1129,7 @@ def _flash_attn_fwd(
             ])
             if arch // 10 in [10, 11]:
                 call_args.extend([mSFQ, mSFK, mSFV])
+                call_args.extend([_q_ptr_shape, _k_ptr_shape])
             _flash_attn_fwd.compile_cache[compile_key](*call_args)
     if is_split_kv:
         _flash_attn_fwd_combine(
