@@ -764,6 +764,7 @@ def _flash_attn_fwd(
         fa_logging.get_fa_log_level(),
         mSFQ is not None,
         _sf_vec_size if mSFQ is not None else None,
+        is_fp4,
     )
 
     if compile_key not in _flash_attn_fwd.compile_cache:
