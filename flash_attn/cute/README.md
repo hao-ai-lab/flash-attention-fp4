@@ -29,8 +29,10 @@ All values in TFLOPS. Peak: **NVFP4+FP8 2031 TF**, **MXFP8+FP8 1960 TF**.
 
 ### Sequence length sweep (B200, batch=1, dedicated GPU)
 
-![B200 h=32 TFLOPS](figures/b200_tflops_h32.png)
-![B200 h=12 TFLOPS](figures/b200_tflops_h12.png)
+![B200 h=32 non-causal](figures/b200_tflops_h32.png)
+![B200 h=12 non-causal](figures/b200_tflops_h12.png)
+![B200 h=32 causal](figures/b200_tflops_h32_causal.png)
+![B200 h=12 causal](figures/b200_tflops_h12_causal.png)
 
 **h=32, d=128 (MHA)**
 
