@@ -701,8 +701,9 @@ def main(
         (1, 4096, 24, 128),
         (1, 32768, 24, 128),
     ]
-    if pv_mode != "fp4":
-        # headdim=64 only works when PV does not use block-scaled FP4.
+    if pv_mode != "fp4" and sf_vec_size * 4 <= 64:
+        # headdim=64 requires head_dim >= sf_vec_size*4 (block-scaled MMA atom K constraint).
+        # MXFP8 (sf_vec_size=32) needs headdim >= 128; NVFP4 (sf_vec_size=16) supports d=64.
         configs.append((1, 32768, 24, 64))
     print("=" * 80)
     print("FP4 Flash Attention Benchmark")

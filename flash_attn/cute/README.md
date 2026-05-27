@@ -23,6 +23,7 @@ Block-scaled QK attention with BF16 or FP8 PV (triton `do_bench`, B200):
 | b=1 s=32768 h=24 d=64 | 919 | **986** | — | 949 |
 
 All values in TFLOPS. Peak: **NVFP4+FP8 2031 TF**, **MXFP8+FP8 1960 TF**.
+**—** = unsupported. MXFP8 (sf_vec_size=32) requires headdim ≥ 128 because the block-scaled MMA hardware atom tiles 4 instruction K-tiles per scale factor, giving a minimum K dimension of `sf_vec_size × 4 = 128`. NVFP4 (sf_vec_size=16) supports headdim ≥ 64.
 
 ¹ Matches [Wan2.1-T2V-1.3B](https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B-Diffusers) inference (480×832 video, 81 frames → latent seqlen 32760, nheads=12, headdim=128).
 
