@@ -1,3 +1,5 @@
 my_analysis.txt
 *.cubin
+*.mp4
+*.csv
 debug/profile_logs/

@@ -1,0 +1,218 @@
+# FP4 Kernel Investigation & Optimization
+
+## Context
+- Our FP4 block-scaled FA4 kernel peaks at ~1800 TFLOPS (1867 with quant removed)
+- New FP8 FA4 PR ([Dao-AILab/flash-attention#2109](https://github.com/Dao-AILab/flash-attention/pull/2109)) claims ~1950 TFLOPS
+- They use standard FP8 tcgen05.mma (not block-scaled), with per-head descaling folded into softmax
+- Upstream FA4 main branch has 2-CTA support (`FA_DISABLE_2CTA=0` by default for hdim=128 non-causal)
+- Our kernel uses 1-CTA (`tcgen05.mma.cta_group::1`)
+
+## Tasks
+
+- [ ] **1. Investigate FP8 PR #2109 TFLOPS gap**
+  - Even with all quant instructions commented out (lines 3200-3212), our kernel only reaches 1867 TFLOPS vs their 1950
+  - Key difference: they use 2-CTA gemm instructions; we use 1-CTA
+  - Verify their numbers are real by running their code if possible
+  - Identify all performance-relevant differences (2-CTA, tile sizes, pipeline depth, etc.)
+  - **Commit**: git commit of flash-attention-fp4 repo used for benchmarks
+  - **Command**: `CUTE_DSL_ENABLE_TVM_FFI=1 python -m flash_attn.cute.benchmarks.bench_fp4`
+
+### Task 1 Findings
+
+**PR #2109 does NOT introduce 2-CTA — the upstream FA4 main already has it.**
+The PR is purely FP8 data type support. Key findings:
+- FP8 uses standard `tcgen05.mma` with `kind::f8f6f4` (not block-scaled)
+- Per-head descale factors (q_descale * k_descale) folded into softmax_scale
+- V descale applied during output normalization
+- `max_offset=8` trick to prevent FP8 underflow
+- e2e softmax polynomial disabled for FP8 (hurts performance)
+
+**Upstream FA4 2-CTA is enabled by default** for hdim∈{128,192}, non-causal, non-split-kv.
+Controlled by `FA_DISABLE_2CTA` env var (`utils.py:60`).
+
+#### Benchmark Results (B200 sm100, hdim=128, non-causal, TFLOPS)
+
+All benchmarks on PR #2109 FP8 branch (`cc52c48f`), except "Our FP4" column which uses our fp4 branch (`1aa24eef`).
+
+| batch | seqlen | BF16 2-CTA | BF16 1-CTA | FP8 2-CTA | FP8 1-CTA | Our FP4 1-CTA |
+|-------|--------|-----------|-----------|----------|----------|---------------|
+| 32    | 512    | 781.7     | 982.7     | 1102.3   | 1117.8   | 991.8         |
+| 16    | 1024   | 1004.2    | 1223.4    | 1390.2   | 1425.6   | 1261.3        |
+| 8     | 2048   | 1154.7    | 1375.0    | 1629.4   | 1639.4   | 1474.0        |
+| 4     | 4096   | 1242.0    | 1457.4    | 1806.0   | 1801.9   | 1635.8        |
+| 2     | 8192   | 1293.7    | 1509.7    | 1913.1   | 1897.7   | 1730.8        |
+| 1     | 16384  | 1316.4    | 1557.8    | **1959.5** | 1939.9 | 1776.9        |
+| 1     | 32768  | 1232.1    | 1503.6    | 1950.1   | **1967.7** | 1792.3      |
+| 4     | 8192   | 1293.1    | 1522.4    | 1942.4   | 1931.5   | 1751.6        |
+
+- **Commits**: PR#2109 `cc52c48f`, our fp4 `1aa24eef`
+- **Command**: `CUTE_DSL_ENABLE_TVM_FFI=1 python /tmp/bench_fp8_branch.py [--fp8] [--disable-2cta]`
+
+**Key observations:**
+1. **BF16: 2-CTA is ~20% slower than 1-CTA** on B200 (1316 vs 1558 peak). Consistent across all shapes.
+2. **FP8: 2-CTA ≈ 1-CTA** (~1960 vs ~1940-1968, within noise). 2-CTA edges out at medium seqlen, 1-CTA at very long seqlen.
+3. **FP8 peak: ~1960 TFLOPS** — matches their claimed ~1950.
+4. **Our FP4 1-CTA: 1792 TFLOPS peak** — 9% behind FP8's ~1960.
+5. **Our FP4 vs their BF16 1-CTA**: Our FP4 is ~15% faster (1792 vs 1558).
+
+**Critical question: why is our FP4 kernel (1792) slower than their FP8 (1960)?**
+- Both use reduced-precision GEMM for QK (FP4 block-scaled vs FP8 standard)
+- FP8 does NOT quantize P — it stays in higher precision for PV GEMM
+- Our FP4 also does NOT quantize P currently (quant code commented out) — PV uses BF16 MMA
+- So the only delta should be QK GEMM: FP4 block-scaled vs FP8 standard
+
+#### Deep dive: FP4 vs FP8 GEMM performance gap
+
+**Pipeline depth**: Both use kv_stage=4 for hdim=128. NOT the issue.
+- Upstream FP8: Q=32KB (FP8) + O=64KB → KV/stage=32KB → (224-96)/32 = 4
+- Our FP4: Q=16KB (FP4) + O=64KB + SF=6KB → KV/stage=32KB (V=BF16 dominates, K aliases V) → 4
+
+**ROOT CAUSE: ~5-9% from outdated base kernel + 0.5-6% from FP4 block-scaled MMA overhead**
+
+Normalized analysis (subtracting base kernel gap) across all shapes:
+
+| shape | BaseGap | FP4/ourBF16 | FP8/upBF16 | NormFP4 | NormGap |
+|---------|---------|------------|------------|---------|---------|
+| 32x512  | 6.2%    | 1.07x      | 1.14x      | 1053    | **6.1%** |
+| 16x1024 | 6.8%    | 1.10x      | 1.17x      | 1347    | **5.8%** |
+| 8x2048  | 6.5%    | 1.14x      | 1.19x      | 1570    | **4.4%** |
+| 4x4096  | 5.1%    | 1.18x      | 1.24x      | 1720    | **4.8%** |
+| 2x8192  | 4.4%    | 1.20x      | 1.26x      | 1807    | **5.0%** |
+| 1x16384 | 5.7%    | 1.21x      | 1.25x      | 1877    | **3.3%** |
+| 1x32768 | 9.2%    | 1.30x      | 1.31x      | 1957    | **0.5%** |
+| 4x8192  | 5.3%    | 1.21x      | 1.27x      | 1844    | **4.7%** |
+
+- **BaseGap** = upstream BF16 / our BF16 (how much faster upstream's base kernel is)
+- **NormFP4** = our FP4 × (upstreamBF16 / ourBF16) — what our FP4 would achieve on upstream's base
+- **NormGap** = how much FP8 still beats normalized FP4 (actual instruction overhead)
+
+Our BF16 re-run numbers: 925, 1146, 1291, 1386, 1446, 1474, 1377, 1446 TFLOPS.
+
+**Pattern**: NormGap is **larger at small seqlen (6%) and shrinks at large seqlen (0.5%)**. This is expected: at small seqlen the kernel is more GEMM-bound (block-scaled MMA overhead matters), at large seqlen it's more memory/softmax-bound (GEMM difference masked).
+
+The **base kernel gap (5-9%)** comes from upstream optimizations we haven't ported:
+- `b2176fd3` — Tune ex2 frequency and registers
+- `c7997621` — Tweak PTX for gemm
+- `dd15c025` — Tune ex2_emu_freq
+- `884a52ae` — More explicit Q loading
+- `98024f90` — CLC work-stealing scheduler
+- Various pipeline cleanup and named barrier refactors
+
+**Conclusion**: The raw 9-13% FP4-vs-FP8 gap decomposes into:
+1. **~5-9% stale fork** — rebasing onto upstream would close this
+2. **~0.5-6% actual FP4 block-scaled overhead** — from SF TMA loads + block-scaled MMA instruction; larger at small seqlen (GEMM-bound), negligible at large seqlen (memory-bound)
+
+---
+
+- [x] **2. Debug: why does removing all quant code still give reasonable diffs?**
+  - With quant code removed, FP4 vs BF16 ref: max_diff=0.1943, mean_diff=0.020350
+  - P scale factors (SFP) should be polluted garbage — gemm_Pi would read FP4 from BF16-formatted data
+
+### Task 2 Findings
+
+**The output IS wrong — but bounded, not NaN/garbage.** Here's why:
+
+**Code flow with P quant commented out (quant_pv=True):**
+1. `tSrS_t2r` = P values loaded from TMEM (correct: exp2 of QK scores)
+2. `apply_exp2_convert(tSrS_t2r)` — modifies S in-place, but does NOT write to `tSrP_r2t`
+3. Lines 3200-3212 COMMENTED OUT — no `_quant_fp4`, no `scale_groupwise`, no SFP R2S copy
+4. `tSrP_r2t_f32` (line 3185) = **uninitialized register fragment** — contains leftover register values
+5. Line 3224-3225: copies `tSrP_r2t_f32` (garbage) to TMEM for PV MMA
+6. sSFP (SMEM) = **uninitialized** — no R2S copy of scale factors was executed
+7. Block-scaled PV MMA reads garbage P data + garbage SFP scale factors + valid FP4 V + valid SFV
+
+**Why the output is "reasonable" (not NaN/random):**
+- **FP4 E2M1 is bounded**: Only 16 possible values per nibble: {0, ±0.5, ±1, ±1.5, ±2, ±3, ±4, ±6}. Even random bit patterns produce finite values in [-6, 6].
+- **E4M3 scale factors are bounded**: Range [~2e-10, 448]. Even garbage bytes produce finite scale values.
+- **Product P_fp4 × SFP is bounded**: At most 6 × 448 = 2688. The PV gemm accumulates these into float32 accumulators — large but finite.
+- **Softmax normalization renormalizes**: The correction loop divides O by row_sum. Even with garbage P weights, the output is a (wrong) weighted average of V values. Since V values are real data, the output stays in the same magnitude range.
+- **max_diff=0.19 is actually large**: For outputs typically in [-0.1, 0.1], this is ~2x the output magnitude. The output is WRONG but BOUNDED.
+
+**Verification**: The `force_fp4_impl bf16 test` (which runs quant_pv=False with BF16 P, same FP4 QK) shows exact element-wise matches — confirming the FP4 QK path is correct and the diffs come specifically from the garbage PV block-scaled MMA.
+
+**Conclusion**: The "reasonable" diffs are an artifact of FP4 bounded arithmetic + softmax normalization. The output is numerically wrong but doesn't produce NaN/inf. This is expected behavior for garbage-in-bounded-out MMA pipelines.
+
+- [ ] **3. Integrate 2-CTA gemm instructions from FA4 main branch**
+  - **UPDATE**: 2-CTA is slower on our B200 hardware (see Task 1 benchmarks above)
+  - Main FA4 (flash_fwd_sm100.py) has full 2-CTA support on `public/main` (20+ commits ahead)
+  - PR #2109 does NOT switch CTA groups — upstream already has it
+  - Upstream `use_2cta_instrs` enabled for hdim∈{128,192}, non-causal, non-split-kv
+  - Our flash_fwd_sm100_fp4.py has skeleton at line 885-886 but asserts False
+
+### Task 3 Analysis
+
+**2-CTA is SLOWER on our B200** (see Task 1 benchmarks). Upstream BF16 1-CTA (peak 1557) > 2-CTA (peak 1315). The FP8 PR reaches 1952 TFLOPS because FP8 has 2x MMA throughput which more than compensates for the 2-CTA overhead.
+
+**Integration scope is massive** — 20+ components need changes:
+- MMA tiler M doubles (128→256)
+- Cluster shape (1,1)→(2,1), SMEM KV per stage halved (peer CTA has other half)
+- TMA multicast to both CTAs, TMA copy bytes doubled
+- Grid scheduling: cluster_idx vs block_idx, m_tile_idx recomputed
+- mma_tile_coord_v = bidx % thr_id.shape for each CTA's row ownership
+- TmemAllocator needs is_two_cta + tmem_dealloc_mbar_ptr in SharedStorage
+- Cluster cooperative groups with doubled thread counts
+- pipeline_init_arrive/wait with cluster shape
+- gO partitioning: flat_divide by mma_tiler_pv[0]//cta_group_size
+- get_tmem_load_op: use_2cta_instrs=True
+- All gemm_ptx_* already wired for cta_group param (just needs value=2)
+- Block-scaled SFB instruction shape: M halved per CTA (already coded at line 1172)
+
+**Recommendation**: Skip 2-CTA integration. Focus on porting other upstream optimizations (pipeline improvements, CLC scheduler) which may explain the 1475→1557 TFLOPS gap between our BF16 and upstream 1-CTA BF16.
+
+  - **Commit**: N/A (not implemented)
+  - **Command**: N/A
+
+- [x] **4. Remove duplicated softmax classes from FP4 kernel**
+  - FP4 kernel (`flash_fwd_sm100_fp4.py`) had its own copy of `Softmax` (line 110) and `SoftmaxSm100` (line 254)
+  - Main softmax lives in `softmax.py` with identical `Softmax` base class and `SoftmaxSm100`
+
+### Task 4 Findings & Changes
+
+**Removed 437 lines** from `flash_fwd_sm100_fp4.py`:
+- Local `mul_packed_f32x2`, `add_packed_f32x2` helpers (used `calc_packed_f32x2_op` without explicit RN rounding)
+- Local `fadd_reduce` function (identical logic to `utils.fadd_reduce`)
+- Full `Softmax` base class copy (identical to `softmax.py`)
+- Full `SoftmaxSm100` copy with FP4-specific extras
+
+**Added to `softmax.py`**:
+- `scale_groupwise()` method on `SoftmaxSm100` — normalizes P by per-group max before FP4 quantization (was in FP4 copy, currently commented out in usage but needed for future quant_pv work)
+
+**Changed imports in `flash_fwd_sm100_fp4.py`**:
+- `from flash_attn.cute.softmax import apply_score_mod_inner` → `from flash_attn.cute.softmax import SoftmaxSm100, apply_score_mod_inner`
+
+**Analysis of removed methods**:
+- `scale_groupwise`: Moved to softmax.py (commented out in usage at line 3202 but design-required)
+- `update_row_sum_sage`: Already exists in softmax.py (slightly different signature — FP4 had extra `group_max_layout` param, but this method was never called)
+- `apply_sage_sp1`: Dead code (referenced `self.sp1_scale` which isn't in the dataclass), not moved
+- `fadd_reduce`: Identical to `utils.fadd_reduce`, used via `Softmax._compute_row_sum` which calls `utils.fadd_reduce` in the softmax.py version
+
+**Rounding difference**: The local `mul_packed_f32x2`/`add_packed_f32x2` used default rounding (RZ) while `utils.*` versions use RN. This difference is negligible for softmax computation and both BF16 and FP4 paths produce identical numerical results.
+
+**Test results** (no regressions):
+- BF16 FA4: OK
+- FP4 (quant_qk): max_diff=0.0295, mean_diff=0.001606 (identical to before)
+- FP4 (quant_v): max_diff=0.0718, mean_diff=0.007285, 1869 TFLOPS (identical to before)
+- **Command**: `CUTE_DSL_ENABLE_TVM_FFI=1 python -m flash_attn.cute.benchmarks.bench_fp4 --quant_v`
+
+---
+
+## Precision: FP4 quant_qk vs FP8 (both vs BF16 reference)
+
+Same random seed (42), same shapes. FP4 = our quant_qk kernel, FP8 = PR#2109 branch.
+
+| batch | seqlen | nheads | hdim | FP4 max | FP4 mean | FP8 max | FP8 mean |
+|-------|--------|--------|------|---------|----------|---------|----------|
+| 1 | 256 | 16 | 128 | 0.158 | 0.01058 | 0.352 | 0.00591 |
+| 1 | 512 | 16 | 128 | 0.148 | 0.00771 | 0.379 | 0.00555 |
+| 1 | 1024 | 16 | 128 | 0.070 | 0.00553 | 0.260 | 0.00463 |
+| 1 | 2048 | 16 | 128 | 0.078 | 0.00395 | 0.184 | 0.00372 |
+| 2 | 4096 | 16 | 128 | 0.068 | 0.00280 | 0.136 | 0.00286 |
+| 1 | 4096 | 24 | 128 | 0.043 | 0.00280 | 0.132 | 0.00284 |
+| 1 | 8192 | 24 | 128 | 0.033 | 0.00199 | 0.075 | 0.00213 |
+| 1 | 16384 | 16 | 128 | 0.025 | 0.00141 | 0.044 | 0.00157 |
+| 1 | 32768 | 16 | 128 | **0.011** | **0.00100** | 0.022 | 0.00114 |
+| 1 | 32768 | 24 | 128 | **0.016** | **0.00100** | 0.031 | 0.00114 |
+
+**FP4 quant_qk has ~2-2.5x lower max_diff than FP8 across all shapes**, with comparable mean_diff. FP4 block-scaled with per-group scale factors preserves more dynamic range than a simple FP8 per-tensor cast.
+
+- **Command**: `CUTE_DSL_ENABLE_TVM_FFI=1 python /tmp/bench_fp4_precision.py` and `python /tmp/bench_fp8_precision.py`
