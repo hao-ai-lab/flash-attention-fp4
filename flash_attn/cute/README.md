@@ -117,7 +117,7 @@ CUTE_DSL_ENABLE_TVM_FFI=1 python benchmarks/bench_fp4.py --qk_mode mxfp8 --pv_mo
 
 ## Precision (vs BF16 flash_attn_func reference)
 
-Each cell: cos_sim / max_diff / mean_diff. NVFP4 uses flashinfer `nvfp4_quantize` (adaptive per-block SF). MXFP8 uses torch-native FP8 + uniform E8M0 SF. B200 sm_100a, cutlass-dsl 4.4.2.
+Each cell: cos_sim / max_diff / mean_diff. NVFP4 uses flashinfer `nvfp4_quantize` (adaptive per-block SF). MXFP8 uses flashinfer `mxfp8_quantize` (per-group E8M0 SF). B200 sm_100a, cutlass-dsl 4.4.2. **—** = unsupported (MXFP8 requires headdim ≥ 128).
 
 | Config (b,s,h,d) | NVFP4+BF16 | NVFP4+FP8 | MXFP8+FP8 |
 |---|---|---|---|
