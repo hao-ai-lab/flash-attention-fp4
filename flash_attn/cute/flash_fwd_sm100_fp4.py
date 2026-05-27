@@ -27,7 +27,7 @@ from cutlass import Float32, Int32, const_expr, Float8E4M3FN, Float8E5M2, Float8
 from cutlass.cute.nvgpu import cpasync
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
-from flash_attn.cute.modified_utils.block_scaled_layout_test import make_smem_layout_sfa, make_smem_layout_sfb
+from flash_attn.cute.blackwell_helpers import make_smem_layout_sfa, make_smem_layout_sfb, BlockScaledBasicChunk
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from flash_attn.cute.paged_kv import PagedKVManager
 import flash_attn.cute.utils as utils
