@@ -72,10 +72,27 @@ python -c "import flash_attn.cute.interface; print(flash_attn.cute.interface.__f
 
 ```bash
 cd examples/python/CuTeDSL/blackwell/flash-attention/flash_attn/cute
-CUTE_DSL_ENABLE_TVM_FFI=1 python benchmarks/bench_fp4.py          # QK quantized
-CUTE_DSL_ENABLE_TVM_FFI=1 python benchmarks/bench_fp4.py --quant_v # QKV quantized
-CUTE_DSL_ENABLE_TVM_FFI=1 python benchmarks/bench_fp4.py --debug   # correctness test
+CUTE_DSL_ENABLE_TVM_FFI=1 python benchmarks/bench_fp4.py --qk_mode nvfp4 --pv_mode bf16
+CUTE_DSL_ENABLE_TVM_FFI=1 python benchmarks/bench_fp4.py --qk_mode nvfp4 --pv_mode fp8
+CUTE_DSL_ENABLE_TVM_FFI=1 python benchmarks/bench_fp4.py --qk_mode mxfp8 --pv_mode fp8
 ```
+
+## Precision (vs BF16 flash_attn_func reference)
+
+Each cell: cos_sim / max_diff / mean_diff. NVFP4 uses flashinfer `nvfp4_quantize` (adaptive per-block SF). MXFP8 uses torch-native FP8 + uniform E8M0 SF. B200 sm_100a, cutlass-dsl 4.4.2.
+
+| Config (b,s,h,d) | NVFP4+BF16 | NVFP4+FP8 | MXFP8+FP8 |
+|---|---|---|---|
+| (1,256,16,128) | 0.9910 / 0.1562 / 0.0106 | 0.9904 / 0.1475 / 0.0109 | 0.9986 / 0.0605 / 0.0042 |
+| (1,1024,16,128) | 0.9908 / 0.1846 / 0.0055 | 0.9901 / 0.2119 / 0.0057 | 0.9986 / 0.0459 / 0.0022 |
+| (4,4096,16,128) | 0.9906 / 0.0445 / 0.0028 | 0.9899 / 0.0432 / 0.0029 | 0.9985 / 0.0215 / 0.0011 |
+| (1,32768,16,128) | 0.9904 / 0.0112 / 0.0010 | 0.9897 / 0.0122 / 0.0010 | 0.9985 / 0.0057 / 0.0004 |
+| (4,4096,32,128) | 0.9905 / 0.0605 / 0.0028 | 0.9898 / 0.0713 / 0.0029 | 0.9985 / 0.0225 / 0.0011 |
+| (1,4096,12,128) | 0.9906 / 0.0674 / 0.0028 | 0.9899 / 0.0771 / 0.0029 | 0.9985 / 0.0146 / 0.0011 |
+| (1,32768,12,128) | 0.9903 / 0.0175 / 0.0010 | 0.9896 / 0.0194 / 0.0010 | 0.9985 / 0.0042 / 0.0004 |
+| (1,4096,24,128) | 0.9905 / 0.0586 / 0.0028 | 0.9898 / 0.0645 / 0.0029 | 0.9985 / 0.0215 / 0.0011 |
+| (1,32768,24,128) | 0.9905 / 0.0115 / 0.0010 | 0.9899 / 0.0142 / 0.0010 | 0.9985 / 0.0046 / 0.0004 |
+| (1,32768,24,64) | 0.9899 / 0.0215 / 0.0010 | 0.9892 / 0.0223 / 0.0011 | — |
 
 ## Pipeline Graph (scale factor TMEM overlap schedule)
 ![pipeline graph](figures/pipeline.png)
