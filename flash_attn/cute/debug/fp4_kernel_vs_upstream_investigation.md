@@ -287,48 +287,51 @@ Two approaches for block-scaled V with per-128 group scale factors:
 
 **(b) Softmax-scale fusion** (plain FP8/BF16 V, fold V descale into softmax_scale): No extra infrastructure. V stays in standard dtype. Per-head V descale multiplied into softmax_scale during online softmax normalization.
 
-### Results (bench_fp4.py, B200 GPU1, uniform SF=1.0)
+### Results (bench_fp4.py, B200 GPU1)
 
 | Approach | Mode | Peak TFLOPS | cos_sim | max_diff |
 |----------|------|------------|---------|----------|
-| **(b) Plain FP8 V** | NVFP4+FP8 | **2031** | **0.976** | 0.032 |
-| **(b) Plain BF16 V** | NVFP4+BF16 | **1936** | **0.976** | 0.029 |
+| **(b) Plain FP8 V** | NVFP4+FP8 | **1948** | **0.990** | 0.043 |
+| **(b) Plain BF16 V** | NVFP4+BF16 | **1809** | **0.991** | 0.045 |
 | (a) Block-scaled FP4 V | NVFP4+FP4 | 1261 | 0.790 | 0.112 |
 
-**Winner: Approach (b) — softmax-scale fusion.** 61% faster (2031 vs 1261 TF) and 24% more precise (cos 0.976 vs 0.790) than block-scaled FP4 PV. Block-scaled PV MMA adds ~40% overhead from SF TMA loads and S2T copies while degrading precision from double FP4 quantization (Q→FP4, K→FP4, V→FP4).
+**Winner: Approach (b) — softmax-scale fusion.** ~55% faster and much more precise (cos 0.99 vs 0.79) than block-scaled FP4 PV. Block-scaled PV MMA adds ~40% overhead from SF TMA loads and S2T copies while degrading precision from double FP4 quantization.
 
-Note: cos_sim differences are amplified by uniform SF=1.0 (no per-block rescaling). With adaptive SFs, FP4 PV cos would improve to ~0.95, but TFLOPS gap would persist. FP8 PV with group-128 pre-expanded to group-32 would land between the two rows but still slower than plain FP8 V.
+Note: NVFP4 cos 0.990-0.991 uses flashinfer adaptive per-block SF (amax/6). Previous table showed 0.976 due to uniform SF=1.0 (no dynamic range adaptation). TFLOPS measured on shared GPU (lower bound).
 
 ---
 
 ## Precision: All Mixed-Precision Modes vs BF16 Reference
 
-Each cell: cos_sim / max_diff / mean_diff. Bench uses `cute_tensor_like` + `convert_cute_tensor` with uniform SF=1.0.
+Commit `e7d6527e` (fp4-rebase), cutlass-dsl 4.4.2, B200 sm_100a.
+NVFP4 uses flashinfer `nvfp4_quantize` (adaptive per-block SF = amax/6 per 16-elem block).
+MXFP8 uses torch-native FP8 + uniform E8M0 SF=1.0.
+Command: `PYTHONPATH=$(pwd) python -m flash_attn.cute.benchmarks.bench_fp4 --qk_mode <mode> --pv_mode <pv>`
 
-| Config (b,s,h,d) | NVFP4+BF16 | NVFP4+FP8 | MXFP8+FP8 |
-|------------------|------------|-----------|-----------|
-| (1,256,16,128) | 0.9773 / 0.2673 / 0.016967 | 0.9766 / 0.2690 / 0.017197 | 0.9986 / 0.0703 / 0.004174 |
-| (1,1024,16,128) | 0.9771 / 0.1289 / 0.008787 | 0.9764 / 0.1309 / 0.008907 | 0.9986 / 0.0381 / 0.002163 |
-| (4,4096,16,128) | 0.9765 / 0.1250 / 0.004459 | 0.9758 / 0.1152 / 0.004520 | 0.9985 / 0.0215 / 0.001107 |
-| (1,32768,16,128) | 0.9762 / 0.0291 / 0.001587 | 0.9756 / 0.0320 / 0.001609 | 0.9985 / 0.0048 / 0.000394 |
-| (4,4096,32,128) | 0.9764 / 0.1416 / 0.004462 | 0.9758 / 0.1250 / 0.004523 | 0.9985 / 0.0225 / 0.001106 |
-| (1,4096,12,128) | 0.9766 / 0.0713 / 0.004458 | 0.9759 / 0.0742 / 0.004519 | 0.9985 / 0.0205 / 0.001105 |
-| (1,32768,12,128) | 0.9759 / 0.0254 / 0.001586 | 0.9752 / 0.0234 / 0.001608 | 0.9985 / 0.0046 / 0.000393 |
-| (1,4096,24,128) | 0.9763 / 0.0796 / 0.004465 | 0.9756 / 0.0737 / 0.004526 | 0.9985 / 0.0195 / 0.001105 |
-| (1,32768,24,128) | 0.9765 / 0.0211 / 0.001586 | 0.9758 / 0.0217 / 0.001608 | 0.9985 / 0.0056 / 0.000393 |
-| (1,32768,24,64) | 0.9755 / 0.0421 / 0.001607 | 0.9748 / 0.0402 / 0.001631 | — |
+| Config (b,s,h,d) | NVFP4+BF16 cos | NVFP4+FP8 cos | MXFP8+FP8 cos |
+|------------------|----------------|---------------|---------------|
+| (1,256,16,128) | 0.9910 | 0.9904 | 0.9986 |
+| (1,1024,16,128) | 0.9908 | 0.9901 | 0.9986 |
+| (4,4096,16,128) | 0.9906 | 0.9899 | 0.9985 |
+| (1,32768,16,128) | 0.9904 | 0.9897 | 0.9985 |
+| (4,4096,32,128) | 0.9905 | 0.9898 | 0.9985 |
+| (1,4096,12,128) | 0.9906 | 0.9899 | 0.9985 |
+| (1,32768,12,128) | 0.9903 | 0.9896 | 0.9985 |
+| (1,4096,24,128) | 0.9905 | 0.9898 | 0.9985 |
+| (1,32768,24,128) | 0.9905 | 0.9899 | 0.9985 |
+| (1,32768,24,64) | 0.9899 | 0.9892 | — |
 
-MXFP8 has much lower error (cos=0.9985) than NVFP4 (cos=0.976) due to 8-bit vs 4-bit QK quantization.
+NVFP4 cos ~0.990 flat across all shapes (adaptive per-block SF). Previous 0.976 was from
+uniform SF=1.0 quantization (no dynamic range adaptation). MXFP8 cos ~0.9985 (uniform
+E8M0 SF=1.0 → effectively plain FP8 GEMM; with adaptive SF expect ~0.999+).
 
-**Bench precision context**: The bench uses `cute_tensor_like` + `convert_cute_tensor` with **uniform SF=1.0** (no per-block adaptive scaling). This is a simplified quantization that tests the kernel in isolation. With production per-block quantization (e.g., FastVideo's `nvfp4_quantize` which computes SF = amax/max_fp4 per block), NVFP4 achieves cos >= 0.99. The `cvt_sf_MKL_to_M32x4xrm_K4xrk_L` layout conversion only supports uniform SF values; per-block adaptive SF requires a different SF tensor creation path not yet in the bench.
-
-TFLOPS (peak shapes, B200):
+TFLOPS (B200, shared GPU — lower bound due to thermal/contention):
 | Mode | Peak TFLOPS | Shape |
 |------|------------|-------|
-| NVFP4+BF16 | 1936 | (1,32768,24,128) |
-| NVFP4+FP8 | **2031** | (1,32768,24,128) |
-| MXFP8+FP8 | 1960 | (1,32768,24,128) |
-| BF16 ref | 1557 | (1,32768,24,128) |
+| NVFP4+BF16 | 1809 | (1,32768,16,128) |
+| NVFP4+FP8 | **1948** | (1,32768,24,128) |
+| MXFP8+FP8 | 1881 | (1,32768,24,128) |
+| BF16 ref | 1542 | (1,32768,16,128) |
 
 - **Commit**: current fp4 branch, **GPU**: B200
 - **Command**: `CUDA_VISIBLE_DEVICES=1 CUTE_DSL_ENABLE_TVM_FFI=1 python -m flash_attn.cute.benchmarks.bench_fp4 --qk_mode {nvfp4,mxfp8} --pv_mode {bf16,fp8}`
