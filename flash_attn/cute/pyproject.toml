@@ -43,9 +43,9 @@ dev = [
 Homepage = "https://github.com/Dao-AILab/flash-attention"
 Repository = "https://github.com/Dao-AILab/flash-attention"
 
-[tool.setuptools.packages.find]
-where = ["../.."]
-include = ["flash_attn.cute*"]
+[tool.setuptools]
+packages = ["flash_attn.cute"]
+package-dir = {"flash_attn.cute" = "."}
 
 [tool.setuptools_scm]
 root = "../.."
