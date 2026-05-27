@@ -533,6 +533,112 @@ def create_blockscaled_attention_tensors(
         )
 
 
+def create_nvfp4_attention_tensors(
+    batch,
+    seqlen_q,
+    seqlen_k,
+    nheads,
+    nheads_kv,
+    headdim,
+    headdim_v,
+    device="cuda",
+    dtype_gen=torch.bfloat16,
+    pv_mode="bf16",
+    pv_fp8_dtype=None,
+):
+    """Create NVFP4 tensors using flashinfer's nvfp4_quantize (adaptive per-block SF)."""
+    from flashinfer.quantization import nvfp4_quantize, SfLayout
+
+    sf_vec_size = 16
+    tile_m = 128
+
+    q_ref = torch.randn(batch, seqlen_q, nheads, headdim, device=device, dtype=torch.float32)
+    k_ref = torch.randn(batch, seqlen_k, nheads_kv, headdim, device=device, dtype=torch.float32)
+    v_ref = torch.randn(batch, seqlen_k, nheads_kv, headdim_v, device=device, dtype=torch.float32)
+
+    def _quantize_and_reshape_sf(ref, batch_, seqlen_, nheads_, headdim_):
+        t2d = ref.to(dtype_gen).reshape(batch_ * seqlen_, nheads_ * headdim_)
+        one = torch.ones(1, device=device, dtype=torch.float32)
+        fp4_data, sf_data = nvfp4_quantize(
+            t2d, one, sfLayout=SfLayout.layout_128x4, do_shuffle=False
+        )
+        fp4 = (
+            fp4_data.reshape(batch_, seqlen_, nheads_, headdim_ // 2)
+            .view(torch.uint8)
+            .view(torch.float4_e2m1fn_x2)
+        )
+        rest_m = seqlen_ // tile_m
+        sf_k = headdim_ // sf_vec_size
+        rest_k = sf_k // 4
+        total_m = batch_ * rest_m
+        total_k = (nheads_ * sf_k) // 4
+        sf = sf_data.reshape(total_m, total_k, 32, 4, 4)
+        sf = sf.reshape(batch_, rest_m, nheads_, rest_k, 32, 4, 4)
+        sf = sf.permute(0, 2, 1, 3, 4, 5, 6).contiguous().permute(4, 5, 2, 6, 3, 1, 0)
+        return fp4, sf
+
+    q_fp4, q_sf = _quantize_and_reshape_sf(q_ref, batch, seqlen_q, nheads, headdim)
+    k_fp4, k_sf = _quantize_and_reshape_sf(k_ref, batch, seqlen_k, nheads_kv, headdim)
+
+    if pv_mode == "fp8":
+        _fp8 = pv_fp8_dtype or cutlass.Float8E4M3FN
+        _torch_fp8 = torch.float8_e4m3fn if _fp8 == cutlass.Float8E4M3FN else torch.float8_e5m2
+        v_tensor = v_ref.to(dtype_gen).to(_torch_fp8)
+    else:
+        v_tensor = v_ref.to(dtype_gen)
+
+    return q_fp4, k_fp4, v_tensor, q_sf, k_sf, None, q_ref, k_ref, v_ref
+
+
+def create_mxfp8_attention_tensors(
+    batch,
+    seqlen_q,
+    seqlen_k,
+    nheads,
+    nheads_kv,
+    headdim,
+    headdim_v,
+    device="cuda",
+    dtype_gen=torch.bfloat16,
+    pv_mode="bf16",
+    pv_fp8_dtype=None,
+):
+    """Create MXFP8 tensors using flashinfer's mxfp8_quantize (adaptive per-group SF)."""
+    from flashinfer.quantization import mxfp8_quantize, SfLayout
+
+    sf_vec_size = 32
+    tile_m = 128
+
+    q_ref = torch.randn(batch, seqlen_q, nheads, headdim, device=device, dtype=torch.float32)
+    k_ref = torch.randn(batch, seqlen_k, nheads_kv, headdim, device=device, dtype=torch.float32)
+    v_ref = torch.randn(batch, seqlen_k, nheads_kv, headdim_v, device=device, dtype=torch.float32)
+
+    def _quantize_and_reshape_sf(ref, batch_, seqlen_, nheads_, headdim_):
+        t2d = ref.to(dtype_gen).reshape(batch_ * seqlen_, nheads_ * headdim_)
+        fp8_data, sf_data = mxfp8_quantize(t2d, sf_swizzle_layout=SfLayout.layout_128x4)
+        fp8 = fp8_data.reshape(batch_, seqlen_, nheads_, headdim_)
+        rest_m = seqlen_ // tile_m
+        sf_k = headdim_ // sf_vec_size
+        rest_k = sf_k // 4
+        total_m = batch_ * rest_m
+        total_k = (nheads_ * sf_k) // 4
+        sf = sf_data.reshape(total_m, total_k, 32, 4, 4)
+        sf = sf.reshape(batch_, rest_m, nheads_, rest_k, 32, 4, 4)
+        sf = sf.permute(0, 2, 1, 3, 4, 5, 6).contiguous().permute(4, 5, 2, 6, 3, 1, 0)
+        return fp8, sf
+
+    q_fp8, q_sf = _quantize_and_reshape_sf(q_ref, batch, seqlen_q, nheads, headdim)
+    k_fp8, k_sf = _quantize_and_reshape_sf(k_ref, batch, seqlen_k, nheads_kv, headdim)
+
+    if pv_mode == "fp8":
+        _fp8 = pv_fp8_dtype or cutlass.Float8E4M3FN
+        _torch_fp8 = torch.float8_e4m3fn if _fp8 == cutlass.Float8E4M3FN else torch.float8_e5m2
+        v_tensor = v_ref.to(dtype_gen).to(_torch_fp8)
+    else:
+        v_tensor = v_ref.to(dtype_gen)
+    return q_fp8, k_fp8, v_tensor, q_sf, k_sf, None, q_ref, k_ref, v_ref
+
+
 def time_fwd(func, *args, repeats=10, verbose=True, desc="", **kwargs):
     """Time forward pass via triton.testing.do_bench.
 
@@ -609,6 +715,9 @@ def main(
     print(f"QK sf_vec_size: {sf_vec_size}")
     print("=" * 80)
 
+    use_nvfp4 = ab_dtype == cutlass.Float4E2M1FN and pv_mode != "fp4"
+    use_mxfp8 = ab_dtype == cutlass.Float8E4M3FN and pv_mode != "fp4"
+
     for batch_size, seqlen, nheads, headdim in configs:
         nheads_kv = nheads
         headdim_v = headdim
@@ -617,29 +726,63 @@ def main(
 
         print(f"\n### Batch={batch_size}, SeqLen={seqlen}, Nheads={nheads}, Headdim={headdim} ###")
 
-        # Create block-scaled Q/K tensors plus the requested V mode.
-        (q_fp4, k_fp4, v_tensor, q_sf, k_sf, v_sf, q_ref, k_ref, v_ref) = (
-            create_blockscaled_attention_tensors(
-                batch_size,
-                seqlen_q,
-                seqlen,
-                nheads,
-                nheads_kv,
-                headdim,
-                headdim_v,
-                device,
-                dtype_gen,
-                pv_mode=pv_mode,
-                return_torch=False,
-                ab_dtype=ab_dtype,
-                sf_dtype=sf_dtype,
-                sf_vec_size=sf_vec_size,
-                pv_fp8_dtype=pv_fp8_dtype,
-                debug=debug,
+        if use_nvfp4:
+            (q_fp4, k_fp4, v_tensor, q_sf, k_sf, v_sf, q_ref, k_ref, v_ref) = (
+                create_nvfp4_attention_tensors(
+                    batch_size,
+                    seqlen_q,
+                    seqlen,
+                    nheads,
+                    nheads_kv,
+                    headdim,
+                    headdim_v,
+                    device,
+                    dtype_gen,
+                    pv_mode=pv_mode,
+                    pv_fp8_dtype=pv_fp8_dtype,
+                )
             )
-        )
-        q_sf_torch = check_tensor_for_nans(q_sf, name="q_sf")
-        k_sf_torch = check_tensor_for_nans(k_sf, name="k_sf")
+        elif use_mxfp8:
+            (q_fp4, k_fp4, v_tensor, q_sf, k_sf, v_sf, q_ref, k_ref, v_ref) = (
+                create_mxfp8_attention_tensors(
+                    batch_size,
+                    seqlen_q,
+                    seqlen,
+                    nheads,
+                    nheads_kv,
+                    headdim,
+                    headdim_v,
+                    device,
+                    dtype_gen,
+                    pv_mode=pv_mode,
+                    pv_fp8_dtype=pv_fp8_dtype,
+                )
+            )
+        else:
+            (q_fp4, k_fp4, v_tensor, q_sf, k_sf, v_sf, q_ref, k_ref, v_ref) = (
+                create_blockscaled_attention_tensors(
+                    batch_size,
+                    seqlen_q,
+                    seqlen,
+                    nheads,
+                    nheads_kv,
+                    headdim,
+                    headdim_v,
+                    device,
+                    dtype_gen,
+                    pv_mode=pv_mode,
+                    return_torch=False,
+                    ab_dtype=ab_dtype,
+                    sf_dtype=sf_dtype,
+                    sf_vec_size=sf_vec_size,
+                    pv_fp8_dtype=pv_fp8_dtype,
+                    debug=debug,
+                )
+            )
+
+        if not use_nvfp4 and not use_mxfp8:
+            q_sf_torch = check_tensor_for_nans(q_sf, name="q_sf")
+            k_sf_torch = check_tensor_for_nans(k_sf, name="k_sf")
 
         if pv_mode == "fp4":
             v_sf_torch = check_tensor_for_nans(v_sf, name="v_sf")
@@ -781,8 +924,12 @@ def main(
                 has_nan = fp4_cmp.isnan().any().item()
                 max_diff = abs_diff.max().item()
                 mean_diff = abs_diff.mean().item()
+                cos_sim = torch.nn.functional.cosine_similarity(
+                    fp4_cmp.float().flatten().unsqueeze(0),
+                    ref_cmp.float().flatten().unsqueeze(0),
+                ).item()
                 print(
-                    f"  FP4 vs ref: max_diff={max_diff:.4f}, mean_diff={mean_diff:.6f}, has_nan={has_nan}"
+                    f"  FP4 vs ref: cos_sim={cos_sim:.6f}, max_diff={max_diff:.4f}, mean_diff={mean_diff:.6f}, has_nan={has_nan}"
                 )
                 # FP4 quantization error: max_diff~2-3, mean_diff~0.03-0.09 with SF=1.0
                 if debug:
