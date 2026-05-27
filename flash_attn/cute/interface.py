@@ -764,6 +764,8 @@ def _flash_attn_fwd(
         fa_logging.get_fa_log_level(),
         mSFQ is not None,
         _sf_vec_size if mSFQ is not None else None,
+        _sf_dtype if mSFQ is not None else None,
+        v.dtype if mSFQ is not None else None,
         is_fp4,
         (batch_size, num_head, seqlen_q, seqlen_k) if is_fp4 else None,
     )
