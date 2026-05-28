@@ -970,7 +970,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--pv_mode",
         choices=["bf16", "fp4", "fp8"],
-        default=None,
+        default="bf16",
         help="PV path: bf16 baseline V, fp4 block-scaled V, or pure fp8 V",
     )
     parser.add_argument(
