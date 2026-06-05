@@ -20,6 +20,11 @@ from cutlass.cute.runtime import from_dlpack
 
 import quack.activation
 
+# cute.arch.{fma,mul,add}_packed_f32x2 uses RZ rounding mode by default
+fma_packed_f32x2 = partial(cute.arch.fma_packed_f32x2, rnd=nvvm.RoundingModeKind.RN)
+mul_packed_f32x2 = partial(cute.arch.mul_packed_f32x2, rnd=nvvm.RoundingModeKind.RN)
+add_packed_f32x2 = partial(cute.arch.add_packed_f32x2, rnd=nvvm.RoundingModeKind.RN)
+
 _MIXER_ATTRS = ("__vec_size__",)
 
 # Obtained from sollya:
@@ -244,27 +249,6 @@ def convert_from_dlpack_compact_dynamic(
             divisibility=divisibility,
         )
     return t
-
-
-def parse_swizzle_from_pointer(ptr: cute.Pointer) -> cute.Swizzle:
-    """Extract swizzle parameters from a pointer's swizzle_type.
-
-    The swizzle_type string has the form '!cute.swizzle<"S<b,m,s>">' where
-    b, m, s are the swizzle parameters (bits, base, shift).
-
-    Returns:
-        A cute.Swizzle object constructed from the extracted parameters
-
-    Raises:
-        ValueError: If the swizzle_type string cannot be parsed
-    """
-    swizzle_str = str(ptr.type.swizzle_type)
-    match = re.search(r"S<(\d+),(\d+),(\d+)>", swizzle_str)
-    if match:
-        b, m, s = int(match.group(1)), int(match.group(2)), int(match.group(3))
-        return cute.make_swizzle(b, m, s)
-    else:
-        raise ValueError(f"Could not parse swizzle_type: {swizzle_str}")
 
 
 def convert_from_dlpack_leading_static(
@@ -973,18 +957,200 @@ def ssa_to_scalar(val):
     return val[0]
 
 
+# ---------------------------------------------------------------------------
+# FP4-specific helpers
+# ---------------------------------------------------------------------------
+
+
+def parse_swizzle_from_pointer(ptr: cute.Pointer) -> cute.Swizzle:
+    """Extract swizzle parameters from a pointer's swizzle_type.
+
+    The swizzle_type string has the form '!cute.swizzle<"S<b,m,s>">' where
+    b, m, s are the swizzle parameters (bits, base, shift).
+
+    Returns:
+        A cute.Swizzle object constructed from the extracted parameters
+
+    Raises:
+        ValueError: If the swizzle_type string cannot be parsed
+    """
+    swizzle_str = str(ptr.type.swizzle_type)
+    match = re.search(r"S<(\d+),(\d+),(\d+)>", swizzle_str)
+    if match:
+        b, m, s = int(match.group(1)), int(match.group(2)), int(match.group(3))
+        return cute.make_swizzle(b, m, s)
+    else:
+        raise ValueError(f"Could not parse swizzle_type: {swizzle_str}")
+
+
+def convert_layout_acc_mn(acc_layout: cute.Layout, transpose: bool = False) -> cute.Layout:
+    """
+    For Sm80, convert ((2, 2), MMA_M, MMA_N, ...) to ((2, MMA_M), (2, MMA_N), ...).
+    For Sm90, convert ((2, 2, V), MMA_M, MMA_N, ...) to ((2, MMA_M), (2, V, MMA_N), ...).
+    """
+    acc_layout_col_major = cute.make_layout(acc_layout.shape)
+    shape = (
+        (acc_layout_col_major.shape[0][1], acc_layout_col_major.shape[1]),  # MMA_M
+        (
+            acc_layout_col_major.shape[0][0],
+            *acc_layout_col_major.shape[0][2:],
+            acc_layout_col_major.shape[2],
+        ),  # MMA_N
+        *acc_layout_col_major.shape[3:],
+    )
+    stride = (
+        (acc_layout_col_major.stride[0][1], acc_layout_col_major.stride[1]),  # MMA_M
+        (
+            acc_layout_col_major.stride[0][0],
+            *acc_layout_col_major.stride[0][2:],
+            acc_layout_col_major.stride[2],
+        ),  # MMA_N
+        *acc_layout_col_major.stride[3:],
+    )
+    if const_expr(transpose):
+        shape = (shape[1], shape[0], *shape[2:])
+        stride = (stride[1], stride[0], *stride[2:])
+    acc_layout_mn = cute.make_layout(shape, stride=stride)
+    return cute.composition(acc_layout, acc_layout_mn)
+
+
+def make_acc_tensor_mn_view(acc: cute.Tensor, transpose: bool = False) -> cute.Tensor:
+    return cute.make_tensor(acc.iterator, convert_layout_acc_mn(acc.layout, transpose=transpose))
+
+
 @cute.jit
-def get_batch_from_cu_tensor(idx: Int32, cu_tensor: cute.Tensor) -> Int32:
-    """Binary search to determine batch from packed index in a cumulative tensor"""
-    batch_size = cute.size(cu_tensor) - 1
-    lo = Int32(0)
-    hi = batch_size
+def convert_layout_acc_frgA(acc_layout: cute.Layout) -> cute.Layout:
+    # For back to back gemm, convert layout of acc0 to gemm 1 accept layout.
+    if const_expr(cute.rank(acc_layout.shape[0]) == 3):  # Sm90
+        l = cute.logical_divide(acc_layout, ((None, None, 2), None, None))
+        rA_mma_view = cute.make_layout(
+            (
+                (l.shape[0][0], l.shape[0][1], l.shape[0][2][0]),
+                l.shape[1],
+                (l.shape[0][2][1], l.shape[2]),
+            ),
+            stride=(
+                (l.stride[0][0], l.stride[0][1], l.stride[0][2][0]),
+                l.stride[1],
+                (l.stride[0][2][1], l.stride[2]),
+            ),
+        )
+    else:  # Sm80
+        l = cute.logical_divide(acc_layout, (None, None, 2))
+        rA_mma_view = cute.make_layout(
+            (
+                (l.shape[0], l.shape[2][0]),
+                l.shape[1],
+                l.shape[2][1],
+            ),
+            stride=(
+                (l.stride[0], l.stride[2][0]),
+                l.stride[1],
+                l.stride[2][1],
+            ),
+        )
+    return rA_mma_view
 
-    while lo < hi:
-        mid = (lo + hi) // 2
-        if cu_tensor[mid + 1] <= idx:
-            lo = mid + 1
-        else:
-            hi = mid
 
-    return lo
+def make_acc_tensor_frgA_view(acc: cute.Tensor) -> cute.Tensor:
+    return cute.make_tensor(acc.iterator, convert_layout_acc_frgA(acc.layout))
+
+
+def select(a: cute.Tensor, mode: list[int]) -> cute.Tensor:
+    return cute.make_tensor(a.iterator, cute.select(a.layout, mode))
+
+
+def transpose_view(a: cute.Tensor) -> cute.Tensor:
+    """Transpose the first two dimensions of a tensor on smem."""
+    shape = (a.shape[1], a.shape[0], *a.shape[2:])
+    order = (1, 0, *range(2, cute.rank(a)))
+    return cute.composition(a, cute.make_ordered_layout(shape, order=order))
+
+
+@cute.jit
+def exp2f(x: cute.TensorSSA | Float32) -> cute.TensorSSA | Float32:
+    """exp2f calculation for both vector and scalar."""
+    if const_expr(isinstance(x, cute.TensorSSA)):
+        res = cute.make_fragment(x.shape, Float32)
+        res.store(x)
+        for i in cutlass.range_constexpr(cute.size(x.shape)):
+            res[i] = cute.arch.exp2(res[i])
+        return res.load()
+    else:
+        return cute.arch.exp2(x)
+
+
+@dsl_user_op
+def log2f(a: float | Float32, *, loc=None, ip=None) -> Float32:
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Float32(a).ir_value(loc=loc, ip=ip)],
+            "lg2.approx.ftz.f32 $0, $1;",
+            "=f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def logf(a: float | Float32, *, loc=None, ip=None) -> Float32:
+    return log2f(a, loc=loc, ip=ip) * math.log(2.0)
+
+
+@dsl_user_op
+def elem_pointer_i64(x: cute.Tensor, coord: cute.Coord, *, loc=None, ip=None) -> cute.Pointer:
+    flat_coord_i64 = tuple(cutlass.Int64(c) for c in cute.flatten(coord))
+    flat_stride = cute.flatten_to_tuple(x.stride)
+    assert len(flat_coord_i64) == len(flat_stride), (
+        "Coordinate and stride must have the same length"
+    )
+    offset = sum(c * s for c, s in zip(flat_coord_i64, flat_stride))
+    # HACK: we assume that applying the offset does not change the pointer alignment
+    byte_offset = offset * x.element_type.width // 8
+    return cute.make_ptr(
+        x.element_type,
+        x.iterator.toint() + byte_offset,
+        x.memspace,
+        assumed_align=x.iterator.alignment,
+    )
+
+
+@dsl_user_op
+def domain_offset_i64(coord: cute.Coord, tensor: cute.Tensor, *, loc=None, ip=None) -> cute.Tensor:
+    flat_coord_i64 = tuple(cutlass.Int64(c) for c in cute.flatten(coord))
+    flat_stride = cute.flatten_to_tuple(tensor.stride)
+    assert len(flat_coord_i64) == len(flat_stride), (
+        "Coordinate and stride must have the same length"
+    )
+    offset = sum(c * s for c, s in zip(flat_coord_i64, flat_stride))
+    assert isinstance(tensor.iterator, cute.Pointer)
+    # HACK: we assume that applying the offset does not change the pointer alignment
+    new_ptr = cute.make_ptr(
+        tensor.element_type,
+        tensor.iterator.toint() + offset * tensor.element_type.width // 8,
+        tensor.memspace,
+        assumed_align=tensor.iterator.max_alignment,
+    )
+    return cute.make_tensor(new_ptr, tensor.layout)
+
+
+@dsl_user_op
+def coord_offset_i64(
+    tensor: cute.Tensor, idx: cute.typing.Int, dim: int, *, loc=None, ip=None
+) -> cute.Tensor:
+    offset = cutlass.Int64(idx) * cute.size(tensor.stride[dim])
+    assert isinstance(tensor.iterator, cute.Pointer)
+    # HACK: we assume that applying the offset does not change the pointer alignment
+    new_ptr = cute.make_ptr(
+        tensor.element_type,
+        tensor.iterator.toint() + offset * tensor.element_type.width // 8,
+        tensor.memspace,
+        assumed_align=tensor.iterator.max_alignment,
+    )
+    new_layout = cute.slice_(
+        tensor.layout, (*[None] * dim, 0, *[None] * (cute.rank(tensor) - dim - 1))
+    )
+    return cute.make_tensor(new_ptr, new_layout)
