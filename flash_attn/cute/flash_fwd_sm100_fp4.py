@@ -2626,18 +2626,23 @@ class FlashAttentionForwardSm100:
             else:
                 mask_fn_none = None
 
-            fp8_pv_p_log2_offset = float(
-                os.getenv(
-                    "FA4_FP8_PV_P_LOG2_OFFSET",
-                    "0.0" if self.head_dim_v_padded <= 64 else "8.0",
-                )
-            )
+            import math as _math
+            if const_expr(self.quant_pv):
+                # FP4 PV: P should be in [0, E2M1_max=6], so max_offset = log2(6).
+                _max_offset = _math.log2(6)
+                _rescale_threshold = 0.0
+            elif const_expr(not self.quant_pv and self.v_dtype.width == 8):
+                # FP8 PV: use max_offset to shift P range for better utilization.
+                _max_offset = float(os.getenv("FA4_FP8_PV_P_LOG2_OFFSET", "0.0" if self.head_dim_v_padded <= 64 else "8.0"))
+                _rescale_threshold = 8.0
+            else:
+                _max_offset = 0
+                _rescale_threshold = 8.0
             softmax = SoftmaxSm100.create(
                 softmax_scale_log2,
-                rescale_threshold=8.0,
-                # rescale_threshold=8.0 if const_expr(self.q_dtype.width == 16) else 0.0, # (Wenxuan) disable skipping rescale until FP4 precision is verified
+                rescale_threshold=_rescale_threshold,
                 softmax_scale=softmax_scale,
-                p_log2_offset=fp8_pv_p_log2_offset if const_expr(not self.quant_pv and self.v_dtype.width == 8) else 0.0,
+                max_offset=_max_offset,
                 quant_pv=self.quant_pv,
                 compute_sp1=self.compute_sp1,
             )
