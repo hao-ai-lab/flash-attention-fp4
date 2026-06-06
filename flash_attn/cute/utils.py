@@ -19,10 +19,12 @@ from cutlass.cute.runtime import from_dlpack
 
 import quack.activation
 
-# cute.arch.{fma,mul,add}_packed_f32x2 uses RZ rounding mode by default
-fma_packed_f32x2 = partial(cute.arch.fma_packed_f32x2, rnd=nvvm.RoundingModeKind.RN)
-mul_packed_f32x2 = partial(cute.arch.mul_packed_f32x2, rnd=nvvm.RoundingModeKind.RN)
-add_packed_f32x2 = partial(cute.arch.add_packed_f32x2, rnd=nvvm.RoundingModeKind.RN)
+# cute.arch.{fma,mul,add}_packed_f32x2 uses RZ rounding mode by default.
+# cutlass-dsl >=4.5 changed rnd from enum to string.
+_RND_RN = "rn" if tuple(int(x) for x in cutlass.__version__.split(".")[:2]) >= (4, 5) else nvvm.RoundingModeKind.RN
+fma_packed_f32x2 = partial(cute.arch.fma_packed_f32x2, rnd=_RND_RN)
+mul_packed_f32x2 = partial(cute.arch.mul_packed_f32x2, rnd=_RND_RN)
+add_packed_f32x2 = partial(cute.arch.add_packed_f32x2, rnd=_RND_RN)
 
 _MIXER_ATTRS = ("__vec_size__",)
 
