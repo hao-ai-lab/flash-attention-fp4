@@ -580,14 +580,42 @@ def create_nvfp4_attention_tensors(
     q_fp4, q_sf = _quantize_and_reshape_sf(q_ref, batch, seqlen_q, nheads, headdim)
     k_fp4, k_sf = _quantize_and_reshape_sf(k_ref, batch, seqlen_k, nheads_kv, headdim)
 
-    if pv_mode == "fp8":
+    v_sf = None
+    if pv_mode == "fp4":
+        # K-major FP4 V: nvfp4_quantize on v.permute(0,2,3,1).reshape(b*h*d, s)
+        # produces (b*h*d, s/2) FP4 byte tensor. Reshape to (b, h, d, s/2).
+        v_bf16 = v_ref.to(dtype_gen)
+        v_km = v_bf16.permute(0, 2, 3, 1).contiguous().reshape(batch * nheads_kv * headdim_v, seqlen_k)
+        one = torch.ones(1, device=device, dtype=torch.float32)
+        v_fp4_data, v_sf_data = nvfp4_quantize(
+            v_km, one, sfLayout=SfLayout.layout_128x4, do_shuffle=False
+        )
+        v_tensor = (
+            v_fp4_data.reshape(batch, nheads_kv, headdim_v, seqlen_k // 2)
+            .view(torch.uint8)
+            .view(torch.float4_e2m1fn_x2)
+        )
+        # V SF layout: The kernel's mV_shape is (d, s, h, b) after transpose.
+        # tile_to_shape(atom, (d, s, h, b), (2,1,3,4)) produces:
+        #   (((32,4), d//128), ((16,4), s//64), h, b)
+        # which flattens to 7-dim: (32, 4, d//128, 4, s//64, h, b)
+        # The SF from nvfp4_quantize on (b*h*d, s) has shape (b*h*d, s//16).
+        # Reshape to match: split M=b*h*d into (b, h, d//128) and K=s//16 into s//64.
+        rest_m_v = headdim_v // tile_m  # d//128
+        rest_k_v = seqlen_k // (sf_vec_size * 4)  # s//64
+        v_sf = v_sf_data.reshape(
+            batch * nheads_kv * rest_m_v, rest_k_v, 32, 4, 4
+        ).reshape(
+            batch, nheads_kv, rest_m_v, rest_k_v, 32, 4, 4
+        ).permute(0, 1, 2, 3, 4, 5, 6).contiguous().permute(4, 5, 2, 6, 3, 1, 0)
+    elif pv_mode == "fp8":
         _fp8 = pv_fp8_dtype or cutlass.Float8E4M3FN
         _torch_fp8 = torch.float8_e4m3fn if _fp8 == cutlass.Float8E4M3FN else torch.float8_e5m2
         v_tensor = v_ref.to(dtype_gen).to(_torch_fp8)
     else:
         v_tensor = v_ref.to(dtype_gen)
 
-    return q_fp4, k_fp4, v_tensor, q_sf, k_sf, None, q_ref, k_ref, v_ref
+    return q_fp4, k_fp4, v_tensor, q_sf, k_sf, v_sf, q_ref, k_ref, v_ref
 
 
 def create_mxfp8_attention_tensors(
@@ -716,7 +744,7 @@ def main(
     print(f"QK sf_vec_size: {sf_vec_size}")
     print("=" * 80)
 
-    use_nvfp4 = ab_dtype == cutlass.Float4E2M1FN and pv_mode != "fp4"
+    use_nvfp4 = ab_dtype == cutlass.Float4E2M1FN
     use_mxfp8 = ab_dtype == cutlass.Float8E4M3FN and pv_mode != "fp4"
 
     for batch_size, seqlen, nheads, headdim in configs:

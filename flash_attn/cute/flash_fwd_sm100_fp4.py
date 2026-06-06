@@ -265,8 +265,14 @@ class FlashAttentionForwardSm100:
         self._e2e_freq_override = int(_e2e_freq_env) if _e2e_freq_env else None
         self.e2e_freq = self._e2e_freq_override if self._e2e_freq_override is not None else self._tune.get("e2e_freq", 16)
         self.e2e_start_frg = int(os.getenv("FA4_E2E_START_FRG", str(self._tune.get("e2e_start_frg", 0))))
-        # e2e helps NVFP4 (sf_vec_size=16) but hurts MXFP8 (sf_vec_size=32) for BF16 PV
-        self.force_e2e = self._tune.get("enable_e2e", False) and self.sf_vec_size == 16
+        # e2e helps NVFP4 (sf_vec_size=16) but hurts MXFP8 (sf_vec_size=32) for BF16 PV.
+        # On SM103 (B300), hardware exp2 is 2x faster — e2e may not be needed.
+        _force_e2e_env = os.getenv("FA4_FORCE_E2E")
+        self._force_e2e_from_env = _force_e2e_env is not None
+        if _force_e2e_env is not None:
+            self.force_e2e = _force_e2e_env == "1"
+        else:
+            self.force_e2e = self._tune.get("enable_e2e", False) and self.sf_vec_size == 16
         # Fused exp2 + packed E4M3 conversion. A/B'd against the 2-pass baseline
         # on (1, 32768, 24, 128) MXFP8+FP8 at parity (~1663 TFLOPS both ways) —
         # the DSL's IR fuser likely achieves the same register schedule. Kept
@@ -524,11 +530,10 @@ class FlashAttentionForwardSm100:
                 (self.is_causal, self.head_dim_padded), {}
             )
             if const_expr(self._e2e_freq_override is None and "e2e_freq" in _fp8_tune):
-                # NVFP4 FP8: freq=9, MXFP8 FP8: freq=10
                 _fp8_default = _fp8_tune["e2e_freq"] if self.sf_vec_size == 16 else 10
                 self.e2e_freq = _fp8_default
                 self.e2e_start_frg = _fp8_tune.get("e2e_start_frg", self.e2e_start_frg)
-            self.force_e2e = True
+            pass  # force_e2e already set in __init__ (respects FA4_FORCE_E2E env)
         elif const_expr(self._e2e_freq_override is None):
             if const_expr(
                 self.head_dim_padded > 64 and not self.is_causal and not self.is_local and self.pack_gqa
@@ -2850,6 +2855,67 @@ class FlashAttentionForwardSm100:
                 tSrP_u32_view[k] = packed_e2m1
 
     @cute.jit
+    def _fused_group_max_scale_quant(
+        self,
+        softmax: SoftmaxSm100,
+        tSrP_f32: cute.Tensor,
+        tSrP: cute.Tensor,
+    ):
+        """Fused group_max + scale + quantize to reduce register pressure.
+
+        Instead of 3 separate passes over the full fragment (128 FP32 values),
+        processes each sf_vec_size group (16 elements) sequentially:
+        group_max → scale → quant_e2m1 before moving to the next group.
+        Peak live regs: 16 (group) + 1 (max) + 2 (packed) vs ~150 in the split path.
+        """
+        inv6 = Float32(1.0 / 6.0)
+        acc_S_frag = cute.logical_divide(tSrP_f32, cute.make_layout(self.sf_vec_size))
+        num_groups = cute.size(acc_S_frag, mode=[1])
+        tSrP_frag = cute.logical_divide(tSrP, cute.make_layout(self.sf_vec_size))
+        tSrPSF_f32 = cute.make_rmem_tensor(cute.make_layout(num_groups), Float32)
+        tSrPSF = cute.make_rmem_tensor(tSrPSF_f32.layout, self.sf_dtype)
+
+        for g in cutlass.range_constexpr(num_groups):
+            # 1. Group max (reduction over sf_vec_size elements)
+            gmax = softmax._compute_row_max(acc_S_frag[None, g].load()) * inv6
+            tSrPSF_f32[g] = gmax
+
+            # 2. Scale by 1/gmax
+            inv_gmax = Float32(1.0) / cute.arch.fmax(gmax, 1e-20)
+            for j in cutlass.range(0, self.sf_vec_size, 2, unroll_full=True):
+                acc_S_frag[j, g], acc_S_frag[j + 1, g] = utils.fma_packed_f32x2(
+                    (acc_S_frag[j, g], acc_S_frag[j + 1, g]),
+                    (inv_gmax, inv_gmax),
+                    (Float32(0.0), Float32(0.0)),
+                )
+
+            # 3. Quantize this group to E2M1
+            tSrP_u32_view = cute.recast_tensor(tSrP_frag[None, g], cute.Int32)
+            for k in cutlass.range_constexpr(0, cute.size(tSrP_u32_view, mode=[0])):
+                tSrP_u32_view[k] = packed_float_to_e2m1(
+                    acc_S_frag[k * 8, g],
+                    acc_S_frag[k * 8 + 1, g],
+                    acc_S_frag[k * 8 + 2, g],
+                    acc_S_frag[k * 8 + 3, g],
+                    acc_S_frag[k * 8 + 4, g],
+                    acc_S_frag[k * 8 + 5, g],
+                    acc_S_frag[k * 8 + 6, g],
+                    acc_S_frag[k * 8 + 7, g],
+                )
+
+        # 4. Pack SF values to UE4M3 (separate loop, small tensor)
+        tSrPSF_u32_view = cute.recast_tensor(tSrPSF, cute.Int32)
+        for i in cutlass.range_constexpr(0, cute.size(tSrPSF_f32) // 4, unroll=1):
+            tSrPSF_u32_view[i] = packed_float_to_ue4m3(
+                tSrPSF_f32[i * 4],
+                tSrPSF_f32[i * 4 + 1],
+                tSrPSF_f32[i * 4 + 2],
+                tSrPSF_f32[i * 4 + 3],
+            )
+
+        return tSrPSF_f32, tSrPSF
+
+    @cute.jit
     def _apply_exp2_pack_fp8(
         self,
         softmax,
@@ -3027,10 +3093,9 @@ class FlashAttentionForwardSm100:
             )
             # update_row_sum BEFORE scale_groupwise so it uses original P values
             softmax.update_row_sum(tSrS_t2r.load(), acc_scale, is_first)
-            tSrPSF_f32 = softmax.compute_group_max(tSrS_t2r, sf_size=self.sf_vec_size)
-            tSrPSF = cute.make_rmem_tensor(tSrPSF_f32.layout, self.sf_dtype)
-            softmax.scale_groupwise(tSrS_t2r, tSrPSF_f32, sf_size=self.sf_vec_size)
-            self._quant_fp4(tSrS_t2r, tSrPSF_f32, tSrP_r2t, tSrPSF)
+            tSrPSF_f32, tSrPSF = self._fused_group_max_scale_quant(
+                softmax, tSrS_t2r, tSrP_r2t,
+            )
             # R2S: Copy tSrPSF (registers) to sSFP (shared memory).
             # The SFP smem layout is BlockScaledBasicChunk(sf_vec_size).layout
             # tile_to_shape((M=128, K=128)). The atom is ((32,4),(sf_vec,4))
