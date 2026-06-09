@@ -15,14 +15,13 @@ Usage:
 """
 
 import os
-from dataclasses import dataclass, field
-from typing import Optional
+from dataclasses import dataclass
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
-from matplotlib.patches import FancyBboxPatch
+from matplotlib.patches import Rectangle
 
 # ---------------------------------------------------------------------------
 # Cycle model for M=N=d=128 tiles on B300 (SM103)
@@ -34,14 +33,23 @@ PV_GEMM_BF16 = 1024    # BF16 PV GEMM
 PV_GEMM_FP8 = 512      # FP8 PV GEMM
 PV_GEMM_FP4 = 256      # FP4 PV GEMM
 
-# Softmax cycles on B300 (SM103, 2x MUFU throughput)
+# Softmax cycles on B300 (SM103). Throughputs measured on GB300 with
+# agent_space/bench_cvt_throughput.cu (instr/clk/SM at saturation):
+#   ex2.approx.ftz.f32           32.0  (2x SM100's 16 — the B300 MUFU doubling)
+#   cvt.rn.bf16x2.f32            62    (~64 limit; trivial truncate of FP32)
+#   cvt.rn.satfinite.e4m3x2.f32  32.0  (FP8 needs renorm/saturate — half rate)
+#   cvt.rn.satfinite.e2m1x2.f32  57    (FP4 cvt itself is fast)
+# Per softmax step each WG (128 threads) does 16384 ex2 and 8192 cvt
+# thread-instructions (128x128 tile, x2 packed cvt). In steady state the two
+# softmax WGs overlap on one SM, so each sees ~half throughput (factor 2).
 LOAD_S_TMEM = 50        # Load S from TMEM
 ROW_MAX = 100           # row_max reduction
-EXP2 = 512              # MUFU.EX2 (halved from B200's 1024)
+EXP2 = 1024             # 16384 / (32/2) — MUFU, 2 WGs sharing (B200: 2048)
 UPDATE_ROW_SUM = 100    # update_row_sum
-P_PACK_BF16 = 200       # cvt.bf16x2 instructions
-P_PACK_FP8 = 1024       # F2FP (NOT 2x on B300)
-P_QUANT_FP4 = 1500      # group_max + scale + E2M1 pack
+P_PACK_BF16 = 256       # 8192 / (62/2) — fast truncating cvt
+P_PACK_FP8 = 512        # 8192 / (32/2) — F2FP E4M3 at exactly half BF16 rate
+P_QUANT_FP4 = 1500      # group_max + scale + E2M1 pack + reg shuffling
+                        # (cvt is fast; the +914 extra PTX instrs dominate)
 WRITE_P_TMEM = 50       # Write P to TMEM
 SIGNAL_OVERHEAD = 10    # mbarrier signal
 
@@ -143,7 +151,7 @@ def _run_softmax_iteration(
     # exp2
     sm_events.append(Event(
         f"exp{iter_label}", t, EXP2, COL_EXP2,
-        label=f"exp2.{iter_label}", text_color="white"
+        label=f"MUFU{iter_label}", text_color="white"
     ))
     t += EXP2
 
@@ -161,14 +169,14 @@ def _run_softmax_iteration(
     ))
     t += quant_cycles
 
-    # Write P to TMEM
+    # Write P to TMEM + P_full mbarrier signal (drawn as one bar so the
+    # timeline has no undrawn time)
     sm_events.append(Event(
-        f"wrP{iter_label}", t, WRITE_P_TMEM, COL_WRITE_P,
+        f"wrP{iter_label}", t, WRITE_P_TMEM + SIGNAL_OVERHEAD, COL_WRITE_P,
         label="wrP", text_color="#333333"
     ))
     t += WRITE_P_TMEM
-
-    # Signal P_full[stage] -- P is now available for MMA to consume
+    # P is available for MMA to consume once the write completes
     p_full_ready[stage] = t
     t += SIGNAL_OVERHEAD
     return t
@@ -252,8 +260,11 @@ def simulate_pipeline(mode: PVMode, n_iter: int = 6):
         # Softmax WG0 (stage 0) and WG1 (stage 1)
         # ------------------------------------------------------------------
         for stage in [0, 1]:
+            # Global index matching the PV GEMM that will consume this P:
+            # WG0 (stage 0) produces P for odd PVs (PV1, PV3, ...),
+            # WG1 (stage 1) for even PVs (PV2, PV4, ...).
             sm_t[stage] = _run_softmax_iteration(
-                sm_event_lists[stage], sm_t[stage], stage, it + 1,
+                sm_event_lists[stage], sm_t[stage], stage, 2 * it + 1 + stage,
                 s_full_ready, p_full_ready,
                 quant_cycles, mode.p_quant_color, mode.p_quant_label_prefix,
             )
@@ -284,25 +295,36 @@ def simulate_pipeline(mode: PVMode, n_iter: int = 6):
 # Rendering
 # ---------------------------------------------------------------------------
 
-def draw_timeline(ax, events: list[Event], y_center: float, bar_height: float):
-    """Draw a row of events on the given axes."""
+def draw_timeline(ax, events: list[Event], y_center: float, bar_height: float,
+                  x_scale: float = 1.0):
+    """Draw a row of events on the given axes.
+
+    x_scale: approximate pixels-per-cycle, used to decide label thresholds.
+    """
     for ev in events:
         if ev.duration <= 0:
             continue
         h = bar_height * (0.45 if ev.is_wait else 1.0)
         y = y_center - h / 2
 
-        rect = FancyBboxPatch(
+        # Flush rectangles (no rounding, no border) so adjacent events butt
+        # together without white slivers that read as false pipeline gaps.
+        rect = Rectangle(
             (ev.start, y), ev.duration, h,
-            boxstyle="round,pad=0,rounding_size=4",
-            facecolor=ev.color, edgecolor="white", linewidth=0.8,
+            facecolor=ev.color, edgecolor="none",
             zorder=3 if not ev.is_wait else 2,
         )
         ax.add_patch(rect)
 
-        # Label (only if bar is wide enough)
-        if ev.duration >= 80 and ev.label:
-            fontsize = 7.5 if ev.duration >= 200 else 6
+        # Label -- skip for very narrow bars, use smaller font for medium bars
+        bar_px = ev.duration * x_scale
+        if ev.label and bar_px >= 25:
+            if bar_px >= 70:
+                fontsize = 7.5
+            elif bar_px >= 40:
+                fontsize = 6
+            else:
+                fontsize = 5
             ax.text(
                 ev.start + ev.duration / 2, y_center,
                 ev.label, ha="center", va="center",
@@ -312,7 +334,78 @@ def draw_timeline(ax, events: list[Event], y_center: float, bar_height: float):
             )
 
 
-def render_mode(mode: PVMode, ax, n_iter: int = 6):
+def _draw_dependency_arrows(ax, mma_ev, sm0_ev, sm1_ev, y_mma, y_sm0, y_sm1,
+                            bar_height):
+    """Draw arrows showing S_full (QK -> Softmax) and P_full (Softmax -> PV) sync."""
+    arrow_kw_s = dict(
+        arrowstyle="->,head_width=0.15,head_length=0.08",
+        color="#2266AA", lw=0.8, alpha=0.5, zorder=1,
+        connectionstyle="arc3,rad=0.0",
+    )
+    arrow_kw_p = dict(
+        arrowstyle="->,head_width=0.15,head_length=0.08",
+        color="#AA4422", lw=0.8, alpha=0.5, zorder=1,
+        connectionstyle="arc3,rad=0.0",
+    )
+
+    # Build lookup: name -> event
+    def lookup(events):
+        d = {}
+        for ev in events:
+            d[ev.name] = ev
+        return d
+
+    mma_d = lookup(mma_ev)
+
+    # S_full arrows: end of QK -> start of softmax (after wait)
+    for name, ev in mma_d.items():
+        if not name.startswith("QK"):
+            continue
+        qk_end_x = ev.start + ev.duration
+        idx = name[2:]  # e.g. "1", "2", ...
+        qk_num = int(idx)
+        # QK with odd index -> stage 0 (Softmax WG0), even -> stage 1
+        if qk_num % 2 == 1:
+            target_events = sm0_ev
+            y_target = y_sm0
+        else:
+            target_events = sm1_ev
+            y_target = y_sm1
+        # Find the softmax event that starts at or right after this QK ends
+        for sev in target_events:
+            if not sev.is_wait and sev.start >= qk_end_x - 5:
+                ax.annotate("",
+                    xy=(sev.start, y_target + bar_height * 0.35),
+                    xytext=(qk_end_x, y_mma - bar_height * 0.35),
+                    arrowprops=arrow_kw_s,
+                )
+                break
+
+    # P_full arrows: end of softmax write_P -> start of PV
+    for sev_list, y_src, stage in [
+        (sm0_ev, y_sm0, 0), (sm1_ev, y_sm1, 1)
+    ]:
+        for sev in sev_list:
+            if not sev.name.startswith("wrP"):
+                continue
+            wrp_end = sev.start + sev.duration
+            # Find matching PV in MMA that starts near this time
+            for mev in mma_ev:
+                if not mev.name.startswith("PV"):
+                    continue
+                if mev.start >= wrp_end - 5 and mev.start <= wrp_end + 200:
+                    # Only draw if PV color matches stage
+                    expected_col = COL_PV_STAGE0 if stage == 0 else COL_PV_STAGE1
+                    if mev.color == expected_col:
+                        ax.annotate("",
+                            xy=(mev.start, y_mma - bar_height * 0.35),
+                            xytext=(wrp_end, y_src + bar_height * 0.35),
+                            arrowprops=arrow_kw_p,
+                        )
+                        break
+
+
+def render_mode(mode: PVMode, ax, n_iter: int = 6, fig_width_inches: float = 18.0):
     """Render a single PV mode subplot."""
     mma_ev, sm0_ev, sm1_ev, total = simulate_pipeline(mode, n_iter)
 
@@ -320,8 +413,17 @@ def render_mode(mode: PVMode, ax, n_iter: int = 6):
     y_positions = [2, 1, 0]
     bar_height = 0.65
 
+    # Approximate pixels per cycle for label sizing (fig DPI * usable width / total cycles)
+    usable_width = fig_width_inches * 0.87 * 150  # approximate
+    x_scale = usable_width / max(total, 1)
+
     for events, y in zip([mma_ev, sm0_ev, sm1_ev], y_positions):
-        draw_timeline(ax, events, y, bar_height)
+        draw_timeline(ax, events, y, bar_height, x_scale)
+
+    # Draw dependency arrows (only for first few iterations to avoid clutter)
+    _draw_dependency_arrows(ax, mma_ev, sm0_ev, sm1_ev,
+                            y_positions[0], y_positions[1], y_positions[2],
+                            bar_height)
 
     # Axes configuration
     ax.set_xlim(-50, total + 50)
@@ -352,22 +454,39 @@ def render_mode(mode: PVMode, ax, n_iter: int = 6):
     ax.set_facecolor(COL_BG)
 
 
-def make_legend(fig):
-    """Create a shared legend at the bottom."""
+def make_legend(fig, modes=None):
+    """Create a shared legend showing only colors that appear in the figure.
+
+    If *modes* is None, all PV modes are assumed (combined figure).
+    """
+    if modes is None:
+        modes = PV_MODES
+
+    # Always-present entries
     legend_items = [
         mpatches.Patch(facecolor=COL_QK, edgecolor="white", label="QK GEMM (FP4)"),
         mpatches.Patch(facecolor=COL_PV_STAGE0, edgecolor="white", label="PV GEMM (stage 0)"),
         mpatches.Patch(facecolor=COL_PV_STAGE1, edgecolor="white", label="PV GEMM (stage 1)"),
-        mpatches.Patch(facecolor=COL_EXP2, edgecolor="white", label="exp2 (MUFU)"),
-        mpatches.Patch(facecolor=COL_QUANT_BF16, edgecolor="white", label="P pack (BF16)"),
-        mpatches.Patch(facecolor=COL_QUANT_FP8, edgecolor="white", label="P pack (FP8 F2FP)"),
-        mpatches.Patch(facecolor=COL_QUANT_FP4, edgecolor="white", label="P quant (FP4)"),
+        mpatches.Patch(facecolor=COL_EXP2, edgecolor="white", label="MUFU (exp2)"),
+    ]
+
+    # Per-mode quant/pack entries — only include if that mode is in the figure
+    mode_colors = {m.p_quant_color for m in modes}
+    if COL_QUANT_BF16 in mode_colors:
+        legend_items.append(mpatches.Patch(facecolor=COL_QUANT_BF16, edgecolor="white", label="P pack (BF16)"))
+    if COL_QUANT_FP8 in mode_colors:
+        legend_items.append(mpatches.Patch(facecolor=COL_QUANT_FP8, edgecolor="white", label="P pack (FP8 F2FP)"))
+    if COL_QUANT_FP4 in mode_colors:
+        legend_items.append(mpatches.Patch(facecolor=COL_QUANT_FP4, edgecolor="white", label="P quant (FP4)"))
+
+    legend_items += [
         mpatches.Patch(facecolor=COL_ROWMAX, edgecolor="white", label="row_max / row_sum"),
         mpatches.Patch(facecolor=COL_WAIT, edgecolor="white", label="mbarrier wait (stall)"),
     ]
+
     fig.legend(
         handles=legend_items, loc="lower center",
-        ncol=5, fontsize=7.5, frameon=True,
+        ncol=min(len(legend_items), 5), fontsize=7.5, frameon=True,
         fancybox=True, shadow=False,
         edgecolor="#CCCCCC",
         bbox_to_anchor=(0.5, -0.01),
@@ -403,7 +522,7 @@ def main():
         fig_single, ax_single = plt.subplots(1, 1, figsize=(18, 3.5), dpi=150)
         fig_single.subplots_adjust(bottom=0.22, top=0.82, left=0.10, right=0.97)
         render_mode(mode, ax_single, n_iter=6)
-        make_legend(fig_single)
+        make_legend(fig_single, modes=[mode])
 
         tag = mode.name.lower().replace(" ", "_")
         path = os.path.join(out_dir, f"pipeline_model_b300_{tag}.png")

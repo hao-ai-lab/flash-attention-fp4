@@ -25,7 +25,7 @@ Peak numbers (s=32768): BF16 PV 2142 TF, FP8 PV 1774 TF, FP4 PV 1340 TF.
 **Key finding**: On B300, exp2 is no longer the bottleneck for any PV mode.
 The new bottlenecks are:
 - **BF16 PV**: MMA-bound → 1.37x (best result)
-- **FP8 PV**: F2FP packing (MIO pipe, did NOT get 2x on SM103) → softmax-bound
+- **FP8 PV**: F2FP packing (32/clk, exactly half the BF16 cvt rate) → softmax-bound
 - **FP4 PV**: P quantization instruction throughput → heavily softmax-bound
 
 ## Corrected Roofline Analysis
@@ -43,11 +43,28 @@ The paper shows exp2 takes the **same** 1024 cycles as one BF16 MMA tile.
 This means exp2 IS a co-bottleneck with MMA on B200, contradicting the
 previous version of this analysis.
 
-### B300 (SM103) Adjustments
+### B300 (SM103) Adjustments — Measured Instruction Throughput
 
-- MUFU.EX2 throughput: 32 ops/clock/SM (2x) → **exp drops to 512 cycles**
-- F2FP (cvt.e4m3x2): likely unchanged at 16 ops/clock → **still 1024 cycles**
-- MMA throughput: unchanged → same cycle counts
+Measured on this GB300 with `agent_space/bench_cvt_throughput.cu` (single SM,
+8 independent serial chains per thread, 512 threads = saturated):
+
+| Instruction                      | instr/clk/SM | Note                              |
+|----------------------------------|--------------|-----------------------------------|
+| `ex2.approx.ftz.f32` (MUFU)     | **32.0**     | 2x SM100's 16 — the B300 doubling |
+| `cvt.rn.bf16x2.f32`             | **62**       | ~64 limit; trivial FP32 truncation|
+| `cvt.rn.satfinite.e4m3x2.f32`   | **32.0**     | FP8: exactly half the BF16 rate   |
+| `cvt.rn.satfinite.e2m1x2.f32`   | **57**       | FP4 cvt itself is fast            |
+| mix 4x ex2 + 4x e4m3 cvt        | 54.6 combined| partial port overlap, not full 64 |
+
+Key facts:
+- MUFU.EX2 = 32/clk confirms the SM103 2x doubling (SM100: 16/clk).
+- FP32→FP8 conversion runs at **exactly half** the FP32→BF16 rate. BF16 is a
+  round+truncate of the top 16 bits of FP32 (full-width datapath); E4M3 needs
+  exponent rebias, mantissa renormalization, saturation and NaN remapping —
+  implemented at half rate.
+- FP32→FP4 (E2M1) cvt is nearly as fast as BF16 — the FP4 PV cost is NOT the
+  conversion, it's the surrounding group_max/scale/register traffic.
+- MMA throughput: unchanged vs SM100 → same GEMM cycle counts.
 
 ### Pipeline Cycle Model (steady state, per iteration)
 
@@ -61,6 +78,11 @@ Each softmax WG handles one stage, ping-pong between WG0 (stage 0) and WG1 (stag
 Wait S → Load S → row_max → exp2 → row_sum → P pack/quant → Write P → Signal P_full
 ```
 
+Softmax cycle counts below use the measured throughputs with a 2x contention
+factor because in steady state the two softmax WGs overlap on the same SM and
+share the vector pipes. Per softmax step each WG executes 16384 ex2 and 8192
+packed-cvt thread-instructions (128×128 tile, 2 elements per cvt):
+
 | Component                  | BF16 PV | FP8 PV  | FP4 PV  |
 |----------------------------|---------|---------|---------|
 | **MMA WG per KV block**    |         |         |         |
@@ -69,13 +91,16 @@ Wait S → Load S → row_max → exp2 → row_sum → P pack/quant → Write P 
 | Total MMA per block        | 2560    | 1536    | 1024    |
 | **Softmax WG per stage**   |         |         |         |
 | TMEM load + row_max        | 150     | 150     | 150     |
-| exp2 (MUFU, SM103)         | 512     | 512     | 512     |
+| exp2 (16384 / (32/2))     | 1024    | 1024    | 1024    |
 | row_sum                    | 100     | 100     | 100     |
-| P pack/quant               | 200     | 1024    | 1500    |
+| P pack/quant               | 256     | 512     | 1500    |
 | TMEM store + signal        | 60      | 60      | 60      |
-| Total softmax per stage    | 1022    | 1846    | 2322    |
+| Total softmax per stage    | 1590    | 1846    | 2834    |
 | **Bottleneck**             | MMA     | softmax | softmax |
-| **Expected ratio**         | 1.0x    | 0.83x   | 0.44x   |
+
+P pack: BF16 = 8192/(62/2) ≈ 256; FP8 = 8192/(32/2) = 512; FP4 quant is
+dominated by group_max + scale + register shuffling (+914 PTX instructions),
+not the E2M1 cvt itself (57/clk measured).
 
 The MMA WG must complete the full PV+QK cycle before the softmax results
 from the same stage are needed again. With ping-pong, each softmax WG has
@@ -115,21 +140,28 @@ is 128 `cvt.rn.bf16x2.f32` (BF16 P pack) replaced by 128 `cvt.rn.satfinite.e4m3x
 - +426 mov: register shuffling for group processing
 - +18 mbarrier: extra sync for SFP SMEM copy
 
-## Why FP8 PV is Slower on B300 than B200
+## Why FP8 PV is Slower than BF16 PV on B300
 
-On B200:
-- Softmax: exp2 (1024 cy) + F2FP pack (1024 cy), interleaved → ~1024 effective
-- MMA per block: QK (512) + PV (1024) = 1536 cy
-- With e2e emulation overlapping exp2 with MMA: effective softmax < 1536 cy → MMA-bound
+The instruction COUNT is identical — the PTX census shows the FP8 PV kernel
+differs from BF16 PV only in 128 `cvt.rn.bf16x2.f32` replaced by 128
+`cvt.rn.satfinite.e4m3x2.f32`. The difference is hardware THROUGHPUT:
 
-On B300:
-- Softmax: exp2 (512 cy) + F2FP pack (1024 cy) → 1024 effective (F2FP dominates)
-- MMA per block: QK (512) + PV (1024) = 1536 cy → MMA should be bottleneck
-- But F2FP + row ops + TMEM overhead ≈ MMA cycle → marginal, no headroom
-- e2e emulation cannot help: F2FP is the bottleneck, not exp2
+- `cvt.rn.bf16x2.f32`: 62/clk/SM. BF16 is the top 16 bits of FP32, so the
+  conversion is a round+truncate on the full-width FP32 datapath.
+- `cvt.rn.satfinite.e4m3x2.f32`: exactly 32/clk/SM (half). E4M3 needs
+  exponent rebias from 8-bit to 4-bit range, mantissa renormalization,
+  saturation clamping, and NaN remapping — narrower dedicated hardware.
 
-The 1.17x FP8 PV speedup on B300 (vs 1.31x on B200) reflects that the F2FP
-packing cost is now exposed because exp2 shrank but F2FP didn't.
+So P-pack costs 2x the cycles for FP8 (512 vs 256 per stage, contended).
+On top of that, the FP8 PV GEMM is 2x faster than BF16 PV GEMM (1024 vs
+2048 per block), so the MMA cycle shrinks from 2560 to 1536 while the
+softmax stage grows from 1590 to 1846 — the kernel flips from MMA-bound
+to softmax-bound, and the extra PV speed cannot be realized. e2e emulation
+cannot help: the bottleneck is F2FP packing, not exp2.
+
+On B200 the same FP8 path was relatively better (1.31x) because the BF16
+baseline softmax was also exp2-bound (MUFU at 16/clk), hiding the F2FP cost.
+B300 doubled MUFU (16→32/clk) but left F2FP at 32/clk, exposing it.
 
 ## Why FP4 PV is Slower than BF16 Reference
 
@@ -141,9 +173,11 @@ The softmax WG does significantly more work for FP4 PV:
 5. **`_quant_fp4()` (E2M1 pack)** — 8 floats → 1 uint32 → +128 cvt.e2m1x2 + bit ops
 6. **SF packing + R2S copy** — pack scale factors to UE4M3, copy to SMEM
 
-Items 3–6 add ~1500 cycles to softmax, making it 2322 cycles per stage vs
-the 1024-cycle MMA block for FP4×FP4 PV GEMM. The MMA WG stalls 1298 cycles
-per stage waiting for P. This explains the 0.86x performance.
+Items 3–6 add ~1500 cycles to softmax, making it ~2834 cycles per stage vs
+the 1024-cycle MMA block for FP4×FP4 PV GEMM. The MMA WG spends most of its
+time stalled waiting for P. This explains the 0.86x performance. Note the
+E2M1 cvt itself is fast (57/clk measured) — the cost is the group_max
+reduction, per-group scaling, and the register traffic they generate.
 
 ## e2e Emulation on B300
 
