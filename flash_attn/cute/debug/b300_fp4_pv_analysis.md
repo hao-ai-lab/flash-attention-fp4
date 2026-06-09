@@ -102,6 +102,49 @@ P pack: BF16 = 8192/(62/2) ≈ 256; FP8 = 8192/(32/2) = 512; FP4 quant is
 dominated by group_max + scale + register shuffling (+914 PTX instructions),
 not the E2M1 cvt itself (57/clk measured).
 
+## Real In-Kernel Trace (measured, not modeled)
+
+The kernel has flashinfer-style timestamp instrumentation
+(`flash_attn/cute/profiler.py`), compiled in via `FA4_PROFILE_PIPELINE=1`.
+One elected lane per warpgroup records `%clock` cycles at every pipeline
+event into a gmem buffer. Run `flash_attn/cute/debug/trace_pipeline.py`
+to capture and render a trace (3 rows: MMA WG, Softmax WG0, Softmax WG1).
+
+Measured means per event, block 0, b=1 s=4096 h=24 d=128 (96 softmax
+iterations per WG, GB300 at 2070 MHz; cycles from %clock):
+
+| Event (mean cycles)        | BF16 PV | FP8 PV  | FP4 PV  |
+|----------------------------|---------|---------|---------|
+| **MMA WG**                 |         |         |         |
+| wait P (stall)             | 841 (33%)| 950 (38%)| 1306 (42%)|
+| PV GEMM issue              | 560     | 405     | 549     |
+| QK GEMM issue              | 262     | 267     | 246     |
+| wait KV (TMA)              | 95      | 120     | 105     |
+| **Softmax WG (per iter)**  |         |         |         |
+| S load + row_max           | 697     | 821     | 666     |
+| exp2 (+fused pack)         | 1581    | 1674    | 1579    |
+| P quant / pack             | 75      | 325     | 1283    |
+| P store + signal           | 380     | 230     | 177     |
+| wait S                     | 581     | 759     | 594     |
+| wait corr                  | 867     | 173     | 1013    |
+
+Real-trace findings:
+- Even BF16 PV is partially softmax-bound on GB300: the MMA WG spends 33%
+  of its time waiting for P. The exp2 span (which includes the fused BF16
+  pack) measures ~1580 cycles — well above the 512-cycle MUFU-only roofline,
+  because both softmax WGs contend for the SM and the span includes the
+  e2e bookkeeping around the MUFU burst.
+- FP8 PV: the visible `quant` span only adds ~325 cycles because most of
+  the F2FP work is interleaved into the exp2 span (`_apply_exp2_pack_fp8`),
+  which grows by ~90 cycles; total extra ~340 cycles per iteration over
+  BF16, pushing MMA wait-P to 38%.
+- FP4 PV: P quantization measures ~1283 cycles per iteration on top of the
+  same exp2 cost — the softmax iteration grows from ~2,700 to ~3,700 cycles
+  while the PV GEMM gets cheaper, so the MMA WG stalls 42% of the time.
+- GEMM *issue* spans are short (250-560 cycles) — tcgen05 MMAs execute
+  asynchronously, so the MMA WG's real exposure is the waits, exactly what
+  the trace shows.
+
 The MMA WG must complete the full PV+QK cycle before the softmax results
 from the same stage are needed again. With ping-pong, each softmax WG has
 the entire MMA block cycle to complete its work. When softmax takes longer
@@ -239,6 +282,11 @@ CUDA_VISIBLE_DEVICES=1 python3 -m flash_attn.cute.benchmarks.bench_fp4 --quant_v
 # Generate PTX for instruction analysis
 CUDA_VISIBLE_DEVICES=1 CUTE_DSL_KEEP_PTX=1 python3 agent_space/profile_stalls.py --pv_mode bf16
 
-# Visualize pipeline model
+# Real in-kernel pipeline trace (instrumented kernel, %clock timestamps)
+CUDA_VISIBLE_DEVICES=1 python3 flash_attn/cute/debug/trace_pipeline.py --pv_mode bf16
+CUDA_VISIBLE_DEVICES=1 python3 flash_attn/cute/debug/trace_pipeline.py --pv_mode fp8
+CUDA_VISIBLE_DEVICES=1 python3 flash_attn/cute/debug/trace_pipeline.py --pv_mode fp4
+
+# Theoretical pipeline model (roofline-based, no kernel run needed)
 python3 flash_attn/cute/debug/visualize_pipeline.py
 ```

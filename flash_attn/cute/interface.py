@@ -665,6 +665,9 @@ def _flash_attn_fwd(
                            # key; both modes shared a slot and the second silently
                            # reused the kernel compiled for the first.
         local,
+        # In-kernel pipeline trace (flash_attn/cute/profiler.py): instrumented
+        # and clean kernels must not share a cache slot.
+        os.environ.get("FA4_PROFILE_PIPELINE", "0") == "1",
     )
     fp4_qk = use_fp4 and not is_cute_q
     # FP4 V also needs the make_ptr path: dlpack reports half-headdim shape for
@@ -921,7 +924,16 @@ def _flash_attn_fwd(
         ]
         # Add scale factor tensors if using the block-scaled SM100 kernel
         if use_blockscaled_impl:
-            compile_args.extend([mSFQ_tensor, mSFK_tensor, mSFV_tensor])
+            # In-kernel pipeline trace buffer (FA4_PROFILE_PIPELINE=1).
+            profiler_tensor = None
+            if os.environ.get("FA4_PROFILE_PIPELINE", "0") == "1":
+                from flash_attn.cute import profiler as fa4_profiler
+                if fa4_profiler.LAST_BUFFER is None:
+                    fa4_profiler.LAST_BUFFER = fa4_profiler.allocate_profiler_buffer()
+                profiler_tensor = to_cute_tensor(
+                    fa4_profiler.LAST_BUFFER, assumed_align=16, leading_dim=0
+                )
+            compile_args.extend([mSFQ_tensor, mSFK_tensor, mSFV_tensor, profiler_tensor])
         # Add q/k shapes for the block-scaled kernel (it always builds tensors from pointer + shape)
         if use_blockscaled_impl:
             if fp4_qk:
@@ -989,7 +1001,13 @@ def _flash_attn_fwd(
 
     # Add scale factor tensors if using the block-scaled SM100 kernel
     if use_blockscaled_impl:
-        call_args.extend([mSFQ, mSFK, mSFV])
+        profiler_buf = None
+        if os.environ.get("FA4_PROFILE_PIPELINE", "0") == "1":
+            from flash_attn.cute import profiler as fa4_profiler
+            if fa4_profiler.LAST_BUFFER is None:
+                fa4_profiler.LAST_BUFFER = fa4_profiler.allocate_profiler_buffer()
+            profiler_buf = fa4_profiler.LAST_BUFFER
+        call_args.extend([mSFQ, mSFK, mSFV, profiler_buf])
     # Add q/k shapes for the block-scaled kernel
     if use_blockscaled_impl:
         call_args.extend([q_ptr_shape, k_ptr_shape])

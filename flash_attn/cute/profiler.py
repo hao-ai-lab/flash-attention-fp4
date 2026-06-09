@@ -5,14 +5,16 @@ Two modes:
    to estimate per-WG timing. No kernel modification needed.
    Run: `python3 flash_attn/cute/debug/visualize_pipeline.py`
 
-2. **Trace-based** (opt-in): Injects `cute.printf` calls at key pipeline points
-   to capture actual `globaltimer_lo` timestamps. Requires kernel recompilation.
-   Set `FA4_PROFILE_PIPELINE=1` before running the kernel.
+2. **Trace-based** (opt-in): records %clock timestamps at pipeline events
+   inside the kernel (modeled on flashinfer's profiler.cuh), written to a
+   gmem buffer by one elected lane per warpgroup. Enabled at compile time
+   via FA4_PROFILE_PIPELINE=1 — when off, the kernel has no trace code.
+   Run: `FA4_PROFILE_PIPELINE=1 python3 flash_attn/cute/debug/trace_pipeline.py`
 
-Buffer layout for trace mode (uint64 per entry):
-    Entry 0: metadata (num_blocks << 32 | num_groups)
-    Entry 1+: strided by (block_idx * num_groups + group_idx)
-    Each entry: (tag:u32, timestamp:u32) packed into u64
+Buffer layout for trace mode (int32):
+    [0] = num_blocks (CTAs), [1] = num_groups
+    Event k of (block b, group g): tag at index 2 + 2*((b*G+g) + k*stride),
+    timestamp at +1, where stride = num_blocks * num_groups.
     Tag encoding: sm_id[31:24] | block_id[23:12] | event_idx[11:2] | event_type[1:0]
 """
 
@@ -20,7 +22,7 @@ import os
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Int32
+from cutlass import Int32
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.cute.arch import llvm
 
@@ -59,28 +61,96 @@ def smid(*, loc=None, ip=None) -> Int32:
     )
 
 
+@dsl_user_op
+def clock_lo(*, loc=None, ip=None) -> Int32:
+    """Read the low 32 bits of the per-SM cycle counter (%clock).
+
+    Cycle-accurate and coherent across warps of the same CTA (same SM),
+    which is exactly what the FA4 pipeline trace needs — the MMA WG and
+    both softmax WGs live in one CTA. Wraps every 2^32 cycles (~2s @ 2GHz).
+    """
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [],
+            "mov.u32 $0, %clock;",
+            "=r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
+# In-kernel trace recording (flashinfer-style, see flashinfer/profiler.cuh)
+#
+# Buffer is int32. Layout:
+#   [0] = num_blocks (CTAs), [1] = num_groups
+#   entry k of (block b, group g): tag at 2 + 2*((b*num_groups+g) + k*stride),
+#   timestamp at +1, where stride = num_blocks*num_groups.
+# Tag: sm_id[31:24] | block_id[23:12] | event_idx[11:2] | event_type[1:0].
+# One elected lane per warpgroup writes; the slot counter k is a loop-carried
+# register in the calling warpgroup (no atomics, no gmem read-modify-write).
+# ---------------------------------------------------------------------------
+
+@cute.jit
+def prof_init_meta(prof: cute.Tensor, num_blocks: Int32, num_groups: Int32):
+    """Write buffer metadata. Call from one thread of block 0."""
+    prof[0] = num_blocks
+    prof[1] = num_groups
+
+
+@cute.jit
+def prof_make_tag_base(block_linear: Int32) -> Int32:
+    """Tag base for the current SM/block (event bits filled per record)."""
+    return (smid() << 24) | ((block_linear & 0xFFF) << 12)
+
+
+@cute.jit
+def prof_record(
+    prof: cute.Tensor,
+    bg_index: Int32,       # block_linear * num_groups + group
+    stride: Int32,         # num_blocks * num_groups
+    tag_base: Int32,
+    k: Int32,              # per-(block, group) slot counter
+    event_idx: cutlass.Constexpr[int],
+    event_type: cutlass.Constexpr[int],
+    pred,                  # only the elected lane writes
+) -> Int32:
+    """Record one event; returns the next slot counter (k + 1)."""
+    if pred:
+        slot32 = 2 + 2 * (bg_index + k * stride)
+        if slot32 + 1 < cute.size(prof.shape):
+            prof[slot32] = tag_base | Int32((event_idx << 2) | event_type)
+            prof[slot32 + 1] = clock_lo()
+    return k + 1
+
+
 # Event type constants
 EVENT_BEGIN = 0
 EVENT_END = 1
 EVENT_INSTANT = 2
 
 # Event index constants (10-bit, max 1023)
-EVT_QK_GEMM = 0
-EVT_PV_GEMM = 1
-EVT_SOFTMAX_EXP = 2
-EVT_SOFTMAX_QUANT = 3
-EVT_SOFTMAX_ROWMAX = 4
-EVT_SOFTMAX_ROWSUM = 5
-EVT_SOFTMAX_WAIT_S = 6
-EVT_SOFTMAX_SIGNAL_P = 7
-EVT_MMA_WAIT_P = 8
-EVT_MMA_SIGNAL_S = 9
-EVT_CORRECTION = 10
-EVT_EPILOGUE = 11
+EVT_QK_GEMM = 0          # MMA WG: QK GEMM issue
+EVT_PV_GEMM = 1          # MMA WG: PV GEMM issue
+EVT_SOFTMAX_EXP = 2      # softmax WG: exp2 (+row_sum; +pack on fused paths)
+EVT_SOFTMAX_QUANT = 3    # softmax WG: P quant / pack
+EVT_SOFTMAX_ROWMAX = 4   # softmax WG: S t2r load + mask + row_max + subtract
+EVT_SOFTMAX_ROWSUM = 5   # (unused; row_sum folded into EXP)
+EVT_SOFTMAX_WAIT_S = 6   # softmax WG: mbarrier wait for S_full
+EVT_SOFTMAX_STORE_P = 7  # softmax WG: P r2t store + P_full arrives
+EVT_MMA_WAIT_P = 8       # MMA WG: mbarrier wait for P_full / O rescaled
+EVT_MMA_SIGNAL_S = 9     # (unused)
+EVT_SOFTMAX_WAIT_CORR = 10  # softmax WG: wait for correction empty
+EVT_EPILOGUE = 11        # (unused)
+EVT_MMA_WAIT_KV = 12     # MMA WG: pipeline_kv consumer wait (TMA load)
 
 EVENT_NAMES = [
-    "QK GEMM", "PV GEMM", "exp2", "P quant", "row_max", "row_sum",
-    "wait S", "signal P", "wait P", "signal S", "correction", "epilogue",
+    "QK GEMM", "PV GEMM", "exp2", "P quant", "load+row_max", "row_sum",
+    "wait S", "store P", "wait P", "signal S", "wait corr", "epilogue",
+    "wait KV",
 ]
 
 # WG group indices
@@ -98,235 +168,86 @@ def is_profiling_enabled():
     return os.environ.get("FA4_PROFILE_PIPELINE", "0") == "1"
 
 
-def allocate_profiler_buffer(max_events_per_group=256, num_blocks=256):
-    """Allocate a global memory buffer for profiling events."""
+# Host-side handle to the buffer used by the most recent profiled kernel
+# launch. Set by interface.py, read by the trace script after the call.
+LAST_BUFFER = None
+
+# Default buffer size: 8M int32 = 32 MB = up to ~9000 events per (block,
+# group) at a 148-CTA persistent grid.
+DEFAULT_BUFFER_INT32 = 8 * 1024 * 1024
+
+
+def allocate_profiler_buffer(device="cuda", n_int32=DEFAULT_BUFFER_INT32):
+    """Allocate (and zero) the int32 trace buffer."""
     import torch
-    total_entries = 1 + max_events_per_group * num_blocks * NUM_GROUPS
-    buf = torch.zeros(total_entries, dtype=torch.int64, device="cuda")
-    return buf
+    return torch.zeros(n_int32, dtype=torch.int32, device=device)
 
 
-def decode_events(profiler_buf):
-    """Decode the profiler buffer into a list of event dicts."""
+def decode_trace(profiler_buf):
+    """Decode the int32-pair trace buffer into a list of event dicts.
+
+    Returns (events, num_blocks, num_groups). Events carry timestamps in
+    SM cycles (from %clock), coherent within one block.
+    """
     import numpy as np
 
-    buf = profiler_buf.cpu().numpy().view(np.uint64)
-    if buf[0] == 0:
+    buf = profiler_buf.cpu().numpy().view(np.uint32)
+    num_blocks = int(buf[0])
+    num_groups = int(buf[1])
+    if num_blocks == 0 or num_groups == 0:
         return [], 0, 0
 
-    raw = int(buf[0])
-    num_blocks = raw & 0xFFFFFFFF
-    num_groups = (raw >> 32) & 0xFFFFFFFF
-
+    stride = num_blocks * num_groups
     events = []
-    for i in range(1, len(buf)):
-        if buf[i] == 0:
-            continue
-        raw = int(buf[i])
-        tag = raw & 0xFFFFFFFF
-        timestamp = (raw >> 32) & 0xFFFFFFFF
-
-        sm_id = (tag >> 24) & 0xFF
-        block_group_idx = (tag >> 12) & 0xFFF
-        event_idx = (tag >> 2) & 0x3FF
-        event_type = tag & 0x3
-
-        block_idx = block_group_idx // num_groups if num_groups > 0 else 0
-        group_idx = block_group_idx % num_groups if num_groups > 0 else 0
-
+    data = buf[2:]
+    n_pairs = len(data) // 2
+    tags = data[0 : 2 * n_pairs : 2]
+    times = data[1 : 2 * n_pairs : 2]
+    nonzero = np.nonzero(tags)[0]
+    for i in nonzero:
+        tag = int(tags[i])
+        bg = int(i % stride)
         events.append({
-            "block_idx": block_idx,
-            "group_idx": group_idx,
-            "event_idx": event_idx,
-            "event_type": event_type,
-            "sm_id": sm_id,
-            "timestamp": timestamp,
+            "block_idx": bg // num_groups,
+            "group_idx": bg % num_groups,
+            "slot": int(i // stride),
+            "event_idx": (tag >> 2) & 0x3FF,
+            "event_type": tag & 0x3,
+            "sm_id": (tag >> 24) & 0xFF,
+            "timestamp": int(times[i]),
         })
+    return events, num_blocks, num_groups
 
-    return events, int(num_blocks), int(num_groups)
 
+def pair_spans(events):
+    """Pair sequential BEGIN/END events per (block, group) into spans.
 
-def parse_printf_trace(stdout_text):
-    """Parse cute.printf trace output into events.
-
-    Expected format per line:
-        FA4_TRACE|<wg_id>|<event_idx>|<event_type>|<timestamp>|<sm_id>|<block_id>
-
-    Returns list of event dicts compatible with visualize_pipeline().
+    Events of one (block, group) are written by a single thread in slot
+    order, so pairing is by slot order with a per-event-idx open stack.
+    Returns dict (block, group) -> list of {event_idx, start, end} sorted
+    by start, with timestamps rebased per block to that block's minimum.
     """
-    import re
-    events = []
-    pattern = re.compile(
-        r"FA4_TRACE\|(\d+)\|(\d+)\|(\d+)\|(\d+)\|(\d+)\|(\d+)"
-    )
-    for line in stdout_text.strip().split("\n"):
-        m = pattern.search(line)
-        if m:
-            wg_id, event_idx, event_type, timestamp, sm_id, block_id = (
-                int(x) for x in m.groups()
-            )
-            events.append({
-                "block_idx": block_id,
-                "group_idx": wg_id,
-                "event_idx": event_idx,
-                "event_type": event_type,
-                "sm_id": sm_id,
-                "timestamp": timestamp,
-            })
-    return events
+    from collections import defaultdict
 
+    by_bg = defaultdict(list)
+    for e in events:
+        by_bg[(e["block_idx"], e["group_idx"])].append(e)
 
-def visualize_pipeline(events, block_idx=0, output_path="pipeline_trace.png",
-                       max_iterations=None, title=None):
-    """Create a 3-row pipeline timeline visualization.
-
-    Rows: MMA WG, Softmax WG0, Softmax WG1
-    MMA WG events are colored by which softmax WG's output they consume.
-    """
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    import matplotlib.patches as mpatches
-
-    # Filter to selected block
-    block_events = [e for e in events if e["block_idx"] == block_idx]
-    if not block_events:
-        print(f"No events for block {block_idx}")
-        return
-
-    block_events.sort(key=lambda e: e["timestamp"])
-    t0 = block_events[0]["timestamp"]
-
-    # Pair begin/end events per group
-    rows = {GRP_MMA: [], GRP_SOFTMAX0: [], GRP_SOFTMAX1: []}
-    open_events = {}
-
-    for e in block_events:
-        grp = e["group_idx"]
-        if grp not in rows:
-            continue
-        key = (grp, e["event_idx"])
-        if e["event_type"] == EVENT_BEGIN:
-            open_events[key] = e
-        elif e["event_type"] == EVENT_END:
-            if key in open_events:
-                start = open_events.pop(key)
-                rows[grp].append({
+    spans = {}
+    for bg, evs in by_bg.items():
+        evs.sort(key=lambda e: e["slot"])
+        open_ev = {}
+        out = []
+        for e in evs:
+            if e["event_type"] == EVENT_BEGIN:
+                open_ev[e["event_idx"]] = e
+            elif e["event_type"] == EVENT_END and e["event_idx"] in open_ev:
+                b = open_ev.pop(e["event_idx"])
+                out.append({
                     "event_idx": e["event_idx"],
-                    "start": start["timestamp"] - t0,
-                    "end": e["timestamp"] - t0,
+                    "start": b["timestamp"],
+                    "end": e["timestamp"],
                 })
-
-    # Color scheme
-    stage0_color = "#4CAF50"   # green for stage 0
-    stage1_color = "#FF9800"   # orange for stage 1
-    qk_color = "#2196F3"       # blue for QK
-    exp_color = "#9C27B0"      # purple for exp
-    quant_color = "#E91E63"    # pink for quant
-    rowop_color = "#00BCD4"    # cyan for row_max/row_sum
-    wait_color = "#9E9E9E"     # gray for waits
-    other_color = "#607D8B"    # blue-gray
-
-    def get_color(grp, evt_idx):
-        if grp == GRP_MMA:
-            if evt_idx == EVT_QK_GEMM:
-                return qk_color
-            elif evt_idx == EVT_PV_GEMM:
-                return stage0_color
-            elif evt_idx == EVT_MMA_WAIT_P:
-                return wait_color
-        elif grp in (GRP_SOFTMAX0, GRP_SOFTMAX1):
-            if evt_idx == EVT_SOFTMAX_EXP:
-                return exp_color
-            elif evt_idx == EVT_SOFTMAX_QUANT:
-                return quant_color
-            elif evt_idx in (EVT_SOFTMAX_ROWMAX, EVT_SOFTMAX_ROWSUM):
-                return rowop_color
-            elif evt_idx in (EVT_SOFTMAX_WAIT_S, EVT_SOFTMAX_SIGNAL_P):
-                return wait_color
-        return other_color
-
-    fig, axes = plt.subplots(3, 1, figsize=(20, 4), sharex=True,
-                             gridspec_kw={"hspace": 0.15})
-
-    row_map = {GRP_MMA: 0, GRP_SOFTMAX0: 1, GRP_SOFTMAX1: 2}
-    row_labels = ["MMA WG", "Softmax WG0", "Softmax WG1"]
-
-    mma_counters = {"QK": 0, "PV": 0}
-    pv_stage_toggle = 0
-
-    for grp_idx, ax_idx in row_map.items():
-        ax = axes[ax_idx]
-        ax.set_ylabel(row_labels[ax_idx], fontsize=10, rotation=0,
-                       ha="right", va="center")
-        ax.set_ylim(0, 1)
-        ax.set_yticks([])
-        ax.spines["top"].set_visible(False)
-        ax.spines["right"].set_visible(False)
-        ax.spines["left"].set_visible(False)
-
-        for span in rows.get(grp_idx, []):
-            evt = span["event_idx"]
-            start_ns = span["start"]
-            duration = span["end"] - span["start"]
-            color = get_color(grp_idx, evt)
-
-            label = ""
-            if grp_idx == GRP_MMA:
-                if evt == EVT_QK_GEMM:
-                    mma_counters["QK"] += 1
-                    label = f"QK{mma_counters['QK']}"
-                    color = qk_color
-                elif evt == EVT_PV_GEMM:
-                    mma_counters["PV"] += 1
-                    label = f"PV{mma_counters['PV']}"
-                    color = [stage0_color, stage1_color][pv_stage_toggle]
-                    pv_stage_toggle = 1 - pv_stage_toggle
-                elif evt == EVT_MMA_WAIT_P:
-                    label = "wait"
-            elif grp_idx in (GRP_SOFTMAX0, GRP_SOFTMAX1):
-                if evt == EVT_SOFTMAX_EXP:
-                    label = "exp"
-                elif evt == EVT_SOFTMAX_QUANT:
-                    label = "quant"
-                elif evt == EVT_SOFTMAX_WAIT_S:
-                    label = "wait"
-                elif evt == EVT_SOFTMAX_ROWMAX:
-                    label = "rmax"
-                elif evt == EVT_SOFTMAX_ROWSUM:
-                    label = "rsum"
-
-            ax.barh(0.5, duration, left=start_ns, height=0.7,
-                    color=color, edgecolor="white", linewidth=0.5)
-            if label and duration > 20:
-                ax.text(start_ns + duration / 2, 0.5, label,
-                        ha="center", va="center", fontsize=7, color="white",
-                        fontweight="bold")
-
-    if max_iterations:
-        all_ends = [s["end"] for grp in rows.values() for s in grp]
-        if all_ends:
-            axes[-1].set_xlim(0, sorted(all_ends)[
-                min(len(all_ends) - 1, max_iterations * 10)
-            ])
-
-    axes[-1].set_xlabel("Time (cycles)")
-    fig.suptitle(title or f"FA4 Pipeline Trace — Block {block_idx}",
-                 fontsize=12, y=0.98)
-
-    legend_patches = [
-        mpatches.Patch(color=qk_color, label="QK GEMM"),
-        mpatches.Patch(color=stage0_color, label="PV (stage 0)"),
-        mpatches.Patch(color=stage1_color, label="PV (stage 1)"),
-        mpatches.Patch(color=exp_color, label="exp2"),
-        mpatches.Patch(color=quant_color, label="P quant/pack"),
-        mpatches.Patch(color=rowop_color, label="row_max/row_sum"),
-        mpatches.Patch(color=wait_color, label="barrier wait"),
-    ]
-    fig.legend(handles=legend_patches, loc="upper right", ncol=4, fontsize=8,
-               bbox_to_anchor=(0.98, 0.98))
-
-    plt.savefig(output_path, dpi=150, bbox_inches="tight")
-    plt.close()
-    print(f"Pipeline visualization saved to {output_path}")
-    return output_path
+        out.sort(key=lambda s: s["start"])
+        spans[bg] = out
+    return spans
