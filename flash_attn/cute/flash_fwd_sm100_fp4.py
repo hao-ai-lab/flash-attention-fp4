@@ -2445,15 +2445,26 @@ class FlashAttentionForwardSm100:
 
                         if const_expr(prof is not None):
                             prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_PV_GEMM, fa4_prof.EVENT_BEGIN, prof_pred)
-                        gemm_Pi[stage](
-                            tCrB=tOrVi,
-                            sB=sV_cur,
-                            zero_init=not O_should_accumulate,
-                            mbar_ptr=mbar_ptr + self.mbar_P_full_2_offset + stage,
-                            mbar_phase=P_full_O_rescaled_phase,
-                        )
-                        if const_expr(prof is not None):
+                            # The PV issue sequence embeds a wait for P's 2nd
+                            # half; the GEMM's PTX stores %clock around it.
+                            prof_k, _pts_b, _pts_e = fa4_prof.prof_reserve_pair_ts(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_PV_WAIT_P2, prof_pred)
+                            gemm_Pi[stage](
+                                tCrB=tOrVi,
+                                sB=sV_cur,
+                                zero_init=not O_should_accumulate,
+                                mbar_ptr=mbar_ptr + self.mbar_P_full_2_offset + stage,
+                                mbar_phase=P_full_O_rescaled_phase,
+                                prof_ts_addrs=(_pts_b, _pts_e),
+                            )
                             prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_PV_GEMM, fa4_prof.EVENT_END, prof_pred)
+                        else:
+                            gemm_Pi[stage](
+                                tCrB=tOrVi,
+                                sB=sV_cur,
+                                zero_init=not O_should_accumulate,
+                                mbar_ptr=mbar_ptr + self.mbar_P_full_2_offset + stage,
+                                mbar_phase=P_full_O_rescaled_phase,
+                            )
 
                         # 4. release accumulated O0_partial / O1_partial
                         # Don't need to signal O_full to the correction warps anymore since the
@@ -2571,15 +2582,24 @@ class FlashAttentionForwardSm100:
                     _zi_post = not O_should_accumulate
                     if const_expr(prof is not None):
                         prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_PV_GEMM, fa4_prof.EVENT_BEGIN, prof_pred)
-                    gemm_Pi[stage](
-                        tCrB=tOrVi,
-                        sB=sV_cur,
-                        zero_init=_zi_post,
-                        mbar_ptr=mbar_ptr + self.mbar_P_full_2_offset + stage,
-                        mbar_phase=P_full_O_rescaled_phase,
-                    )
-                    if const_expr(prof is not None):
+                        prof_k, _pts_b, _pts_e = fa4_prof.prof_reserve_pair_ts(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_PV_WAIT_P2, prof_pred)
+                        gemm_Pi[stage](
+                            tCrB=tOrVi,
+                            sB=sV_cur,
+                            zero_init=_zi_post,
+                            mbar_ptr=mbar_ptr + self.mbar_P_full_2_offset + stage,
+                            mbar_phase=P_full_O_rescaled_phase,
+                            prof_ts_addrs=(_pts_b, _pts_e),
+                        )
                         prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_PV_GEMM, fa4_prof.EVENT_END, prof_pred)
+                    else:
+                        gemm_Pi[stage](
+                            tCrB=tOrVi,
+                            sB=sV_cur,
+                            zero_init=_zi_post,
+                            mbar_ptr=mbar_ptr + self.mbar_P_full_2_offset + stage,
+                            mbar_phase=P_full_O_rescaled_phase,
+                        )
                     # 4. release accumulated O0_partial
                     # We do need O_full here since for the last tile, by the time the softmax warp
                     # has signaled to the correction warps, the softmax warp has just finished compute

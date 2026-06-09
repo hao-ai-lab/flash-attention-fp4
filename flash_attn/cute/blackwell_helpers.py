@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32, Boolean, const_expr, Float32
+from cutlass import Int32, Int64, Boolean, const_expr, Float32
 from cutlass.cutlass_dsl import T
 from cutlass.cute.nvgpu import tcgen05
 from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode
@@ -414,6 +414,9 @@ def gemm_ptx_partial(
     tA_addr: Optional[Int32] = None,
     cta_group: int = 1,
     pre_mbar_tiles: Optional[cutlass.Constexpr[int]] = None,
+    # (ts_addr_begin, ts_addr_end): global addresses where %clock is stored
+    # right before / after the embedded mbarrier wait (pipeline tracing).
+    prof_ts_addrs: Optional[tuple] = None,
 ) -> None:
     # acc_tmem_addr += acc_offset
     is_ts = op.a_src == cute.nvgpu.tcgen05.OperandSource.TMEM
@@ -547,14 +550,33 @@ def gemm_ptx_partial(
                 split_arrive_idx = cute.size(tCrA.shape[2]) // 4 * 3
             input_args.append(mbar_ptr.toint().ir_value())
             input_args.append(Int32(mbar_phase).ir_value())
-            mbar_wait_str = (
-                ".reg .pred P1; \n\t"
-                "LAB_WAIT: \n\t"
-                "mbarrier.try_wait.parity.shared::cta.b64 P1, [$4], $5, 10000000; \n\t"
-                "@P1 bra DONE; \n\t"
-                "bra     LAB_WAIT; \n\t"
-                "DONE: \n\t"
-            )
+            if const_expr(prof_ts_addrs is not None):
+                # Store %clock around the wait so the trace shows the actual
+                # measured wait window instead of an estimate.
+                input_args.append(Int64(prof_ts_addrs[0]).ir_value())
+                input_args.append(Int64(prof_ts_addrs[1]).ir_value())
+                mbar_wait_str = (
+                    ".reg .pred P1; \n\t"
+                    ".reg .b32 prof_clk; \n\t"
+                    "mov.u32 prof_clk, %clock; \n\t"
+                    "@leader_thread st.global.u32 [$6], prof_clk; \n\t"
+                    "LAB_WAIT: \n\t"
+                    "mbarrier.try_wait.parity.shared::cta.b64 P1, [$4], $5, 10000000; \n\t"
+                    "@P1 bra DONE; \n\t"
+                    "bra     LAB_WAIT; \n\t"
+                    "DONE: \n\t"
+                    "mov.u32 prof_clk, %clock; \n\t"
+                    "@leader_thread st.global.u32 [$7], prof_clk; \n\t"
+                )
+            else:
+                mbar_wait_str = (
+                    ".reg .pred P1; \n\t"
+                    "LAB_WAIT: \n\t"
+                    "mbarrier.try_wait.parity.shared::cta.b64 P1, [$4], $5, 10000000; \n\t"
+                    "@P1 bra DONE; \n\t"
+                    "bra     LAB_WAIT; \n\t"
+                    "DONE: \n\t"
+                )
         else:
             mbar_wait_str = ""
         llvm.inline_asm(
@@ -614,7 +636,9 @@ def gemm_ptx_partial(
                 else ""
             )
             + "}\n",
-            "r,r,r,r" if const_expr(mbar_ptr is None) else "r,r,r,r,r,r",
+            "r,r,r,r"
+            if const_expr(mbar_ptr is None)
+            else ("r,r,r,r,r,r" if const_expr(prof_ts_addrs is None) else "r,r,r,r,r,r,l,l"),
             has_side_effects=True,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -1194,6 +1218,9 @@ def gemm_ptx_partial_fp4(
     zero_init: bool | Boolean = False,
     tA_addr: Optional[Int32] = None,
     pre_mbar_tiles: Optional[cutlass.Constexpr[int]] = None,
+    # (ts_addr_begin, ts_addr_end): global addresses where %clock is stored
+    # right before / after the embedded mbarrier wait (pipeline tracing).
+    prof_ts_addrs: Optional[tuple] = None,
 ) -> None:
     is_ts = op.a_src == cute.nvgpu.tcgen05.OperandSource.TMEM
     if const_expr(not is_ts):
@@ -1360,14 +1387,33 @@ def gemm_ptx_partial_fp4(
             assert mbar_phase is not None, "mbar_phase must be provided when mbar_ptr is not None"
             input_args.append(mbar_ptr.toint().ir_value())
             input_args.append(Int32(mbar_phase).ir_value())
-            mbar_wait_str = (
-                ".reg .pred P1; \n\t"
-                "LAB_WAIT: \n\t"
-                "mbarrier.try_wait.parity.shared::cta.b64 P1, [$6], $7, 10000000; \n\t"
-                "@P1 bra DONE; \n\t"
-                "bra     LAB_WAIT; \n\t"
-                "DONE: \n\t"
-            )
+            if const_expr(prof_ts_addrs is not None):
+                # Store %clock around the wait so the trace shows the actual
+                # measured wait window instead of an estimate.
+                input_args.append(Int64(prof_ts_addrs[0]).ir_value())
+                input_args.append(Int64(prof_ts_addrs[1]).ir_value())
+                mbar_wait_str = (
+                    ".reg .pred P1; \n\t"
+                    ".reg .b32 prof_clk; \n\t"
+                    "mov.u32 prof_clk, %clock; \n\t"
+                    "@leader_thread st.global.u32 [$8], prof_clk; \n\t"
+                    "LAB_WAIT: \n\t"
+                    "mbarrier.try_wait.parity.shared::cta.b64 P1, [$6], $7, 10000000; \n\t"
+                    "@P1 bra DONE; \n\t"
+                    "bra     LAB_WAIT; \n\t"
+                    "DONE: \n\t"
+                    "mov.u32 prof_clk, %clock; \n\t"
+                    "@leader_thread st.global.u32 [$9], prof_clk; \n\t"
+                )
+            else:
+                mbar_wait_str = (
+                    ".reg .pred P1; \n\t"
+                    "LAB_WAIT: \n\t"
+                    "mbarrier.try_wait.parity.shared::cta.b64 P1, [$6], $7, 10000000; \n\t"
+                    "@P1 bra DONE; \n\t"
+                    "bra     LAB_WAIT; \n\t"
+                    "DONE: \n\t"
+                )
         else:
             mbar_wait_str = ""
 
@@ -1443,7 +1489,9 @@ def gemm_ptx_partial_fp4(
                 else ""
             )
             + "}\n",
-            "r,r,r,r,r,r" if const_expr(mbar_ptr is None) else "r,r,r,r,r,r,r,r",
+            "r,r,r,r,r,r"
+            if const_expr(mbar_ptr is None)
+            else ("r,r,r,r,r,r,r,r" if const_expr(prof_ts_addrs is None) else "r,r,r,r,r,r,r,r,l,l"),
             has_side_effects=True,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,

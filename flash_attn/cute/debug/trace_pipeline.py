@@ -38,6 +38,7 @@ COLORS = {
     fa4_prof.EVT_SOFTMAX_WAIT_CORR: "#999999", # darker gray
     fa4_prof.EVT_MMA_WAIT_P: "#CCCCCC",        # gray
     fa4_prof.EVT_MMA_WAIT_KV: "#888888",       # dark gray
+    fa4_prof.EVT_PV_WAIT_P2: "#E8E8E8",        # light gray overlay on PV
 }
 
 LABELS = {
@@ -51,6 +52,7 @@ LABELS = {
     fa4_prof.EVT_SOFTMAX_WAIT_CORR: "wait corr",
     fa4_prof.EVT_MMA_WAIT_P: "wait P",
     fa4_prof.EVT_MMA_WAIT_KV: "wait KV",
+    fa4_prof.EVT_PV_WAIT_P2: "wait P2",
 }
 
 WAIT_EVENTS = {
@@ -171,40 +173,38 @@ def render(spans_by_bg, block, output_path, title, start_iter, num_iters):
 
             is_wait = evt in WAIT_EVENTS
             h = 0.35 if is_wait else 0.7
+            zorder = 2 if is_wait else 3
+            if evt == fa4_prof.EVT_PV_WAIT_P2:
+                # Measured embedded wait (%clock stored inside the GEMM's
+                # PTX around its mbar_P_full_2 try_wait) — drawn on top of
+                # the enclosing PV bar at its actual position.
+                h, zorder = 0.5, 4
             vis_dur = vis_end - vis_start
             ax.add_patch(Rectangle(
                 (vis_start - w0, 0.5 - h / 2), max(vis_dur, 1), h,
                 facecolor=color, edgecolor="none",
-                zorder=2 if is_wait else 3,
+                zorder=zorder,
             ))
-            if grp == fa4_prof.GRP_MMA and evt == fa4_prof.EVT_PV_GEMM:
-                # Mid-bar dotted divider: the PV issue sequence embeds a wait
-                # for the 2nd half of P (mbar_P_full_2 in gemm_ptx_partial)
-                # roughly here — long PV bars are that wait, not a slower GEMM.
-                cx = vis_start - w0 + vis_dur / 2
-                ax.plot([cx, cx], [0.5 - h / 2, 0.5 + h / 2],
-                        linestyle=":", color="white", linewidth=1.2, zorder=5)
             # Label only when the bar is wide enough for the text
             # (~2550 usable px at figsize 20in x 150dpi).
             bar_px = vis_dur * 2550.0 / (w1 - w0)
+            dark_text = is_wait or evt == fa4_prof.EVT_PV_WAIT_P2
             if label and bar_px >= 10 * len(label) + 8:
                 ax.text(vis_start - w0 + vis_dur / 2, 0.5, label,
                         ha="center", va="center", fontsize=7,
-                        color="white" if not is_wait else "#555555",
-                        fontweight="bold", zorder=4, clip_on=True)
+                        color="#555555" if dark_text else "white",
+                        fontweight="bold", zorder=6, clip_on=True)
 
         ax.set_xlim(0, w1 - w0)
 
     axes[-1].set_xlabel("Cycles (%clock, same SM)")
     fig.suptitle(title, fontsize=12, fontweight="bold")
 
-    from matplotlib.lines import Line2D
     legend = [
-        mpatches.Patch(color="#4488CC", label="QK GEMM issue"),
-        mpatches.Patch(color="#44AA66", label="PV GEMM issue (stage 0)"),
-        mpatches.Patch(color="#DD8844", label="PV GEMM issue (stage 1)"),
-        Line2D([0], [0], color="#555555", linestyle=":", linewidth=1.5,
-               label="embedded wait for P 2nd half (inside PV)"),
+        mpatches.Patch(color="#4488CC", label="QK GEMM"),
+        mpatches.Patch(color="#44AA66", label="PV GEMM (stage 0)"),
+        mpatches.Patch(color="#DD8844", label="PV GEMM (stage 1)"),
+        mpatches.Patch(color="#E8E8E8", label="wait P 2nd half (measured, inside PV)"),
         mpatches.Patch(color="#9966CC", label="exp2 (+fused pack)"),
         mpatches.Patch(color="#CC3355", label="P quant / pack"),
         mpatches.Patch(color="#77BBDD", label="S load + row_max"),

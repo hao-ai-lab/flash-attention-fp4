@@ -22,7 +22,7 @@ import os
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32
+from cutlass import Int32, Int64
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.cute.arch import llvm
 
@@ -127,6 +127,39 @@ def prof_record(
     return k + 1
 
 
+@cute.jit
+def prof_reserve_pair_ts(
+    prof: cute.Tensor,
+    bg_index: Int32,
+    stride: Int32,
+    tag_base: Int32,
+    k: Int32,
+    event_idx: cutlass.Constexpr[int],
+    pred,
+):
+    """Reserve a BEGIN/END pair at slots k and k+1, writing only the tags.
+
+    Returns (k + 2, ts_addr_begin, ts_addr_end): the global addresses of the
+    two timestamp ints, to be filled by device code that knows the actual
+    event boundaries (e.g. %clock stores inside a GEMM's inline PTX around
+    its embedded mbarrier wait). Out-of-range slots are redirected to the
+    last entry pair of the buffer as a sacrificial scratch slot.
+    """
+    slot_b = 2 + 2 * (bg_index + k * stride)
+    slot_e = 2 + 2 * (bg_index + (k + 1) * stride)
+    last_ok = cute.size(prof.shape) - 2
+    if slot_e + 1 >= cute.size(prof.shape):
+        slot_b = last_ok
+        slot_e = last_ok
+    if pred:
+        prof[slot_b] = tag_base | Int32((event_idx << 2) | 0)  # EVENT_BEGIN
+        prof[slot_e] = tag_base | Int32((event_idx << 2) | 1)  # EVENT_END
+    base = Int64(prof.iterator.toint())
+    ts_addr_b = base + Int64(slot_b + 1) * 4
+    ts_addr_e = base + Int64(slot_e + 1) * 4
+    return k + 2, ts_addr_b, ts_addr_e
+
+
 # Event type constants
 EVENT_BEGIN = 0
 EVENT_END = 1
@@ -146,11 +179,12 @@ EVT_MMA_SIGNAL_S = 9     # (unused)
 EVT_SOFTMAX_WAIT_CORR = 10  # softmax WG: wait for correction empty
 EVT_EPILOGUE = 11        # (unused)
 EVT_MMA_WAIT_KV = 12     # MMA WG: pipeline_kv consumer wait (TMA load)
+EVT_PV_WAIT_P2 = 13      # MMA WG: embedded wait for P 2nd half inside PV GEMM
 
 EVENT_NAMES = [
     "QK GEMM", "PV GEMM", "exp2", "P quant", "load+row_max", "row_sum",
     "wait S", "store P", "wait P", "signal S", "wait corr", "epilogue",
-    "wait KV",
+    "wait KV", "wait P2",
 ]
 
 # WG group indices

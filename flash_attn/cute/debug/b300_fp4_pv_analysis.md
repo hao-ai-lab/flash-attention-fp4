@@ -144,13 +144,19 @@ Real-trace findings:
 - GEMM *issue* spans are short (250-560 cycles) — tcgen05 MMAs execute
   asynchronously, so the MMA WG's real exposure is the waits, exactly what
   the trace shows.
-- PV span lengths are bimodal (BF16 PV: ~450 cy fast mode, tail to 1222 cy).
-  The PV issue sequence embeds a second wait: softmax stores P in two halves
+- The PV issue sequence embeds a second wait: softmax stores P in two halves
   (`mbar_P_full_O_rescaled`, then `mbar_P_full_2`), and `gemm_ptx_partial`
   issues the first K-tiles, then `mbarrier.try_wait`s for the second half
-  before issuing the rest. Long PV bars = softmax late with P's 2nd half.
-  Stage-1 PVs stretch most (mean 615 vs 457 cy) because the MMA warp runs
-  the two stages back-to-back and catches up with softmax WG1's store.
+  before issuing the rest. This wait is now MEASURED directly — the GEMM's
+  inline PTX stores %clock right before and after the try_wait loop
+  (`prof_ts_addrs` in `gemm_ptx_partial`/`gemm_ptx_partial_fp4`), and the
+  trace draws it as a light-gray overlay at its actual position inside the
+  PV bar. Measured steady state: wait-P2 mean is only 71-85 cycles across
+  all three PV modes (the mbarrier round-trip when P's 2nd half is already
+  signaled), so the ~420-cycle PV-span baseline is tcgen05 issue cost, and
+  PV-span variance is dominated by issue backpressure, not the P2 wait.
+  (An earlier run without this measurement showed a 1222-cycle PV tail that
+  we wrongly attributed to the P2 wait — the measured data corrected this.)
 
 The MMA WG must complete the full PV+QK cycle before the softmax results
 from the same stage are needed again. With ping-pong, each softmax WG has
