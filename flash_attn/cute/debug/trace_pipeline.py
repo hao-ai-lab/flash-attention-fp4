@@ -193,8 +193,11 @@ def render(spans_by_bg, block, output_path, title, start_iter, num_iters):
 
     legend = [
         mpatches.Patch(color="#4488CC", label="QK GEMM issue"),
-        mpatches.Patch(color="#44AA66", label="PV GEMM issue (stage 0)"),
-        mpatches.Patch(color="#DD8844", label="PV GEMM issue (stage 1)"),
+        # The PV issue sequence embeds a wait for the 2nd half of P
+        # (mbar_P_full_2 inside gemm_ptx_partial) — long PV bars mean the
+        # softmax WG was late storing P's second half, not a slower GEMM.
+        mpatches.Patch(color="#44AA66", label="PV issue+wait P2 (stage 0)"),
+        mpatches.Patch(color="#DD8844", label="PV issue+wait P2 (stage 1)"),
         mpatches.Patch(color="#9966CC", label="exp2 (+fused pack)"),
         mpatches.Patch(color="#CC3355", label="P quant / pack"),
         mpatches.Patch(color="#77BBDD", label="S load + row_max"),
