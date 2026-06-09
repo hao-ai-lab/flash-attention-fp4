@@ -316,19 +316,15 @@ def draw_timeline(ax, events: list[Event], y_center: float, bar_height: float,
         )
         ax.add_patch(rect)
 
-        # Label -- skip for very narrow bars, use smaller font for medium bars
+        # Label -- only bars wide enough to hold readable text; narrow bars
+        # (ldS, max, sum, wrP at typical scales) stay unlabeled.
         bar_px = ev.duration * x_scale
-        if ev.label and bar_px >= 25:
-            if bar_px >= 70:
-                fontsize = 7.5
-            elif bar_px >= 40:
-                fontsize = 6
-            else:
-                fontsize = 5
+        if ev.label and bar_px >= max(50, 11 * len(ev.label)):
             ax.text(
                 ev.start + ev.duration / 2, y_center,
                 ev.label, ha="center", va="center",
-                fontsize=fontsize, color=ev.text_color,
+                fontsize=7.5 if bar_px >= 80 else 6.5,
+                color=ev.text_color,
                 fontweight="bold", zorder=4,
                 clip_on=True,
             )
@@ -425,8 +421,8 @@ def render_mode(mode: PVMode, ax, n_iter: int = 6, fig_width_inches: float = 18.
                             y_positions[0], y_positions[1], y_positions[2],
                             bar_height)
 
-    # Axes configuration
-    ax.set_xlim(-50, total + 50)
+    # Axes configuration (2% right margin so the last bars don't touch the frame)
+    ax.set_xlim(-0.005 * total, 1.02 * total)
     ax.set_ylim(-0.6, 2.8)
     ax.set_yticks(y_positions)
     ax.set_yticklabels(row_labels, fontsize=9, fontweight="bold")
@@ -497,13 +493,13 @@ def main():
     out_dir = os.path.dirname(os.path.abspath(__file__))
 
     # --- Combined figure with all 3 PV modes ---
-    fig, axes = plt.subplots(3, 1, figsize=(18, 9), dpi=150)
-    fig.subplots_adjust(hspace=0.45, bottom=0.10, top=0.93, left=0.10, right=0.97)
+    fig, axes = plt.subplots(3, 1, figsize=(18, 9.5), dpi=150)
+    fig.subplots_adjust(hspace=0.50, bottom=0.10, top=0.88, left=0.10, right=0.97)
 
     fig.suptitle(
         "FA4 Kernel Pipeline: MMA vs Softmax Overlap on B300 (SM103)\n"
         "M = N = d = 128  |  QK: FP4, MMA WG + 2 Softmax WGs (double-buffered)",
-        fontsize=12, fontweight="bold", y=0.98,
+        fontsize=12, fontweight="bold", y=0.97,
     )
 
     for ax, mode in zip(axes, PV_MODES):
