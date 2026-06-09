@@ -61,21 +61,42 @@ from flash_attn.cute.tile_scheduler import (
 
 # === TUNING KNOBS ===
 # Keys: (is_causal: bool, head_dim_padded: int)
-# FP4 kernel is always 1-CTA. SM103 not supported (block-scaled MMA is SM100 only).
 # Values:
 #   e2e_freq: int — exp2 emulation frequency (0=all hardware exp2)
 #   e2e_start_frg: int — fragment index to start emulation from
 #   num_regs_softmax: int — register count for softmax warps (multiple of 8)
 #   num_regs_correction: int — register count for correction warps (multiple of 8)
 #   num_regs_other: derived as 512 - num_regs_softmax * 2 - num_regs_correction
-_FP4_TUNING_CONFIG = {
-    # BF16 PV: e2e_freq=16 verified via bench_fp4.py (1921 TF peak).
+
+def _is_sm103():
+    """Detect B300/GB300 (SM 10.3) which has 2x MUFU.EX2 throughput."""
+    try:
+        import torch
+        major, minor = torch.cuda.get_device_capability()
+        return major == 10 and minor >= 3
+    except Exception:
+        return False
+
+# SM100 (B200/GB200): e2e emulation helps overlap FP32 FMA with MMA.
+_FP4_TUNING_CONFIG_SM100 = {
+    # BF16 PV: e2e_freq=16 verified via bench_fp4.py (1921 TF peak on B200).
     (False, 128): {"e2e_freq": 16, "e2e_start_frg": 1, "num_regs_softmax": 192, "num_regs_correction": 80, "enable_e2e": True},
     (True, 128):  {"e2e_freq": 16, "e2e_start_frg": 1, "num_regs_softmax": 192, "num_regs_correction": 80, "enable_e2e": True},
 }
+# SM103 (B300/GB300): 2x MUFU throughput — e2e emulation hurts because hw exp2
+# already finishes in 512 cycles (was 1024 on SM100). Disabling e2e: 2100 TF
+# (vs 1905 TF with e2e on) for BF16 PV on GB300 at 2070 MHz.
+_FP4_TUNING_CONFIG_SM103 = {
+    (False, 128): {"e2e_freq": 16, "e2e_start_frg": 0, "num_regs_softmax": 192, "num_regs_correction": 80, "enable_e2e": False},
+    (True, 128):  {"e2e_freq": 16, "e2e_start_frg": 0, "num_regs_softmax": 192, "num_regs_correction": 80, "enable_e2e": False},
+}
+
+_FP4_TUNING_CONFIG = _FP4_TUNING_CONFIG_SM103 if _is_sm103() else _FP4_TUNING_CONFIG_SM100
+
 # FP8 PV overrides: when v_dtype.width == 8 and quant_pv == False
 _FP4_FP8PV_TUNING_CONFIG = {
-    # FP8 PV: e2e_freq=9 verified via bench_fp4.py (2018 TF peak).
+    # FP8 PV: e2e_freq=9 verified on B200 (2018 TF peak). On B300, e2e is
+    # irrelevant (~1910 TF regardless) — F2FP packing is the softmax bottleneck.
     (False, 128): {"e2e_freq": 9, "e2e_start_frg": 0},
     (True, 128):  {"e2e_freq": 9, "e2e_start_frg": 0},
 }
