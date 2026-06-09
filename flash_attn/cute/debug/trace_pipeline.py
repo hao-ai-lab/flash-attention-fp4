@@ -138,28 +138,27 @@ def render(spans_by_bg, block, output_path, title, start_iter, num_iters):
         qk_idx = 0
         counters = {}
         for s in spans:
-            if s["end"] < w0 or s["start"] > w1:
-                # keep counting GEMMs before the window so indices are global
-                if grp == fa4_prof.GRP_MMA and s["end"] < w0:
-                    if s["event_idx"] == fa4_prof.EVT_PV_GEMM:
-                        pv_idx += 1
-                    elif s["event_idx"] == fa4_prof.EVT_QK_GEMM:
-                        qk_idx += 1
-                if s["end"] < w0:
-                    counters[s["event_idx"]] = counters.get(s["event_idx"], 0) + 1
-                continue
             evt = s["event_idx"]
-            dur = s["end"] - s["start"]
+            # Count every span (even outside the window) so indices stay global.
+            counters[evt] = counters.get(evt, 0) + 1
+            if grp == fa4_prof.GRP_MMA:
+                if evt == fa4_prof.EVT_PV_GEMM:
+                    pv_idx += 1
+                elif evt == fa4_prof.EVT_QK_GEMM:
+                    qk_idx += 1
+            # Clip to the window; skip spans entirely outside it.
+            vis_start = max(s["start"], w0)
+            vis_end = min(s["end"], w1)
+            if vis_end <= vis_start:
+                continue
+
             color = COLORS.get(evt, "#607D8B")
             label = LABELS.get(evt, "")
-            counters[evt] = counters.get(evt, 0) + 1
             if grp == fa4_prof.GRP_MMA and evt == fa4_prof.EVT_PV_GEMM:
-                pv_idx += 1
                 # PV issue order alternates stage 0, stage 1
                 color = color[(pv_idx - 1) % 2] if isinstance(color, tuple) else color
                 label = f"PV{pv_idx}"
             elif grp == fa4_prof.GRP_MMA and evt == fa4_prof.EVT_QK_GEMM:
-                qk_idx += 1
                 label = f"QK{qk_idx}"
             elif evt in (fa4_prof.EVT_SOFTMAX_EXP, fa4_prof.EVT_SOFTMAX_QUANT):
                 # Number softmax work by the PV that consumes it:
@@ -172,13 +171,17 @@ def render(spans_by_bg, block, output_path, title, start_iter, num_iters):
 
             is_wait = evt in WAIT_EVENTS
             h = 0.35 if is_wait else 0.7
+            vis_dur = vis_end - vis_start
             ax.add_patch(Rectangle(
-                (s["start"] - w0, 0.5 - h / 2), max(dur, 1), h,
+                (vis_start - w0, 0.5 - h / 2), max(vis_dur, 1), h,
                 facecolor=color, edgecolor="none",
                 zorder=2 if is_wait else 3,
             ))
-            if dur > (w1 - w0) * 0.012 and label:
-                ax.text(s["start"] - w0 + dur / 2, 0.5, label,
+            # Label only when the bar is wide enough for the text
+            # (~2550 usable px at figsize 20in x 150dpi).
+            bar_px = vis_dur * 2550.0 / (w1 - w0)
+            if label and bar_px >= 10 * len(label) + 8:
+                ax.text(vis_start - w0 + vis_dur / 2, 0.5, label,
                         ha="center", va="center", fontsize=7,
                         color="white" if not is_wait else "#555555",
                         fontweight="bold", zorder=4, clip_on=True)
@@ -215,7 +218,7 @@ def main():
     p.add_argument("--nheads", type=int, default=24)
     p.add_argument("--headdim", type=int, default=128)
     p.add_argument("--block", type=int, default=0, help="CTA to visualize")
-    p.add_argument("--start-iter", type=int, default=8,
+    p.add_argument("--start-iter", type=int, default=0,
                    help="first softmax iteration of the window")
     p.add_argument("--num-iters", type=int, default=8,
                    help="number of softmax iterations to show")
