@@ -177,6 +177,13 @@ def render(spans_by_bg, block, output_path, title, start_iter, num_iters):
                 facecolor=color, edgecolor="none",
                 zorder=2 if is_wait else 3,
             ))
+            if grp == fa4_prof.GRP_MMA and evt == fa4_prof.EVT_PV_GEMM:
+                # Mid-bar dotted divider: the PV issue sequence embeds a wait
+                # for the 2nd half of P (mbar_P_full_2 in gemm_ptx_partial)
+                # roughly here — long PV bars are that wait, not a slower GEMM.
+                cx = vis_start - w0 + vis_dur / 2
+                ax.plot([cx, cx], [0.5 - h / 2, 0.5 + h / 2],
+                        linestyle=":", color="white", linewidth=1.2, zorder=5)
             # Label only when the bar is wide enough for the text
             # (~2550 usable px at figsize 20in x 150dpi).
             bar_px = vis_dur * 2550.0 / (w1 - w0)
@@ -191,13 +198,13 @@ def render(spans_by_bg, block, output_path, title, start_iter, num_iters):
     axes[-1].set_xlabel("Cycles (%clock, same SM)")
     fig.suptitle(title, fontsize=12, fontweight="bold")
 
+    from matplotlib.lines import Line2D
     legend = [
         mpatches.Patch(color="#4488CC", label="QK GEMM issue"),
-        # The PV issue sequence embeds a wait for the 2nd half of P
-        # (mbar_P_full_2 inside gemm_ptx_partial) — long PV bars mean the
-        # softmax WG was late storing P's second half, not a slower GEMM.
-        mpatches.Patch(color="#44AA66", label="PV issue+wait P2 (stage 0)"),
-        mpatches.Patch(color="#DD8844", label="PV issue+wait P2 (stage 1)"),
+        mpatches.Patch(color="#44AA66", label="PV GEMM issue (stage 0)"),
+        mpatches.Patch(color="#DD8844", label="PV GEMM issue (stage 1)"),
+        Line2D([0], [0], color="#555555", linestyle=":", linewidth=1.5,
+               label="embedded wait for P 2nd half (inside PV)"),
         mpatches.Patch(color="#9966CC", label="exp2 (+fused pack)"),
         mpatches.Patch(color="#CC3355", label="P quant / pack"),
         mpatches.Patch(color="#77BBDD", label="S load + row_max"),
