@@ -35,17 +35,17 @@ COLORS = {
     fa4_prof.EVT_SOFTMAX_ROWMAX: "#77BBDD",    # cyan
     fa4_prof.EVT_SOFTMAX_WAIT_S: "#CCCCCC",    # gray
     fa4_prof.EVT_SOFTMAX_STORE_P: "#AADDEE",   # light blue
-    fa4_prof.EVT_SOFTMAX_WAIT_CORR: "#999999", # darker gray
+    fa4_prof.EVT_SOFTMAX_WAIT_CORR: "#B8A98F", # tan — distinct from KV wait
     fa4_prof.EVT_MMA_WAIT_P: "#CCCCCC",        # gray
-    fa4_prof.EVT_MMA_WAIT_KV: "#888888",       # dark gray
+    fa4_prof.EVT_MMA_WAIT_KV: "#555555",       # near-black, MMA row only
     fa4_prof.EVT_PV_WAIT_P2: "#E8E8E8",        # light gray overlay on PV
 }
 
 LABELS = {
     fa4_prof.EVT_QK_GEMM: "QK",
     fa4_prof.EVT_PV_GEMM: "PV",
-    fa4_prof.EVT_SOFTMAX_EXP: "exp",
-    fa4_prof.EVT_SOFTMAX_QUANT: "quant",
+    fa4_prof.EVT_SOFTMAX_EXP: "MUFU",
+    fa4_prof.EVT_SOFTMAX_QUANT: "quant",  # overridden per PV mode in render()
     fa4_prof.EVT_SOFTMAX_ROWMAX: "ld+max",
     fa4_prof.EVT_SOFTMAX_WAIT_S: "wait S",
     fa4_prof.EVT_SOFTMAX_STORE_P: "stP",
@@ -84,7 +84,7 @@ def run_attention(pv_mode, batch, seqlen, nheads, headdim):
 def summarize(spans_by_bg, block):
     """Print per-event duration totals for the chosen block."""
     print(f"\n=== Per-event cycle totals (block {block}) ===")
-    for grp, name in [(fa4_prof.GRP_MMA, "MMA WG"),
+    for grp, name in [(fa4_prof.GRP_MMA, "MMA warp"),
                       (fa4_prof.GRP_SOFTMAX0, "Softmax WG0"),
                       (fa4_prof.GRP_SOFTMAX1, "Softmax WG1")]:
         spans = spans_by_bg.get((block, grp), [])
@@ -102,12 +102,17 @@ def summarize(spans_by_bg, block):
             print(f"  {nm:12s} n={cnt:5d} total={tot:9d} cy ({100.0*tot/total_window:5.1f}%) mean={tot/cnt:7.1f} cy")
 
 
-def render(spans_by_bg, block, output_path, title, start_iter, num_iters):
+def render(spans_by_bg, block, output_path, title, start_iter, num_iters,
+           pv_mode="bf16"):
     rows = [
-        (fa4_prof.GRP_MMA, "MMA WG"),
+        (fa4_prof.GRP_MMA, "MMA warp"),
         (fa4_prof.GRP_SOFTMAX0, "Softmax WG0"),
         (fa4_prof.GRP_SOFTMAX1, "Softmax WG1"),
     ]
+    # BF16/FP8 P conversion is a plain cast (F2FP in SASS); only FP4 does
+    # real quantization (group_max + scale + E2M1 pack).
+    quant_label = "quant" if pv_mode == "fp4" else "F2FP"
+    quant_legend = "P quant (FP4)" if pv_mode == "fp4" else "P cast (F2FP)"
 
     # Pick a steady-state window: bounded by the start of softmax WG0's
     # (start_iter)-th and (start_iter+num_iters)-th wait-S span.
@@ -165,6 +170,8 @@ def render(spans_by_bg, block, output_path, title, start_iter, num_iters):
             elif evt in (fa4_prof.EVT_SOFTMAX_EXP, fa4_prof.EVT_SOFTMAX_QUANT):
                 # Number softmax work by the PV that consumes it:
                 # WG0 -> odd PVs, WG1 -> even PVs.
+                if evt == fa4_prof.EVT_SOFTMAX_QUANT:
+                    label = quant_label
                 n = counters[evt]
                 glob = 2 * (n - 1) + (1 if grp == fa4_prof.GRP_SOFTMAX0 else 2)
                 label = f"{label}{glob}"
@@ -200,17 +207,19 @@ def render(spans_by_bg, block, output_path, title, start_iter, num_iters):
     axes[-1].set_xlabel("Cycles (%clock, same SM)")
     fig.suptitle(title, fontsize=12, fontweight="bold")
 
+    mufu_legend = "MUFU (exp2)" if pv_mode == "fp4" else "MUFU (exp2, fused cast)"
     legend = [
         mpatches.Patch(color="#4488CC", label="QK GEMM"),
         mpatches.Patch(color="#44AA66", label="PV GEMM (stage 0)"),
         mpatches.Patch(color="#DD8844", label="PV GEMM (stage 1)"),
         mpatches.Patch(color="#E8E8E8", label="wait P 2nd half (measured, inside PV)"),
-        mpatches.Patch(color="#9966CC", label="exp2 (+fused pack)"),
-        mpatches.Patch(color="#CC3355", label="P quant / pack"),
+        mpatches.Patch(color="#9966CC", label=mufu_legend),
+        mpatches.Patch(color="#CC3355", label=quant_legend),
         mpatches.Patch(color="#77BBDD", label="S load + row_max"),
         mpatches.Patch(color="#AADDEE", label="P store + signal"),
-        mpatches.Patch(color="#CCCCCC", label="wait (mbarrier)"),
-        mpatches.Patch(color="#888888", label="wait KV (TMA)"),
+        mpatches.Patch(color="#CCCCCC", label="wait S / wait P (mbarrier)"),
+        mpatches.Patch(color="#B8A98F", label="wait correction (softmax WG)"),
+        mpatches.Patch(color="#555555", label="wait KV (TMA, MMA warp only)"),
     ]
     fig.legend(handles=legend, loc="lower center", ncol=5, fontsize=8,
                bbox_to_anchor=(0.5, -0.04))
@@ -257,6 +266,7 @@ def main():
             f"block {args.block} (GB300)"
         ),
         start_iter=args.start_iter, num_iters=args.num_iters,
+        pv_mode=args.pv_mode,
     )
 
 

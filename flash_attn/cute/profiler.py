@@ -194,7 +194,7 @@ GRP_SOFTMAX1 = 2
 GRP_CORRECTION = 3
 NUM_GROUPS = 4
 
-GROUP_NAMES = ["MMA WG", "Softmax WG0", "Softmax WG1", "Correction WG"]
+GROUP_NAMES = ["MMA warp", "Softmax WG0", "Softmax WG1", "Correction WG"]
 
 
 def is_profiling_enabled():

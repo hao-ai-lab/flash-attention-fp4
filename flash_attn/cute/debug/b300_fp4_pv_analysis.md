@@ -68,7 +68,7 @@ Key facts:
 
 ### Pipeline Cycle Model (steady state, per iteration)
 
-MMA WG processes `q_stage=2` tiles per KV block:
+MMA warp processes `q_stage=2` tiles per KV block:
 ```
 Per KV block: PV[0] + PV[1] + QK[0] + QK[1]
 ```
@@ -85,7 +85,7 @@ packed-cvt thread-instructions (128×128 tile, 2 elements per cvt):
 
 | Component                  | BF16 PV | FP8 PV  | FP4 PV  |
 |----------------------------|---------|---------|---------|
-| **MMA WG per KV block**    |         |         |         |
+| **MMA warp per KV block**    |         |         |         |
 | QK GEMM (FP4, ×2 stages)  | 512     | 512     | 512     |
 | PV GEMM (×2 stages)       | 2048    | 1024    | 512     |
 | Total MMA per block        | 2560    | 1536    | 1024    |
@@ -108,14 +108,14 @@ The kernel has flashinfer-style timestamp instrumentation
 (`flash_attn/cute/profiler.py`), compiled in via `FA4_PROFILE_PIPELINE=1`.
 One elected lane per warpgroup records `%clock` cycles at every pipeline
 event into a gmem buffer. Run `flash_attn/cute/debug/trace_pipeline.py`
-to capture and render a trace (3 rows: MMA WG, Softmax WG0, Softmax WG1).
+to capture and render a trace (3 rows: MMA warp, Softmax WG0, Softmax WG1).
 
 Measured means per event, block 0, b=1 s=4096 h=24 d=128 (96 softmax
 iterations per WG, GB300 at 2070 MHz; cycles from %clock):
 
 | Event (mean cycles)        | BF16 PV | FP8 PV  | FP4 PV  |
 |----------------------------|---------|---------|---------|
-| **MMA WG**                 |         |         |         |
+| **MMA warp**                 |         |         |         |
 | wait P (stall)             | 841 (33%)| 950 (38%)| 1306 (42%)|
 | PV GEMM issue              | 560     | 405     | 549     |
 | QK GEMM issue              | 262     | 267     | 246     |
@@ -129,7 +129,7 @@ iterations per WG, GB300 at 2070 MHz; cycles from %clock):
 | wait corr                  | 867     | 173     | 1013    |
 
 Real-trace findings:
-- Even BF16 PV is partially softmax-bound on GB300: the MMA WG spends 33%
+- Even BF16 PV is partially softmax-bound on GB300: the MMA warp spends 33%
   of its time waiting for P. The exp2 span (which includes the fused BF16
   pack) measures ~1580 cycles — well above the 512-cycle MUFU-only roofline,
   because both softmax WGs contend for the SM and the span includes the
@@ -140,9 +140,9 @@ Real-trace findings:
   BF16, pushing MMA wait-P to 38%.
 - FP4 PV: P quantization measures ~1283 cycles per iteration on top of the
   same exp2 cost — the softmax iteration grows from ~2,700 to ~3,700 cycles
-  while the PV GEMM gets cheaper, so the MMA WG stalls 42% of the time.
+  while the PV GEMM gets cheaper, so the MMA warp stalls 42% of the time.
 - GEMM *issue* spans are short (250-560 cycles) — tcgen05 MMAs execute
-  asynchronously, so the MMA WG's real exposure is the waits, exactly what
+  asynchronously, so the MMA warp's real exposure is the waits, exactly what
   the trace shows.
 - The PV issue sequence embeds a second wait: softmax stores P in two halves
   (`mbar_P_full_O_rescaled`, then `mbar_P_full_2`), and `gemm_ptx_partial`
@@ -161,7 +161,7 @@ Real-trace findings:
 The MMA WG must complete the full PV+QK cycle before the softmax results
 from the same stage are needed again. With ping-pong, each softmax WG has
 the entire MMA block cycle to complete its work. When softmax takes longer
-than the MMA cycle, the MMA WG stalls waiting for P_full.
+than the MMA cycle, the MMA warp stalls waiting for P_full.
 
 ## PTX Instruction Analysis
 

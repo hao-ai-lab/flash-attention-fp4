@@ -3,7 +3,7 @@
 Pipeline visualization for FA4 FP4 kernel on B300 (SM103).
 
 Generates a model-based timeline chart showing pipeline overlap between:
-  - MMA WG (warp 12): QK GEMMs + PV GEMMs
+  - MMA warp (warp 12): QK GEMMs + PV GEMMs
   - Softmax WG0 (warps 0-3): even iterations (stage 0)
   - Softmax WG1 (warps 4-7): odd iterations (stage 1)
 
@@ -100,7 +100,7 @@ class PVMode:
 
 
 PV_MODES = [
-    PVMode("BF16 PV", PV_GEMM_BF16, P_PACK_BF16, COL_QUANT_BF16, "pack"),
+    PVMode("BF16 PV", PV_GEMM_BF16, P_PACK_BF16, COL_QUANT_BF16, "F2FP"),
     PVMode("FP8 PV", PV_GEMM_FP8, P_PACK_FP8, COL_QUANT_FP8, "F2FP"),
     PVMode("FP4 PV", PV_GEMM_FP4, P_QUANT_FP4, COL_QUANT_FP4, "quant"),
 ]
@@ -221,7 +221,7 @@ def simulate_pipeline(mode: PVMode, n_iter: int = 6):
         is_prologue = (it == 0)
 
         # ------------------------------------------------------------------
-        # MMA WG
+        # MMA warp
         # ------------------------------------------------------------------
 
         # PV GEMMs (skip in prologue -- no P available yet)
@@ -405,7 +405,7 @@ def render_mode(mode: PVMode, ax, n_iter: int = 6, fig_width_inches: float = 18.
     """Render a single PV mode subplot."""
     mma_ev, sm0_ev, sm1_ev, total = simulate_pipeline(mode, n_iter)
 
-    row_labels = ["MMA WG", "Softmax WG0", "Softmax WG1"]
+    row_labels = ["MMA warp", "Softmax WG0", "Softmax WG1"]
     y_positions = [2, 1, 0]
     bar_height = 0.65
 
@@ -469,9 +469,9 @@ def make_legend(fig, modes=None):
     # Per-mode quant/pack entries — only include if that mode is in the figure
     mode_colors = {m.p_quant_color for m in modes}
     if COL_QUANT_BF16 in mode_colors:
-        legend_items.append(mpatches.Patch(facecolor=COL_QUANT_BF16, edgecolor="white", label="P pack (BF16)"))
+        legend_items.append(mpatches.Patch(facecolor=COL_QUANT_BF16, edgecolor="white", label="P cast (F2FP, BF16)"))
     if COL_QUANT_FP8 in mode_colors:
-        legend_items.append(mpatches.Patch(facecolor=COL_QUANT_FP8, edgecolor="white", label="P pack (FP8 F2FP)"))
+        legend_items.append(mpatches.Patch(facecolor=COL_QUANT_FP8, edgecolor="white", label="P cast (F2FP, FP8)"))
     if COL_QUANT_FP4 in mode_colors:
         legend_items.append(mpatches.Patch(facecolor=COL_QUANT_FP4, edgecolor="white", label="P quant (FP4)"))
 
@@ -498,7 +498,7 @@ def main():
 
     fig.suptitle(
         "FA4 Kernel Pipeline: MMA vs Softmax Overlap on B300 (SM103)\n"
-        "M = N = d = 128  |  QK: FP4, MMA WG + 2 Softmax WGs (double-buffered)",
+        "M = N = d = 128  |  QK: FP4, MMA warp + 2 Softmax WGs (double-buffered)",
         fontsize=12, fontweight="bold", y=0.97,
     )
 
