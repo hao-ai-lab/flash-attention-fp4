@@ -266,20 +266,65 @@ Processes each sf_vec_size group sequentially to reduce register pressure.
 ### 5. `nvidia-cutlass-dsl` 4.5 rounding mode compat
 `utils.py:_RND_RN` auto-detects enum vs string API.
 
-## Potential Improvements
+## Overlap Investigation: F2FP/quant vs Other Hardware Units (measured)
 
-1. **FP8 PV**: Reduce F2FP latency by interleaving with exp2 (already attempted
-   in `_apply_exp2_pack_fp8` — the fragment-level interleaving helps on B200 but
-   not enough on B300 where the fundamental issue is F2FP MIO throughput).
+We tried to speed up FP8/FP4 PV by overlapping the bottleneck F2FP/quant
+stream with instructions on other units (MUFU, TMEM stores, st.shared).
+Result: **no speedup — the overlap already exists in the compiled SASS.**
 
-2. **FP4 PV**: Reduce P quantization overhead. Options:
-   - Hardware-assisted E2M1 packing (future GPU arch)
-   - Coarser quantization groups (larger sf_vec_size → fewer group_max reductions)
-   - Approximate group_max (skip reduction, use tile-level max)
+What was tried (all bitwise-validated against baseline outputs):
 
-3. **Register allocation**: Sweeping `num_regs_softmax` (168–224) showed no
-   improvement for FP4 PV — the bottleneck is instruction throughput, not
-   register pressure (register spills are 15K local ops vs 81M total instructions).
+1. **Knob sweep** (`FA4_FP8_PV_USE_FUSED_PACK`, `FA4_FORCE_E2E`, combinations):
+   all variants land at 1909-1910 TF on (1, 32768, 24, 128). Source-order
+   interleaving of exp2/F2FP has no effect.
+2. **Chunk-pipelined FP8 path** (`FA4_FP8_PV_PACK_STORE_PIPELINE=1`,
+   `_pack_fp8_store_pipelined`): software-pipelines exp2(chunk c) with
+   F2FP-pack(c-1) and tcgen05.st(c-1) — three data-independent streams on
+   MUFU / cvt / TMEM ports — and fires P_full right after the first
+   `mbar_p_split` chunks. Measured: 1521/1638/1909 TF at s=4096/8192/32768,
+   identical to baseline (1521/1638/1909).
+3. **Chunk-pipelined FP4 path** (`FA4_FP4_PV_QUANT_STORE_PIPELINE=1`,
+   `_fused_group_max_scale_quant_store_pipelined`): issues each P chunk's
+   TMEM store as soon as its groups are quantized. Measured 1389 vs 1387
+   TF baseline — parity.
+
+Why: dumping SASS for baseline vs pipelined (ptxas -O3, sm_103a) shows
+**ptxas already produces an equivalently interleaved schedule for the
+baseline**. FP8: identical MUFU.EX2/F2FP run structure (83 transitions in
+both). FP4: the per-group `MUFU.RCP → FMNMX×10 → F2FP×8` quant pattern is
+already finely interleaved with the MUFU.EX2 stream (160 vs 168 unit-runs).
+The whole softmax step is one fully-unrolled basic block, so ptxas freely
+schedules across the source-level phases, and the hardware scoreboard
+dual-issues across ports where possible (measured mixed ex2+F2FP throughput
+54.6/clk vs 32 each in isolation — already reflected in kernel timing).
+
+**Instrumentation artifact warning**: with `FA4_PROFILE_PIPELINE=1`, the
+chunk-pipelined FP8 variant looks ~14% faster per CTA than the instrumented
+baseline (MMA wait-P 1055→713 cy). This is an artifact: the profiler's
+side-effecting `%clock` inline asm between the exp/pack/store phases acts
+as a scheduling barrier and prevents ptxas from interleaving the baseline.
+The clean kernels are identical. Do not tune from instrumented runs alone.
+
+The remaining FP8/FP4 PV gap is therefore raw issue-slot count on the
+cvt/MUFU/ALU ports, not scheduling. Real improvement options:
+- Fewer instructions: coarser SF groups (fewer group_max FMNMX), approximate
+  group_max, packed-max if a 2-wide min/max op exists on SM103.
+- Move quant work to the underutilized correction WG (requires a register →
+  TMEM/SMEM round-trip of P — likely costs more than it saves).
+- Hardware-assisted E2M1 packing (future arch).
+
+Also observed while validating: the FP4 PV kernel has **pre-existing
+run-to-run nondeterminism** — ~1 in 20 runs of the *unmodified baseline*
+differs from its own reference output (diffs up to 3.8 in O on a couple of
+adjacent seq rows). Bisects show it is unrelated to the new pipelined paths
+(they reproduce it at the same rate). Likely a latent race in the FP4 PV
+path; needs separate investigation.
+
+## Other Notes
+
+- **Register allocation**: Sweeping `num_regs_softmax` (168–224) showed no
+  improvement for FP4 PV — the bottleneck is instruction throughput, not
+  register pressure (register spills are 15K local ops vs 81M total instructions).
 
 ## Commands
 

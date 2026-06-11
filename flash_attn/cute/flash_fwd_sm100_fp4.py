@@ -302,6 +302,12 @@ class FlashAttentionForwardSm100:
         # is more exposed.
         self.fp8_pv_use_fused_pack = os.getenv("FA4_FP8_PV_USE_FUSED_PACK", "0") == "1"
         self.fp8_pv_zero_fill_regs = os.getenv("FA4_FP8_PV_ZERO_FILL_REGS", "1") == "1"
+        # Chunk-pipelined P conversion + TMEM store: convert chunk c, issue its
+        # tcgen05.st, convert chunk c+1 while the store drains — overlaps the
+        # F2FP/quant stream (cvt pipe) with the TMEM-store path, and fires the
+        # P_full signals as early as possible.
+        self.fp8_pv_pack_store_pipeline = os.getenv("FA4_FP8_PV_PACK_STORE_PIPELINE", "0") == "1"
+        self.fp4_pv_quant_store_pipeline = os.getenv("FA4_FP4_PV_QUANT_STORE_PIPELINE", "0") == "1"
         self.mma_inst_bits_k = 256
         if self.sf_vec_size == 16:
             # NVFP4 / MXF4NVF4: 256-bit operand tile covers 64 logical K elements.
@@ -3104,6 +3110,172 @@ class FlashAttentionForwardSm100:
                 softmax_like[None, j].store(src_like[None, j].load().to(tSrP.element_type))
 
     @cute.jit
+    def _pack_fp8_store_pipelined(
+        self,
+        tSrP_f32: cute.Tensor,     # scaled S values (exp2 applied here, in place)
+        tSrP: cute.Tensor,         # fp8 view of the P r2t backing storage
+        tSrP_r2t_f32: cute.Tensor, # fp32 view used by the tmem store atoms
+        tStP_r2t: cute.Tensor,     # tmem destination, chunked on mode 2
+        thr_tmem_store,
+        mbar_ptr: cute.Pointer,
+        stage,
+    ):
+        """Software-pipelined exp2 + F2FP pack + TMEM store for FP8 PV.
+
+        Per chunk c: exp2(chunk c) on the MUFU pipe runs while the F2FP pack
+        (cvt pipe) and tcgen05.st (TMEM port) of chunk c-1 drain — the three
+        streams are data-independent one chunk apart, so they can dual-issue
+        across different hardware units instead of executing as three serial
+        phases. exp2 order, pack order and store calls are identical to the
+        baseline, so results are bitwise identical. P_full also fires right
+        after the first mbar_p_split chunks are packed+stored, releasing the
+        MMA warp's PV before the remaining chunks convert. Chunk c of the
+        store covers the same register bytes as u32 pack indices
+        [c*per_chunk, (c+1)*per_chunk) — both views are compact fragments
+        over the same storage, the same aliasing the split store already
+        relies on.
+        """
+        total = cutlass.const_expr(cute.size(tStP_r2t.shape[2]))
+        split = cutlass.const_expr(self.mbar_p_split(total))
+        tSrP_f32_frag = cute.logical_divide(tSrP_f32, cute.make_layout(4))
+        tSrP_frag = cute.logical_divide(tSrP, cute.make_layout(4))
+        n_u32 = cutlass.const_expr(cute.size(tSrP_frag, mode=[1]))
+        assert n_u32 % total == 0, "store chunks must evenly divide packed u32s"
+        per_chunk = cutlass.const_expr(n_u32 // total)
+
+        def _exp2_chunk(c):
+            # 4 source elements per u32 slot
+            for i in cutlass.range_constexpr(c * per_chunk, (c + 1) * per_chunk):
+                for j in cutlass.range_constexpr(0, 4, 2):
+                    tSrP_f32_frag[j, i] = cute.arch.exp2(tSrP_f32_frag[j, i])
+                    tSrP_f32_frag[j + 1, i] = cute.arch.exp2(tSrP_f32_frag[j + 1, i])
+
+        def _pack_chunk(c):
+            for i in cutlass.range_constexpr(c * per_chunk, (c + 1) * per_chunk):
+                tSrP_u32_view = cute.recast_tensor(tSrP_frag[None, i], cute.Int32)
+                for k in cutlass.range_constexpr(0, cute.size(tSrP_u32_view, mode=[0])):
+                    tSrP_u32_view[k] = packed_float_to_ue4m3(
+                        tSrP_f32_frag[k * 4, i],
+                        tSrP_f32_frag[k * 4 + 1, i],
+                        tSrP_f32_frag[k * 4 + 2, i],
+                        tSrP_f32_frag[k * 4 + 3, i],
+                    )
+
+        def _store_chunk(c):
+            cute.copy(thr_tmem_store, tSrP_r2t_f32[None, None, c], tStP_r2t[None, None, c])
+            if const_expr(c == split - 1):
+                cute.arch.fence_view_async_tmem_store()
+                # Notify mma warp that the first half of P is ready
+                cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_O_rescaled_offset + stage)
+
+        _exp2_chunk(0)
+        for c in cutlass.range_constexpr(1, total):
+            # exp2(c) is independent of pack/store(c-1): MUFU vs cvt/TMEM.
+            _exp2_chunk(c)
+            _pack_chunk(c - 1)
+            _store_chunk(c - 1)
+        _pack_chunk(total - 1)
+        _store_chunk(total - 1)
+        cute.arch.fence_view_async_tmem_store()
+        # Notify mma warp that the 2nd half of P is ready
+        cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_2_offset + stage)
+
+    @cute.jit
+    def _fused_group_max_scale_quant_store_pipelined(
+        self,
+        softmax: SoftmaxSm100,
+        tSrP_f32: cute.Tensor,     # exp2'd S values (source, fp32 registers)
+        tSrP: cute.Tensor,         # fp4 view of the P r2t backing storage
+        tSrP_r2t_f32: cute.Tensor, # fp32 view used by the tmem store atoms
+        tStP_r2t: cute.Tensor,     # tmem destination, chunked on mode 2
+        thr_tmem_store,
+        sSFP: cute.Tensor,
+        thr_tmem_load,
+        mbar_ptr: cute.Pointer,
+        stage,
+    ):
+        """FP4 P quantization pipelined with the TMEM stores of P.
+
+        Same group-sequential quant as _fused_group_max_scale_quant, but after
+        the groups belonging to TMEM-store chunk c are quantized, chunk c's
+        tcgen05.st is issued immediately so it drains while the next groups'
+        group_max/scale/E2M1-pack execute. SF packing + the SFP smem copy
+        (st.shared, LSU) follow, then both P_full signals fire — P_full must
+        wait for ALL SFP in smem because the MMA warp S2T-copies the whole SFP
+        buffer right after its P_full wait.
+        """
+        inv6 = Float32(1.0 / 6.0)
+        acc_S_frag = cute.logical_divide(tSrP_f32, cute.make_layout(self.sf_vec_size))
+        num_groups = cute.size(acc_S_frag, mode=[1])
+        tSrP_frag = cute.logical_divide(tSrP, cute.make_layout(self.sf_vec_size))
+        tSrPSF_f32 = cute.make_rmem_tensor(cute.make_layout(num_groups), Float32)
+        tSrPSF = cute.make_rmem_tensor(tSrPSF_f32.layout, self.sf_dtype)
+
+        total = cute.size(tStP_r2t.shape[2])
+        assert num_groups % total == 0, "store chunks must evenly divide SF groups"
+        groups_per_chunk = num_groups // total
+
+        for c in cutlass.range_constexpr(total):
+            for g in cutlass.range_constexpr(c * groups_per_chunk, (c + 1) * groups_per_chunk):
+                # 1. Group max (reduction over sf_vec_size elements)
+                gmax = softmax._compute_row_max(acc_S_frag[None, g].load()) * inv6
+                tSrPSF_f32[g] = gmax
+
+                # 2. Scale by 1/gmax
+                inv_gmax = Float32(1.0) / cute.arch.fmax(gmax, 1e-20)
+                for j in cutlass.range(0, self.sf_vec_size, 2, unroll_full=True):
+                    acc_S_frag[j, g], acc_S_frag[j + 1, g] = utils.fma_packed_f32x2(
+                        (acc_S_frag[j, g], acc_S_frag[j + 1, g]),
+                        (inv_gmax, inv_gmax),
+                        (Float32(0.0), Float32(0.0)),
+                    )
+
+                # 3. Quantize this group to E2M1
+                tSrP_u32_view = cute.recast_tensor(tSrP_frag[None, g], cute.Int32)
+                for k in cutlass.range_constexpr(0, cute.size(tSrP_u32_view, mode=[0])):
+                    tSrP_u32_view[k] = packed_float_to_e2m1(
+                        acc_S_frag[k * 8, g],
+                        acc_S_frag[k * 8 + 1, g],
+                        acc_S_frag[k * 8 + 2, g],
+                        acc_S_frag[k * 8 + 3, g],
+                        acc_S_frag[k * 8 + 4, g],
+                        acc_S_frag[k * 8 + 5, g],
+                        acc_S_frag[k * 8 + 6, g],
+                        acc_S_frag[k * 8 + 7, g],
+                    )
+            # Chunk c's P bytes are final — let the TMEM store drain while the
+            # next chunk's groups are quantized.
+            cute.copy(thr_tmem_store, tSrP_r2t_f32[None, None, c], tStP_r2t[None, None, c])
+
+        # 4. Pack SF values to UE4M3 and copy to SMEM (same as the non-pipelined
+        # path in softmax_step; see the layout comment there).
+        tSrPSF_u32_view = cute.recast_tensor(tSrPSF, cute.Int32)
+        for i in cutlass.range_constexpr(0, cute.size(tSrPSF_f32) // 4, unroll=1):
+            tSrPSF_u32_view[i] = packed_float_to_ue4m3(
+                tSrPSF_f32[i * 4],
+                tSrPSF_f32[i * 4 + 1],
+                tSrPSF_f32[i * 4 + 2],
+                tSrPSF_f32[i * 4 + 3],
+            )
+        thread_idx = thr_tmem_load.thr_idx
+        lane_id = thread_idx % 32
+        warp_id = thread_idx // 32
+        base_offset = lane_id * 16 + (warp_id % 4) * 4
+        k_groups_per_row = const_expr(self.mma_tiler_pv[2] // self.sf_vec_size)
+        k_inner = const_expr(min(k_groups_per_row, 4))
+        k_outer = const_expr(k_groups_per_row // k_inner)
+        sfp_thread_layout = cute.make_layout((k_inner, k_outer), stride=(1, 512))
+        sSFP_stage_ptr = sSFP[None, None, None, stage].iterator
+        sSFP_thread = cute.make_tensor(sSFP_stage_ptr + base_offset, sfp_thread_layout)
+        tSrPSF_2d = cute.logical_divide(tSrPSF, cute.make_layout(k_inner))
+        cute.autovec_copy(tSrPSF_2d, sSFP_thread)
+
+        # All P chunks are stored and all SFP is in smem: fire both signals.
+        cute.arch.fence_view_async_tmem_store()
+        cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_O_rescaled_offset + stage)
+        cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_2_offset + stage)
+
+    @cute.jit
     def softmax_step(
         self,
         mma_si_consumer_phase: Int32,
@@ -3241,9 +3413,18 @@ class FlashAttentionForwardSm100:
             if const_expr(prof is not None):
                 prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_SOFTMAX_EXP, fa4_prof.EVENT_END, prof_pred)
                 prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_SOFTMAX_QUANT, fa4_prof.EVENT_BEGIN, prof_pred)
-            tSrPSF_f32, tSrPSF = self._fused_group_max_scale_quant(
-                softmax, tSrS_t2r, tSrP_r2t,
-            )
+            if const_expr(self.fp4_pv_quant_store_pipeline and sSFP is not None):
+                # Quant pipelined with the P TMEM stores; does the SFP smem
+                # copy and both P_full signals itself.
+                self._fused_group_max_scale_quant_store_pipelined(
+                    softmax, tSrS_t2r, tSrP_r2t, tSrP_r2t_f32, tStP_r2t,
+                    thr_tmem_store, sSFP, thr_tmem_load, mbar_ptr, stage,
+                )
+                tSrPSF_f32, tSrPSF = None, None
+            else:
+                tSrPSF_f32, tSrPSF = self._fused_group_max_scale_quant(
+                    softmax, tSrS_t2r, tSrP_r2t,
+                )
             # R2S: Copy tSrPSF (registers) to sSFP (shared memory).
             # The SFP smem layout is BlockScaledBasicChunk(sf_vec_size).layout
             # tile_to_shape((M=128, K=128)). The atom is ((32,4),(sf_vec,4))
@@ -3253,7 +3434,7 @@ class FlashAttentionForwardSm100:
             # What changes is the K-group count per row:
             #   sf_vec=16, K=128 → 8 SFs per row → 4 inner + 2 outer (rest_k stride 512)
             #   sf_vec=32, K=128 → 4 SFs per row → 4 inner + 1 outer (no rest_k)
-            if const_expr(sSFP is not None):
+            if const_expr(sSFP is not None and not self.fp4_pv_quant_store_pipeline):
                 thread_idx = thr_tmem_load.thr_idx
                 lane_id = thread_idx % 32
                 warp_id = thread_idx // 32
@@ -3291,16 +3472,23 @@ class FlashAttentionForwardSm100:
                         prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_SOFTMAX_EXP, fa4_prof.EVENT_END, prof_pred)
                         prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_SOFTMAX_QUANT, fa4_prof.EVENT_BEGIN, prof_pred)
                 else:
-                    softmax.apply_exp2_convert(
-                        tSrS_t2r,
-                        e2e=self.force_e2e,
-                        e2e_freq=self.e2e_freq,
-                    e2e_start_frg=self.e2e_start_frg,
+                    fp8_pipe_active = const_expr(
+                        self.fp8_pv_pack_store_pipeline and not self.force_e2e
                     )
+                    if const_expr(not fp8_pipe_active):
+                        softmax.apply_exp2_convert(
+                            tSrS_t2r,
+                            e2e=self.force_e2e,
+                            e2e_freq=self.e2e_freq,
+                            e2e_start_frg=self.e2e_start_frg,
+                        )
+                    # else: exp2, F2FP pack and TMEM stores are all
+                    # software-pipelined per chunk in _pack_fp8_store_pipelined.
                     if const_expr(prof is not None):
                         prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_SOFTMAX_EXP, fa4_prof.EVENT_END, prof_pred)
                         prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_SOFTMAX_QUANT, fa4_prof.EVENT_BEGIN, prof_pred)
-                    self._pack_fp8(tSrS_t2r, tSrP_r2t)
+                    if const_expr(not fp8_pipe_active):
+                        self._pack_fp8(tSrS_t2r, tSrP_r2t)
             else:
                 # BF16 PV: exp2 and the bf16x2 pack are fused inside
                 # apply_exp2_convert — EXP covers both, QUANT is zero-width.
@@ -3320,18 +3508,36 @@ class FlashAttentionForwardSm100:
         # Sequence barrier arrive
         if const_expr(self.s0_s1_barrier):
             cute.arch.mbarrier_arrive(mbar_ptr + mbar_s0_s1_sequence_offset + (1 - stage) * 4)
+        # Chunk-pipelined paths do their own stores + P_full signals.
+        fp4_pipelined_store = const_expr(
+            self.quant_pv and self.fp4_pv_quant_store_pipeline and sSFP is not None
+        )
+        fp8_pipelined_store = const_expr(
+            pure_fp8_pv
+            and self.v_dtype == Float8E4M3FN
+            and self.fp8_pv_use_explicit_pack
+            and not self.fp8_pv_use_fused_pack
+            and self.fp8_pv_pack_store_pipeline
+            and not self.force_e2e
+        )
         if const_expr(prof is not None):
             prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_SOFTMAX_STORE_P, fa4_prof.EVENT_BEGIN, prof_pred)
-        for i in cutlass.range_constexpr(self.mbar_p_split(cute.size(tStP_r2t.shape[2]))):
-            cute.copy(thr_tmem_store, tSrP_r2t_f32[None, None, i], tStP_r2t[None, None, i])
-        cute.arch.fence_view_async_tmem_store()
-        # Notify mma warp that P is ready (and SFP is in SMEM)
-        cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_O_rescaled_offset + stage)
-        for i in cutlass.range_constexpr(self.mbar_p_split(cute.size(tStP_r2t.shape[2])), cute.size(tStP_r2t.shape[2])):
-            cute.copy(thr_tmem_store, tSrP_r2t_f32[None, None, i], tStP_r2t[None, None, i])
-        cute.arch.fence_view_async_tmem_store()
-        # Notify mma warp that the 2nd half of P is ready
-        cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_2_offset + stage)
+        if const_expr(fp8_pipelined_store):
+            self._pack_fp8_store_pipelined(
+                tSrS_t2r, tSrP_r2t, tSrP_r2t_f32, tStP_r2t,
+                thr_tmem_store, mbar_ptr, stage,
+            )
+        elif const_expr(not fp4_pipelined_store):
+            for i in cutlass.range_constexpr(self.mbar_p_split(cute.size(tStP_r2t.shape[2]))):
+                cute.copy(thr_tmem_store, tSrP_r2t_f32[None, None, i], tStP_r2t[None, None, i])
+            cute.arch.fence_view_async_tmem_store()
+            # Notify mma warp that P is ready (and SFP is in SMEM)
+            cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_O_rescaled_offset + stage)
+            for i in cutlass.range_constexpr(self.mbar_p_split(cute.size(tStP_r2t.shape[2])), cute.size(tStP_r2t.shape[2])):
+                cute.copy(thr_tmem_store, tSrP_r2t_f32[None, None, i], tStP_r2t[None, None, i])
+            cute.arch.fence_view_async_tmem_store()
+            # Notify mma warp that the 2nd half of P is ready
+            cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_2_offset + stage)
         if const_expr(prof is not None):
             prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_SOFTMAX_STORE_P, fa4_prof.EVENT_END, prof_pred)
             prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_SOFTMAX_WAIT_CORR, fa4_prof.EVENT_BEGIN, prof_pred)
