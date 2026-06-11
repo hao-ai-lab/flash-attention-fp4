@@ -318,6 +318,19 @@ schedules across the source-level phases, and the hardware scoreboard
 dual-issues across ports where possible (measured mixed ex2+F2FP throughput
 54.6/clk vs 32 each in isolation — already reflected in kernel timing).
 
+**Materialized-loop control (measured)**: to verify that the full unrolling
+(not compiler magic) is what enables the overlap, we rebuilt the FP8
+exp2+pack as a real `cutlass.range` IR loop over fragments
+(`FA4_FP8_PV_RANGE_UNROLL`, `_exp2_pack_fp8_range`). With a live loop
+(unroll=1 or 2), the dynamic fragment index makes the register-resident
+S/P tensors unaddressable, so they spill to local memory (240 st.local +
+208 ld.local in PTX vs 0 baseline): **227 TF, an 8.4x slowdown**. With
+`unroll_full` the IR unroller restores constant indices and the result is
+exactly baseline (1909 TF) — confirming `range_constexpr` ≡ fully-unrolled
+`cutlass.range`, and that register residency requires the unrolled form.
+(Also: the `unroll=` kwarg on `range_constexpr` is silently discarded by
+the DSL preprocessor — it only means something on `cutlass.range`.)
+
 **Instrumentation artifact warning**: with `FA4_PROFILE_PIPELINE=1`, the
 chunk-pipelined FP8 variant looks ~14% faster per CTA than the instrumented
 baseline (MMA wait-P 1055→713 cy). This is an artifact: the profiler's

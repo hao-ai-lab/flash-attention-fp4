@@ -308,6 +308,9 @@ class FlashAttentionForwardSm100:
         # P_full signals as early as possible.
         self.fp8_pv_pack_store_pipeline = os.getenv("FA4_FP8_PV_PACK_STORE_PIPELINE", "0") == "1"
         self.fp4_pv_quant_store_pipeline = os.getenv("FA4_FP4_PV_QUANT_STORE_PIPELINE", "0") == "1"
+        # EXPERIMENT: materialized cutlass.range loop over fragments for the
+        # FP8 exp2+pack (0 = off; N = unroll factor; -1 = unroll_full).
+        self.fp8_pv_range_unroll = int(os.getenv("FA4_FP8_PV_RANGE_UNROLL", "0"))
         # Pipeline-trace granularity (FA4_PROFILE_PIPELINE=1). Coarse (default)
         # records only at wait/store boundaries that are already side-effect
         # ordered, so the softmax compute stream contains no timestamps and
@@ -2971,7 +2974,7 @@ class FlashAttentionForwardSm100:
 
         # Process in groups of 4 for UE4M3 conversion
         assert cute.size(tSrPSF_f32) % 4 == 0
-        for i in cutlass.range_constexpr(0, cute.size(tSrPSF_f32) // 4, unroll=1):
+        for i in cutlass.range_constexpr(0, cute.size(tSrPSF_f32) // 4):
         # for i in cutlass.range_constexpr(0, 2):
             # Pack 4 FP32 values into UE4M3 format
             packed_ue4m3 = packed_float_to_ue4m3(
@@ -3050,7 +3053,7 @@ class FlashAttentionForwardSm100:
 
         # 4. Pack SF values to UE4M3 (separate loop, small tensor)
         tSrPSF_u32_view = cute.recast_tensor(tSrPSF, cute.Int32)
-        for i in cutlass.range_constexpr(0, cute.size(tSrPSF_f32) // 4, unroll=1):
+        for i in cutlass.range_constexpr(0, cute.size(tSrPSF_f32) // 4):
             tSrPSF_u32_view[i] = packed_float_to_ue4m3(
                 tSrPSF_f32[i * 4],
                 tSrPSF_f32[i * 4 + 1],
@@ -3116,6 +3119,44 @@ class FlashAttentionForwardSm100:
             src_like = cute.logical_divide(tSrP_f32, cute.make_layout(min(32, cute.size(tSrP_f32))))
             for j in cutlass.range_constexpr(cute.size(src_like, mode=[1])):
                 softmax_like[None, j].store(src_like[None, j].load().to(tSrP.element_type))
+
+    @cute.jit
+    def _exp2_pack_fp8_range_frg(self, tSrS_frg: cute.Tensor, tSrP_u32_frg: cute.Tensor, j):
+        """exp2 + F2FP pack of one 32-element fragment at (dynamic) index j."""
+        for k in cutlass.range_constexpr(0, 32, 2):
+            tSrS_frg[k, j] = cute.arch.exp2(tSrS_frg[k, j])
+            tSrS_frg[k + 1, j] = cute.arch.exp2(tSrS_frg[k + 1, j])
+        for k in cutlass.range_constexpr(8):
+            tSrP_u32_frg[k, j] = packed_float_to_ue4m3(
+                tSrS_frg[k * 4, j],
+                tSrS_frg[k * 4 + 1, j],
+                tSrS_frg[k * 4 + 2, j],
+                tSrS_frg[k * 4 + 3, j],
+            )
+
+    @cute.jit
+    def _exp2_pack_fp8_range(
+        self,
+        tSrS: cute.Tensor,
+        tSrP: cute.Tensor,
+        unroll: cutlass.Constexpr[int],
+    ):
+        """EXPERIMENT (FA4_FP8_PV_RANGE_UNROLL): exp2 + F2FP pack with a
+        materialized cutlass.range loop over fragments instead of the
+        trace-time-unrolled range_constexpr. A dynamic fragment index into the
+        register-resident S/P tensors is expected to force local-memory
+        spills; unroll=-1 (unroll_full) should recover the baseline since the
+        IR unroller turns the indices back into constants."""
+        frg_cnt = cutlass.const_expr(cute.size(tSrS) // 32)
+        tSrS_frg = cute.logical_divide(tSrS, cute.make_layout(32))
+        tSrP_u32 = cute.recast_tensor(tSrP, cute.Int32)
+        tSrP_u32_frg = cute.logical_divide(tSrP_u32, cute.make_layout(8))
+        if const_expr(unroll == -1):
+            for j in cutlass.range(frg_cnt, unroll_full=True):
+                self._exp2_pack_fp8_range_frg(tSrS_frg, tSrP_u32_frg, j)
+        else:
+            for j in cutlass.range(frg_cnt, unroll=unroll):
+                self._exp2_pack_fp8_range_frg(tSrS_frg, tSrP_u32_frg, j)
 
     @cute.jit
     def _pack_fp8_store_pipelined(
@@ -3258,7 +3299,7 @@ class FlashAttentionForwardSm100:
         # 4. Pack SF values to UE4M3 and copy to SMEM (same as the non-pipelined
         # path in softmax_step; see the layout comment there).
         tSrPSF_u32_view = cute.recast_tensor(tSrPSF, cute.Int32)
-        for i in cutlass.range_constexpr(0, cute.size(tSrPSF_f32) // 4, unroll=1):
+        for i in cutlass.range_constexpr(0, cute.size(tSrPSF_f32) // 4):
             tSrPSF_u32_view[i] = packed_float_to_ue4m3(
                 tSrPSF_f32[i * 4],
                 tSrPSF_f32[i * 4 + 1],
@@ -3484,7 +3525,17 @@ class FlashAttentionForwardSm100:
                     fp8_pipe_active = const_expr(
                         self.fp8_pv_pack_store_pipeline and not self.force_e2e
                     )
-                    if const_expr(not fp8_pipe_active):
+                    fp8_range_active = const_expr(
+                        self.fp8_pv_range_unroll != 0
+                        and not self.force_e2e
+                        and not fp8_pipe_active
+                    )
+                    if const_expr(fp8_range_active):
+                        # EXPERIMENT: materialized loop over fragments.
+                        self._exp2_pack_fp8_range(
+                            tSrS_t2r, tSrP_r2t, self.fp8_pv_range_unroll
+                        )
+                    elif const_expr(not fp8_pipe_active):
                         softmax.apply_exp2_convert(
                             tSrS_t2r,
                             e2e=self.force_e2e,
@@ -3496,7 +3547,7 @@ class FlashAttentionForwardSm100:
                     if const_expr(prof is not None and self.prof_detail):
                         prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_SOFTMAX_EXP, fa4_prof.EVENT_END, prof_pred)
                         prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_SOFTMAX_QUANT, fa4_prof.EVENT_BEGIN, prof_pred)
-                    if const_expr(not fp8_pipe_active):
+                    if const_expr(not fp8_pipe_active and not fp8_range_active):
                         self._pack_fp8(tSrS_t2r, tSrP_r2t)
             else:
                 # BF16 PV: exp2 and the bf16x2 pack are fused inside
