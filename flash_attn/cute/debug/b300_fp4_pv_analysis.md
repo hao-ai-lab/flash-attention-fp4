@@ -110,6 +110,26 @@ One elected lane per warpgroup records `%clock` cycles at every pipeline
 event into a gmem buffer. Run `flash_attn/cute/debug/trace_pipeline.py`
 to capture and render a trace (3 rows: MMA warp, Softmax WG0, Softmax WG1).
 
+Two granularities (see the instrumentation-artifact warning below):
+- **Coarse (default)**: events only at wait/store boundaries that are already
+  side-effect ordered — the softmax compute stream contains no timestamps, so
+  ptxas keeps full scheduling freedom and the per-step numbers are close to
+  the clean kernel (e.g. FP8: 96-iteration window 388K cycles coarse vs 472K
+  with detailed events vs ~identical clean TFLOPS). One combined "softmax
+  compute" span per step.
+- **Detailed (`FA4_PROFILE_DETAIL=1`)**: per-phase load/exp/quant spans;
+  phase boundaries inhibit compiler interleaving and inflate spans ~15%.
+
+Average step costs, coarse mode, block 0, b=1 s=4096 h=24 d=128 (the trace
+figures show this line under the title):
+
+| Per step (cycles)            | BF16 PV | FP8 PV | FP4 PV |
+|------------------------------|---------|--------|--------|
+| softmax step period          | 4,855   | 4,001  | 5,389  |
+| softmax step busy            | 2,352   | 2,288  | 3,469  |
+| MMA QK+PV GEMM (one stage)  | 732     | 639    | 622    |
+| MMA wait-P (per PV)          | 933     | 595    | 1,171  |
+
 Measured means per event, block 0, b=1 s=4096 h=24 d=128 (96 softmax
 iterations per WG, GB300 at 2070 MHz; cycles from %clock):
 

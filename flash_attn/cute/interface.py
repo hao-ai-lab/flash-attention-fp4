@@ -666,8 +666,9 @@ def _flash_attn_fwd(
                            # reused the kernel compiled for the first.
         local,
         # In-kernel pipeline trace (flash_attn/cute/profiler.py): instrumented
-        # and clean kernels must not share a cache slot.
+        # and clean kernels must not share a cache slot, nor coarse vs detail.
         os.environ.get("FA4_PROFILE_PIPELINE", "0") == "1",
+        os.environ.get("FA4_PROFILE_DETAIL", "0") == "1",
     )
     fp4_qk = use_fp4 and not is_cute_q
     # FP4 V also needs the make_ptr path: dlpack reports half-headdim shape for

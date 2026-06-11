@@ -308,6 +308,14 @@ class FlashAttentionForwardSm100:
         # P_full signals as early as possible.
         self.fp8_pv_pack_store_pipeline = os.getenv("FA4_FP8_PV_PACK_STORE_PIPELINE", "0") == "1"
         self.fp4_pv_quant_store_pipeline = os.getenv("FA4_FP4_PV_QUANT_STORE_PIPELINE", "0") == "1"
+        # Pipeline-trace granularity (FA4_PROFILE_PIPELINE=1). Coarse (default)
+        # records only at wait/store boundaries that are already side-effect
+        # ordered, so the softmax compute stream contains no timestamps and
+        # ptxas keeps full scheduling freedom — avoiding the artifact where the
+        # profiler's %clock asm acts as a barrier and inflates phase spans.
+        # FA4_PROFILE_DETAIL=1 restores the per-phase (load/exp/quant) events.
+        self.prof_detail = os.getenv("FA4_PROFILE_DETAIL", "0") == "1"
+        self.prof_events_per_step = 12 if self.prof_detail else 8
         self.mma_inst_bits_k = 256
         if self.sf_vec_size == 16:
             # NVFP4 / MXF4NVF4: 256-bit operand tile covers 64 logical K elements.
@@ -3305,7 +3313,7 @@ class FlashAttentionForwardSm100:
         tCtSFP: Optional[cute.Tensor] = None,
         sSFP: Optional[cute.Tensor] = None,
         prof=None,  # (buf, bg_index, stride, tag_base, pred) trace state or None
-        prof_iter=0,  # softmax_step call count (slot base = prof_iter * 12)
+        prof_iter=0,  # softmax_step call count (slot base = prof_iter * events/step)
     ) -> Tuple[cute.Int32, cute.Int32, cute.Int32]:
         """Perform a single step of the softmax computation on a block of attention scores.
 
@@ -3329,16 +3337,17 @@ class FlashAttentionForwardSm100:
         # P size when in FP32
         tScP = cute.composition(tScS, cute.make_layout((self.m_block_size, tilePlikeFP32)))
 
-        # Trace state: 12 events per softmax_step in every PV-mode branch.
+        # Trace state: fixed number of events per softmax_step in every
+        # PV-mode branch (8 coarse / 12 with FA4_PROFILE_DETAIL=1).
         if const_expr(prof is not None):
             prof_buf, prof_bg, prof_stride, prof_tag, prof_pred = prof
-            prof_k = prof_iter * 12
+            prof_k = prof_iter * self.prof_events_per_step
             prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_SOFTMAX_WAIT_S, fa4_prof.EVENT_BEGIN, prof_pred)
         # Wait for Si
         cute.arch.mbarrier_wait(mbar_ptr + self.mbar_S_full_offset + stage, mma_si_consumer_phase)
         if const_expr(prof is not None):
             prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_SOFTMAX_WAIT_S, fa4_prof.EVENT_END, prof_pred)
-            prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_SOFTMAX_ROWMAX, fa4_prof.EVENT_BEGIN, prof_pred)
+            prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_SOFTMAX_ROWMAX if self.prof_detail else fa4_prof.EVT_SOFTMAX_EXP, fa4_prof.EVENT_BEGIN, prof_pred)
         tSrS_t2r = cute.make_fragment(thr_tmem_load.partition_D(tScS).shape, self.qk_acc_dtype)
         cute.copy(thr_tmem_load, tStS_t2r, tSrS_t2r)
         
@@ -3379,7 +3388,7 @@ class FlashAttentionForwardSm100:
         cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_softmax_corr_full_offset + stage)
 
         softmax.scale_subtract_rowmax(tSrS_t2r, row_max)
-        if const_expr(prof is not None):
+        if const_expr(prof is not None and self.prof_detail):
             prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_SOFTMAX_ROWMAX, fa4_prof.EVENT_END, prof_pred)
         # Sequence barrier wait
         if const_expr(self.s0_s1_barrier):
@@ -3399,7 +3408,7 @@ class FlashAttentionForwardSm100:
 
 
         if const_expr(self.quant_pv):
-            if const_expr(prof is not None):
+            if const_expr(prof is not None and self.prof_detail):
                 prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_SOFTMAX_EXP, fa4_prof.EVENT_BEGIN, prof_pred)
             # Exp2 with softmax scale and sp1 scaling
             softmax.apply_exp2_convert(
@@ -3410,7 +3419,7 @@ class FlashAttentionForwardSm100:
             )
             # update_row_sum BEFORE scale_groupwise so it uses original P values
             softmax.update_row_sum(tSrS_t2r.load(), acc_scale, is_first)
-            if const_expr(prof is not None):
+            if const_expr(prof is not None and self.prof_detail):
                 prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_SOFTMAX_EXP, fa4_prof.EVENT_END, prof_pred)
                 prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_SOFTMAX_QUANT, fa4_prof.EVENT_BEGIN, prof_pred)
             if const_expr(self.fp4_pv_quant_store_pipeline and sSFP is not None):
@@ -3452,9 +3461,9 @@ class FlashAttentionForwardSm100:
                 tSrPSF_2d = cute.logical_divide(tSrPSF, cute.make_layout(k_inner))
                 cute.autovec_copy(tSrPSF_2d, sSFP_thread)
             if const_expr(prof is not None):
-                prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_SOFTMAX_QUANT, fa4_prof.EVENT_END, prof_pred)
+                prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_SOFTMAX_QUANT if self.prof_detail else fa4_prof.EVT_SOFTMAX_EXP, fa4_prof.EVENT_END, prof_pred)
         else:
-            if const_expr(prof is not None):
+            if const_expr(prof is not None and self.prof_detail):
                 prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_SOFTMAX_EXP, fa4_prof.EVENT_BEGIN, prof_pred)
             # softmax.scale_apply_exp2_convert(tSrS_t2r, row_max, tSrP_r2t)
             if const_expr(pure_fp8_pv and self.v_dtype == Float8E4M3FN and self.fp8_pv_use_explicit_pack):
@@ -3468,7 +3477,7 @@ class FlashAttentionForwardSm100:
                         e2e=self.force_e2e,
                         e2e_freq=self.e2e_freq,
                     )
-                    if const_expr(prof is not None):
+                    if const_expr(prof is not None and self.prof_detail):
                         prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_SOFTMAX_EXP, fa4_prof.EVENT_END, prof_pred)
                         prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_SOFTMAX_QUANT, fa4_prof.EVENT_BEGIN, prof_pred)
                 else:
@@ -3484,7 +3493,7 @@ class FlashAttentionForwardSm100:
                         )
                     # else: exp2, F2FP pack and TMEM stores are all
                     # software-pipelined per chunk in _pack_fp8_store_pipelined.
-                    if const_expr(prof is not None):
+                    if const_expr(prof is not None and self.prof_detail):
                         prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_SOFTMAX_EXP, fa4_prof.EVENT_END, prof_pred)
                         prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_SOFTMAX_QUANT, fa4_prof.EVENT_BEGIN, prof_pred)
                     if const_expr(not fp8_pipe_active):
@@ -3500,11 +3509,11 @@ class FlashAttentionForwardSm100:
                     e2e_freq=self.e2e_freq,
                     e2e_start_frg=self.e2e_start_frg,
                 )
-                if const_expr(prof is not None):
+                if const_expr(prof is not None and self.prof_detail):
                     prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_SOFTMAX_EXP, fa4_prof.EVENT_END, prof_pred)
                     prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_SOFTMAX_QUANT, fa4_prof.EVENT_BEGIN, prof_pred)
             if const_expr(prof is not None):
-                prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_SOFTMAX_QUANT, fa4_prof.EVENT_END, prof_pred)
+                prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_SOFTMAX_QUANT if self.prof_detail else fa4_prof.EVT_SOFTMAX_EXP, fa4_prof.EVENT_END, prof_pred)
         # Sequence barrier arrive
         if const_expr(self.s0_s1_barrier):
             cute.arch.mbarrier_arrive(mbar_ptr + mbar_s0_s1_sequence_offset + (1 - stage) * 4)

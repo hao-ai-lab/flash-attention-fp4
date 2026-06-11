@@ -102,6 +102,43 @@ def summarize(spans_by_bg, block):
             print(f"  {nm:12s} n={cnt:5d} total={tot:9d} cy ({100.0*tot/total_window:5.1f}%) mean={tot/cnt:7.1f} cy")
 
 
+def step_stats(spans_by_bg, block):
+    """Average cycles of one softmax step and one MMA step (QK+PV) at block.
+
+    Softmax step = median gap between consecutive wait-S starts (per WG,
+    averaged over both WGs); its busy part = mean per-step non-wait time.
+    MMA step (QK+PV) = mean QK span + mean PV span (one stage's GEMM pair;
+    the PV span includes the embedded P2 wait). MMA wait-P = mean stall
+    before each PV.
+    """
+    import statistics
+
+    sm_periods, sm_busys = [], []
+    for grp in (fa4_prof.GRP_SOFTMAX0, fa4_prof.GRP_SOFTMAX1):
+        spans = spans_by_bg.get((block, grp), [])
+        starts = [s["start"] for s in spans if s["event_idx"] == fa4_prof.EVT_SOFTMAX_WAIT_S]
+        if len(starts) > 1:
+            sm_periods.append(statistics.median(
+                b - a for a, b in zip(starts, starts[1:])
+            ))
+        waits = (fa4_prof.EVT_SOFTMAX_WAIT_S, fa4_prof.EVT_SOFTMAX_WAIT_CORR)
+        busy = sum(s["end"] - s["start"] for s in spans if s["event_idx"] not in waits)
+        if starts:
+            sm_busys.append(busy / len(starts))
+
+    mma = spans_by_bg.get((block, fa4_prof.GRP_MMA), [])
+    def _mean(evt):
+        d = [s["end"] - s["start"] for s in mma if s["event_idx"] == evt]
+        return sum(d) / len(d) if d else 0.0
+
+    return {
+        "softmax_period": sum(sm_periods) / len(sm_periods) if sm_periods else 0.0,
+        "softmax_busy": sum(sm_busys) / len(sm_busys) if sm_busys else 0.0,
+        "mma_qk_pv": _mean(fa4_prof.EVT_QK_GEMM) + _mean(fa4_prof.EVT_PV_GEMM),
+        "mma_wait_p": _mean(fa4_prof.EVT_MMA_WAIT_P),
+    }
+
+
 def render(spans_by_bg, block, output_path, title, start_iter, num_iters,
            pv_mode="bf16"):
     rows = [
@@ -113,6 +150,13 @@ def render(spans_by_bg, block, output_path, title, start_iter, num_iters,
     # real quantization (group_max + scale + E2M1 pack).
     quant_label = "quant" if pv_mode == "fp4" else "F2FP"
     quant_legend = "P quant (FP4)" if pv_mode == "fp4" else "P cast (F2FP)"
+    # Coarse traces (default) have no per-phase events: EVT_SOFTMAX_EXP is one
+    # combined compute span. Detect by the absence of ROWMAX spans.
+    detail = any(
+        s["event_idx"] == fa4_prof.EVT_SOFTMAX_ROWMAX
+        for g in (fa4_prof.GRP_SOFTMAX0, fa4_prof.GRP_SOFTMAX1)
+        for s in spans_by_bg.get((block, g), [])
+    )
 
     # Pick a steady-state window: bounded by the start of softmax WG0's
     # (start_iter)-th and (start_iter+num_iters)-th wait-S span.
@@ -172,6 +216,9 @@ def render(spans_by_bg, block, output_path, title, start_iter, num_iters,
                 # WG0 -> odd PVs, WG1 -> even PVs.
                 if evt == fa4_prof.EVT_SOFTMAX_QUANT:
                     label = quant_label
+                elif not detail:
+                    # Coarse trace: one combined compute span per step.
+                    label = "smax"
                 n = counters[evt]
                 glob = 2 * (n - 1) + (1 if grp == fa4_prof.GRP_SOFTMAX0 else 2)
                 label = f"{label}{glob}"
@@ -205,24 +252,44 @@ def render(spans_by_bg, block, output_path, title, start_iter, num_iters,
         ax.set_xlim(0, w1 - w0)
 
     axes[-1].set_xlabel("Cycles (%clock, same SM)")
-    fig.suptitle(title, fontsize=12, fontweight="bold")
+    fig.suptitle(title, fontsize=12, fontweight="bold", y=1.02)
 
-    mufu_legend = "MUFU (exp2)" if pv_mode == "fp4" else "MUFU (exp2, fused cast)"
+    # Average step costs measured over the whole trace (not just the window).
+    st = step_stats(spans_by_bg, block)
+    fig.text(
+        0.5, 0.965,
+        f"avg per step — softmax: {st['softmax_period']:,.0f} cy "
+        f"(busy {st['softmax_busy']:,.0f} cy)  ·  "
+        f"MMA QK+PV GEMM: {st['mma_qk_pv']:,.0f} cy  ·  "
+        f"MMA wait-P: {st['mma_wait_p']:,.0f} cy",
+        ha="center", fontsize=10, color="#333333",
+    )
+
+    if detail:
+        sm_legend = [
+            mpatches.Patch(color="#9966CC", label="MUFU (exp2)" if pv_mode == "fp4" else "MUFU (exp2, fused cast)"),
+            mpatches.Patch(color="#CC3355", label=quant_legend),
+            mpatches.Patch(color="#77BBDD", label="S load + row_max"),
+        ]
+    else:
+        sm_legend = [
+            mpatches.Patch(color="#9966CC",
+                           label="softmax compute (S load + row_max + MUFU + "
+                                 + ("quant" if pv_mode == "fp4" else "F2FP cast") + ")"),
+        ]
     legend = [
         mpatches.Patch(color="#4488CC", label="QK GEMM"),
         mpatches.Patch(color="#44AA66", label="PV GEMM (stage 0)"),
         mpatches.Patch(color="#DD8844", label="PV GEMM (stage 1)"),
         mpatches.Patch(color="#E8E8E8", label="wait P 2nd half (measured, inside PV)"),
-        mpatches.Patch(color="#9966CC", label=mufu_legend),
-        mpatches.Patch(color="#CC3355", label=quant_legend),
-        mpatches.Patch(color="#77BBDD", label="S load + row_max"),
+        *sm_legend,
         mpatches.Patch(color="#AADDEE", label="P store + signal"),
         mpatches.Patch(color="#CCCCCC", label="wait S / wait P (mbarrier)"),
         mpatches.Patch(color="#B8A98F", label="wait correction (softmax WG)"),
         mpatches.Patch(color="#555555", label="wait KV (TMA, MMA warp only)"),
     ]
     fig.legend(handles=legend, loc="lower center", ncol=5, fontsize=8,
-               bbox_to_anchor=(0.5, -0.04))
+               bbox_to_anchor=(0.5, -0.12))
 
     fig.savefig(output_path, dpi=150, bbox_inches="tight", facecolor="white")
     plt.close(fig)
