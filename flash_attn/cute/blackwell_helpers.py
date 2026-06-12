@@ -1734,11 +1734,11 @@ def tmem_ld_red_max(
     """
     from cutlass._mlir import ir as _ir
 
-    # Partition shape is ((atom_v, rest_v), tiles, m, n) for the FP4
-    # kernel's Ld32x32bOp(Repetition(32)) layout: the x32 tiles live in
-    # mode 1 (stride 32 TMEM columns); trailing modes must be singleton.
-    num_tiles = cute.size(tStS.shape[1])
-    assert cute.size(tStS.shape[2]) == 1 and cute.size(tStS.shape[3]) == 1
+    # Group all modes after the value mode so the x32 tile index is a single
+    # mode regardless of the caller's partition rank (the FP4 kernel has
+    # tiles at mode 1 of a rank-4 shape; the BF16 kernel at mode 2 of rank 3).
+    tStS_g = cute.group_modes(tStS, 1, cute.rank(tStS.shape))
+    num_tiles = cute.size(tStS_g.shape[1])
     assert cute.size(tSrS) == num_tiles * 32
     f32_ty = _ir.F32Type.get()
     struct_ty = llvm.StructType.get_literal([f32_ty] * 33)
@@ -1753,7 +1753,7 @@ def tmem_ld_red_max(
     for k in cutlass.range_constexpr(num_tiles):
         result = llvm.inline_asm(
             struct_ty,
-            [tStS[None, k, 0, 0].iterator.toint().ir_value()],
+            [tStS_g[None, k].iterator.toint().ir_value()],
             asm_str,
             "=f," * 33 + "r",
             has_side_effects=True,
