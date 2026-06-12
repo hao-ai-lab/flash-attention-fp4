@@ -317,6 +317,11 @@ class FlashAttentionForwardSm100:
         # +8-15% FP4 PV on GB300 (1388 -> 1595 TF at s=32768) at identical
         # measured accuracy vs the FP32 reference.
         self.fp4_pv_log2_quant = os.getenv("FA4_FP4_PV_LOG2_QUANT", "1") == "1"
+        # SM103 tcgen05.ld.red: fused TMEM S load + per-x32-tile max — row max
+        # nearly free for all PV modes (and free MXFP8 P group maxes).
+        self.use_ldred_rowmax = os.getenv(
+            "FA4_LDRED_ROWMAX", "1" if _is_sm103() else "0"
+        ) == "1"
         # Pipeline-trace granularity (FA4_PROFILE_PIPELINE=1). Coarse (default)
         # records only at wait/store boundaries that are already side-effect
         # ordered, so the softmax compute stream contains no timestamps and
@@ -2919,11 +2924,21 @@ class FlashAttentionForwardSm100:
                     n_block_min_before_local_mask = block_info.get_n_block_min_before_local_mask(
                         seqlen, m_block, n_block_min
                     )
+                    # The default mask partial here has mask_seqlen=False; with
+                    # no causal/local/mask_mod it is a compile-time no-op, so
+                    # the ld.red hardware row max is valid.
+                    unmasked = cutlass.const_expr(
+                        not self.is_causal
+                        and not self.is_local
+                        and self.mask_mod is None
+                        and not self.use_block_sparsity
+                    )
                     for n_tile in cutlass.range(n_block_max - n_block_min_before_local_mask, unroll=1):
                         n_block = n_block_max - n_tile - 1
                         mma_si_consumer_phase, si_corr_producer_phase, s0_s1_sequence_phase = softmax_step(
                             mma_si_consumer_phase, si_corr_producer_phase, s0_s1_sequence_phase, n_block,
                             prof_iter=prof_iter,
+                            mask_is_noop=unmasked,
                         )
                         prof_iter += 1
                     # Separate iterations with local masking on the left
@@ -3089,6 +3104,12 @@ class FlashAttentionForwardSm100:
         tSrP: cute.Tensor,   # fp4 view of the P r2t backing storage
         acc_scale: Float32,
         is_first: cutlass.Constexpr[bool],
+        # SM103 ld.red per-x32-tile maxes of the RAW S values (pre
+        # scale_subtract). When sf_vec_size == 32 each tile max IS the group
+        # max: m'_g = m_raw_g * scale_log2 + (max_offset - row_max*scale_log2)
+        # replaces the whole FMNMX group reduce with one FMA per group.
+        hw_group_maxes: Optional[cute.Tensor] = None,
+        row_max: Optional[Float32] = None,
     ):
         """Log-domain NVFP4 P quantization (FA4_FP4_PV_LOG2_QUANT=1).
 
@@ -3112,11 +3133,21 @@ class FlashAttentionForwardSm100:
         tSrPSF_f32 = cute.make_rmem_tensor(cute.make_layout(num_groups), Float32)
         tSrPSF = cute.make_rmem_tensor(tSrPSF_f32.layout, self.sf_dtype)
 
+        if const_expr(hw_group_maxes is not None):
+            assert cute.size(hw_group_maxes) == num_groups, (
+                "ld.red tile count must equal SF group count (sf_vec_size==32)"
+            )
+            # Transform raw-S tile maxes into post-scale_subtract group maxes.
+            hw_bias = softmax.max_offset - row_max * softmax.scale_log2
+
         row_sum_acc = Float32(0.0)
         for g in cutlass.range_constexpr(num_groups):
             # Group max in log space; clamp so fully-masked groups (all -inf)
             # don't produce NaN from (-inf) - (-inf) below.
-            m = softmax._compute_row_max(acc_S_frag[None, g].load())
+            if const_expr(hw_group_maxes is not None):
+                m = hw_group_maxes[g] * softmax.scale_log2 + hw_bias
+            else:
+                m = softmax._compute_row_max(acc_S_frag[None, g].load())
             bias = cute.arch.fmax(m, Float32(-100.0)) - LOG2_6
 
             # exp2 with the group scale folded into the argument
@@ -3460,6 +3491,10 @@ class FlashAttentionForwardSm100:
         sSFP: Optional[cute.Tensor] = None,
         prof=None,  # (buf, bg_index, stride, tag_base, pred) trace state or None
         prof_iter=0,  # softmax_step call count (slot base = prof_iter * events/step)
+        # True when mask_fn is a compile-time no-op for this call site
+        # (non-causal/non-local, no mask_mod, mask_seqlen=False) — gates the
+        # use of the tcgen05.ld.red hardware max.
+        mask_is_noop: cutlass.Constexpr[bool] = False,
     ) -> Tuple[cute.Int32, cute.Int32, cute.Int32]:
         """Perform a single step of the softmax computation on a block of attention scores.
 
@@ -3494,9 +3529,22 @@ class FlashAttentionForwardSm100:
         if const_expr(prof is not None):
             prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_SOFTMAX_WAIT_S, fa4_prof.EVENT_END, prof_pred)
             prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_SOFTMAX_ROWMAX if self.prof_detail else fa4_prof.EVT_SOFTMAX_EXP, fa4_prof.EVENT_BEGIN, prof_pred)
+        # Load S from TMEM. SM103: tcgen05.ld.red fuses the load with a
+        # per-x32-tile max reduction in the TMEM controller — row max comes
+        # nearly free, and for sf_vec_size=32 (MXFP8 P) each tile max IS the
+        # scale-factor group max.
+        use_ldred = const_expr(self.use_ldred_rowmax and self.score_mod is None)
         tSrS_t2r = cute.make_fragment(thr_tmem_load.partition_D(tScS).shape, self.qk_acc_dtype)
-        cute.copy(thr_tmem_load, tStS_t2r, tSrS_t2r)
-        
+        hw_tile_maxes = None
+        if const_expr(use_ldred):
+            if const_expr(self.quant_pv and self.sf_vec_size == 32 and self.fp4_pv_log2_quant):
+                hw_tile_maxes = cute.make_rmem_tensor(
+                    cute.make_layout(cute.size(tStS_t2r.shape[2])), Float32
+                )
+            hw_max = sm100_utils.tmem_ld_red_max(tStS_t2r, tSrS_t2r, hw_tile_maxes)
+        else:
+            cute.copy(thr_tmem_load, tStS_t2r, tSrS_t2r)
+
         # unblock sfqk load
         cute.arch.fence_view_async_tmem_load()
         sfqk_stage = self.q_stage - 1 - stage
@@ -3517,9 +3565,15 @@ class FlashAttentionForwardSm100:
             )
 
         if const_expr(mask_fn is not None):
-            mask_fn(tSrS_t2r, n_block=n_block) 
+            mask_fn(tSrS_t2r, n_block=n_block)
 
-        row_max, acc_scale = softmax.update_row_max(tSrS_t2r.load(), is_first)
+        # The hardware max is only valid when masking left the values
+        # untouched — masked iterations (seqlen boundary, causal, mask_mod)
+        # fall back to the software reduce over the post-mask values.
+        if const_expr(use_ldred and mask_is_noop):
+            row_max, acc_scale = softmax.update_row_max_precomputed(hw_max, is_first)
+        else:
+            row_max, acc_scale = softmax.update_row_max(tSrS_t2r.load(), is_first)
         tSrPSF_f32 = None
         tSrPSF = None
 
@@ -3587,6 +3641,8 @@ class FlashAttentionForwardSm100:
             elif const_expr(fp4_log2_active):
                 tSrPSF_f32, tSrPSF = self._fused_log2_group_quant(
                     softmax, tSrS_t2r, tSrP_r2t, acc_scale, is_first,
+                    hw_group_maxes=hw_tile_maxes if cutlass.const_expr(mask_is_noop) else None,
+                    row_max=row_max,
                 )
             else:
                 tSrPSF_f32, tSrPSF = self._fused_group_max_scale_quant(

@@ -1711,3 +1711,59 @@ def make_smem_layout_sfb(
         smem_layout,
         cute.make_layout(num_stages, stride=cute.cosize(cute.filter_zeros(smem_layout))),
     )
+
+
+@cute.jit
+def tmem_ld_red_max(
+    tStS: cute.Tensor,
+    tSrS: cute.Tensor,
+    tile_maxes: Optional[cute.Tensor] = None,
+) -> cutlass.Float32:
+    """SM103: fused TMEM load + row-max via raw tcgen05.ld.red PTX.
+
+    Drop-in replacement for cute.copy(thr_tmem_load, src, dst) with a
+    Ld32x32bOp(Repetition(32)) atom that also returns the row max: each
+    x32 load returns its 32 values plus their max in a 33rd register,
+    computed in the TMEM controller at zero ALU cost.
+
+    If `tile_maxes` is given (size = number of x32 tiles), the per-tile
+    maxes are stored there too — for sf_vec_size=32 quantization (MXFP8 P)
+    each x32 tile max IS that scale-factor group's max.
+
+    Ported from LopezCastroRoberto/flash-attention perf/ld.red-upstream.
+    """
+    from cutlass._mlir import ir as _ir
+
+    # Partition shape is ((atom_v, rest_v), tiles, m, n) for the FP4
+    # kernel's Ld32x32bOp(Repetition(32)) layout: the x32 tiles live in
+    # mode 1 (stride 32 TMEM columns); trailing modes must be singleton.
+    num_tiles = cute.size(tStS.shape[1])
+    assert cute.size(tStS.shape[2]) == 1 and cute.size(tStS.shape[3]) == 1
+    assert cute.size(tSrS) == num_tiles * 32
+    f32_ty = _ir.F32Type.get()
+    struct_ty = llvm.StructType.get_literal([f32_ty] * 33)
+
+    asm_str = (
+        "tcgen05.ld.red.sync.aligned.32x32b.x32.f32.max"
+        " {" + ", ".join(f"${i}" for i in range(32)) + "}"
+        ", $32, [$33];\n"
+    )
+
+    row_max = cutlass.Float32(0.0)
+    for k in cutlass.range_constexpr(num_tiles):
+        result = llvm.inline_asm(
+            struct_ty,
+            [tStS[None, k, 0, 0].iterator.toint().ir_value()],
+            asm_str,
+            "=f," * 33 + "r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+        for i in cutlass.range_constexpr(32):
+            tSrS[k * 32 + i] = cutlass.Float32(llvm.extractvalue(f32_ty, result, [i]))
+        tile_max = cutlass.Float32(llvm.extractvalue(f32_ty, result, [32]))
+        if cutlass.const_expr(tile_maxes is not None):
+            tile_maxes[k] = tile_max
+        row_max = tile_max if cutlass.const_expr(k == 0) else cute.arch.fmax(row_max, tile_max)
+    return row_max
