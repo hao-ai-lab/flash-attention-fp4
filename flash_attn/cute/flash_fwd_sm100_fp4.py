@@ -136,11 +136,20 @@ class FlashAttentionForwardSm100:
         is_varlen_q: bool = False,
         sf_dtype: Optional[Type[cutlass.Numeric]] = None,
         sf_vec_size: Optional[int] = None,
+        # PV-side scale-factor format; None mirrors the QK side. Set to
+        # (Float8E8M0FNU, 32) for MXFP8 P/V with NVFP4 QK.
+        sf_dtype_pv: Optional[Type[cutlass.Numeric]] = None,
+        sf_vec_size_pv: Optional[int] = None,
     ):
         assert (sf_dtype, sf_vec_size) in {
             (cutlass.Float8E4M3FN, 16),
             (cutlass.Float8E8M0FNU, 32),
         }, f"Unsupported block-scaled configuration: sf_dtype={sf_dtype}, sf_vec_size={sf_vec_size}"
+        if sf_dtype_pv is not None:
+            assert (sf_dtype_pv, sf_vec_size_pv) in {
+                (cutlass.Float8E4M3FN, 16),
+                (cutlass.Float8E8M0FNU, 32),
+            }, f"Unsupported PV block-scaled configuration: {sf_dtype_pv}, {sf_vec_size_pv}"
         self.use_tma_KV = not paged_kv_non_tma
         # self.dtype = dtype
         # padding head_dim to a multiple of 16 as k_block_size
@@ -268,6 +277,8 @@ class FlashAttentionForwardSm100:
         # Scale factor parameters for block-scaled quantization (FP4)
         self.sf_dtype = sf_dtype
         self.sf_vec_size = sf_vec_size
+        self.sf_dtype_pv = sf_dtype_pv if sf_dtype_pv is not None else sf_dtype
+        self.sf_vec_size_pv = sf_vec_size_pv if sf_vec_size_pv is not None else sf_vec_size
         self.debug_skip_sfq_s2t = os.getenv("FA4_DEBUG_SKIP_SFQ_S2T", "0") == "1"
         # FA4_SFQK_TMEM_SLOT: "s" (default staggered-S), "o" (o-offsets),
         # "o_stagger" (staggered-O). Experiment knob for SFQK TMEM placement.
@@ -339,6 +350,12 @@ class FlashAttentionForwardSm100:
             self.mma_inst_tile_k = self.head_dim_padded // (self.mma_inst_bits_k // 8)
         else:
             raise ValueError(f"Unsupported sf_vec_size={self.sf_vec_size}")
+        # PV GEMM: K dimension is the n_block (seqlen tile), and the operand
+        # element width follows the PV format.
+        if self.sf_vec_size_pv == 16:
+            self.mma_inst_tile_k_pv = self.n_block_size // (self.mma_inst_bits_k // 8 * 2)
+        else:
+            self.mma_inst_tile_k_pv = self.n_block_size // (self.mma_inst_bits_k // 8)
 
     def _setup_attributes(self):
         """Set up configurations and parameters for the FMHA kernel operation.
@@ -368,7 +385,7 @@ class FlashAttentionForwardSm100:
         smem_sQ = align_up(smem_q_per_stage * self.q_stage, align)
         # SFQ/SFP are per q_stage, SF layout cosize: m_block * head_dim / sf_vec_size
         sfq_per_stage = self.m_block_size * self.head_dim_padded // self.sf_vec_size
-        sfp_per_stage = self.m_block_size * self.head_dim_v_padded // self.sf_vec_size
+        sfp_per_stage = self.m_block_size * self.head_dim_v_padded // self.sf_vec_size_pv
         smem_sSFQ = align_up(sfq_per_stage * self.q_stage, align) if self.quant_qk else 0
         smem_sSFP = align_up(sfp_per_stage * self.q_stage, align) if self.quant_pv else 0
         smem_fixed = smem_mbar + smem_tmem + smem_sScale + smem_sO + smem_sQ + smem_sSFQ + smem_sSFP
@@ -381,7 +398,7 @@ class FlashAttentionForwardSm100:
             smem_kv_per_stage = smem_k_per_stage + smem_v_per_stage
         # SF layout cosize per stage: n_block * head_dim / sf_vec_size (MMA-tiled)
         sfk_per_stage = self.n_block_size * self.head_dim_padded // self.sf_vec_size
-        sfv_per_stage = self.n_block_size * self.head_dim_v_padded // self.sf_vec_size
+        sfv_per_stage = self.n_block_size * self.head_dim_v_padded // self.sf_vec_size_pv
         if self.quant_qk:
             smem_kv_per_stage += sfk_per_stage
         if self.quant_pv:
@@ -503,6 +520,10 @@ class FlashAttentionForwardSm100:
             assert const_expr(mSFK is None), "Must provide both QK sfs or None"
         self.quant_qk = const_expr(mSFQ is not None)
         self.quant_pv = const_expr(mSFV is not None)
+        if const_expr(mSFV is not None and self.v_dtype == Float8E4M3FN):
+            assert self.fp4_pv_log2_quant and not self.fp4_pv_quant_store_pipeline, (
+                "MXFP8 PV requires the log-domain quant path"
+            )
         assert not (not self.quant_qk and self.quant_pv)
 
         # Assume all strides are divisible by 128 bits except the last stride
@@ -573,8 +594,12 @@ class FlashAttentionForwardSm100:
 
         if const_expr(self.q_dtype != self.k_dtype):
             raise TypeError(f"Type mismatch: {self.q_dtype} != {self.k_dtype}")
-        if const_expr(mSFV is not None and self.q_dtype != self.v_dtype):
-            raise TypeError(f"Type mismatch: {self.q_dtype} != {self.v_dtype} (V quantization requires matching dtype)")
+        if const_expr(
+            mSFV is not None
+            and self.q_dtype != self.v_dtype
+            and not (self.v_dtype == Float8E4M3FN and self.sf_vec_size_pv == 32)
+        ):
+            raise TypeError(f"Type mismatch: {self.q_dtype} != {self.v_dtype} (V quantization requires matching dtype or MXFP8 PV)")
         self._setup_attributes()
         self.use_tma_O = self.arch >= 90 and mCuSeqlensQ is None and mSeqUsedQ is None
         # Apply FP8 PV tuning overrides when v_dtype is FP8
@@ -628,8 +653,8 @@ class FlashAttentionForwardSm100:
                 self.v_dtype,
                 p_major_mode,
                 self.v_major_mode,
-                self.sf_dtype,
-                self.sf_vec_size,
+                self.sf_dtype_pv,
+                self.sf_vec_size_pv,
                 self.cta_group,
                 self.mma_tiler_pv[:2],
                 p_source,
@@ -708,20 +733,21 @@ class FlashAttentionForwardSm100:
         )
         # Create P scale factor layout for P*V operation (P is the A matrix)
         if const_expr(self.quant_pv):
+            sf_layout_kwargs_pv = {"mma_tile_inst_k": self.mma_inst_tile_k_pv}
             sfp_smem_layout_staged = make_smem_layout_sfa(
                 tiled_mma_pv,
                 self.mma_tiler_pv,
-                self.sf_vec_size,
+                self.sf_vec_size_pv,
                 self.q_stage,
-                **sf_layout_kwargs,
+                **sf_layout_kwargs_pv,
             )
 
             sfv_smem_layout_staged = make_smem_layout_sfb(
                 tiled_mma_pv,
                 self.mma_tiler_pv,
-                self.sf_vec_size,
+                self.sf_vec_size_pv,
                 self.kv_stage,
-                **sf_layout_kwargs,
+                **sf_layout_kwargs_pv,
             )
         
         if const_expr(not self.same_hdim_kv_padded):
@@ -932,7 +958,7 @@ class FlashAttentionForwardSm100:
                 self.cluster_shape_mn, tiled_mma_pv.thr_id
             )
             # Setup scale factor tensor layout
-            sfv_layout = cute.tile_to_shape(blockscaled_utils.BlockScaledBasicChunk(self.sf_vec_size).layout, mV_shape, (2, 1, 3, 4))
+            sfv_layout = cute.tile_to_shape(blockscaled_utils.BlockScaledBasicChunk(self.sf_vec_size_pv).layout, mV_shape, (2, 1, 3, 4))
             mSFV = cute.make_tensor(mSFV.iterator, sfv_layout)
             # For SFB, compute mma_inst_shape_mnk_sfb: (M // (2 if use_2cta_instrs else 1), round_up(N, 128), K)
             mma_inst_shape_mnk_pv = ( # the same processed by one tcgen05.mma instruction
@@ -949,15 +975,15 @@ class FlashAttentionForwardSm100:
             mma_tiler_sfb_pv = (
                 mma_inst_shape_mnk_sfb_pv[0],
                 mma_inst_shape_mnk_sfb_pv[1],
-                mma_inst_shape_mnk_sfb_pv[2] * self.mma_inst_tile_k,
+                mma_inst_shape_mnk_sfb_pv[2] * self.mma_inst_tile_k_pv,
             )
             # For SFB, we need a separate tiled_mma_sfb with CtaGroup.ONE
             tiled_mma_sfb_pv = sm100_utils_basic.make_blockscaled_trivial_tiled_mma(
                 self.v_dtype,
                 p_major_mode,
                 self.v_major_mode,
-                self.sf_dtype,
-                self.sf_vec_size,
+                self.sf_dtype_pv,
+                self.sf_vec_size_pv,
                 cute.nvgpu.tcgen05.CtaGroup.ONE,
                 mma_inst_shape_mnk_sfb_pv[:2],
                 p_source,
@@ -1144,11 +1170,11 @@ class FlashAttentionForwardSm100:
                 self.buffer_align_bytes,
             ]
             sSFP: cute.struct.Align[
-                cute.struct.MemRange[self.sf_dtype, sfp_smem_size],
+                cute.struct.MemRange[self.sf_dtype_pv, sfp_smem_size],
                 self.buffer_align_bytes,
             ]
             sSFV: cute.struct.Align[
-                cute.struct.MemRange[self.sf_dtype, sfv_smem_size],
+                cute.struct.MemRange[self.sf_dtype_pv, sfv_smem_size],
                 self.buffer_align_bytes,
             ]
         
@@ -1616,12 +1642,12 @@ class FlashAttentionForwardSm100:
             sfp_tmem_ptrs = [cute.recast_ptr(
                             cute.make_ptr(Float32, self.tmem_s_offset[stage],
                             mem_space=cute.AddressSpace.tmem, assumed_align=align),
-                            dtype=self.sf_dtype) for stage in range(self.q_stage)]
+                            dtype=self.sf_dtype_pv) for stage in range(self.q_stage)]
             # (MMA, MMA_M, MMA_K) 
             tCtSFP_layout = blockscaled_utils.make_tmem_layout_sfa(
                 tiled_mma_pv,
                 self.mma_tiler_pv,
-                self.sf_vec_size,
+                self.sf_vec_size_pv,
                 cute.slice_(sfp_smem_layout_staged, (None, None, None, 0)),
             )
             tCtSFPs = [cute.make_tensor(sfp_tmem_ptrs[stage], tCtSFP_layout) for stage in range(self.q_stage)]
@@ -1631,7 +1657,7 @@ class FlashAttentionForwardSm100:
             # typed as `self.sf_dtype` (1 byte for E4M3/E8M0), so we convert
             # u32 cols → SF-element offset via `sf_dtype_per_u32 = 32 / sf_width`.
             # Both E4M3 and E8M0 are 8 bits → 4 SFs per u32 col.
-            sf_dtype_per_u32 = 32 // self.sf_dtype.width
+            sf_dtype_per_u32 = 32 // self.sf_dtype_pv.width
             sfp_offset = math.ceil(tcgen05.find_tmem_tensor_col_offset(tCtSFPs[0]) * sf_dtype_per_u32 / align) * align
             sfv_tmem_ptrs = [sfp_tmem_ptrs[stage] + sfp_offset for stage in range(self.q_stage)]
 
@@ -1639,7 +1665,7 @@ class FlashAttentionForwardSm100:
             tCtSFV_layout = blockscaled_utils.make_tmem_layout_sfb(
                 tiled_mma_pv,
                 self.mma_tiler_pv,
-                self.sf_vec_size,
+                self.sf_vec_size_pv,
                 cute.slice_(sfv_smem_layout_staged, (None, None, None, 0)),
             )
             tCtSFVs = [cute.make_tensor(sfv_tmem_ptrs[stage], tCtSFV_layout) for stage in range(self.q_stage)]
@@ -2795,8 +2821,9 @@ class FlashAttentionForwardSm100:
 
             import math as _math
             if const_expr(self.quant_pv):
-                # FP4 PV: P should be in [0, E2M1_max=6], so max_offset = log2(6).
-                _max_offset = _math.log2(6)
+                # P range targets the quantized dtype's max: E2M1 max = 6,
+                # E4M3 max = 448 (MXFP8 PV).
+                _max_offset = _math.log2(6) if const_expr(self.v_dtype.width == 4) else _math.log2(448)
                 _rescale_threshold = 0.0
             elif const_expr(not self.quant_pv and self.v_dtype.width == 8):
                 # FP8 PV: use max_offset to shift P range for better utilization.
@@ -3000,9 +3027,9 @@ class FlashAttentionForwardSm100:
                    tSrP: cute.Tensor,
                    tSrPSF: cute.Tensor,
                    ):
-        tSrP_f32_frag = cute.logical_divide(tSrP_f32, cute.make_layout(self.sf_vec_size))
+        tSrP_f32_frag = cute.logical_divide(tSrP_f32, cute.make_layout(self.sf_vec_size_pv))
         assert cute.size(tSrP_f32_frag, mode=[1]) == cute.size(tSrPSF_f32)
-        tSrP_frag = cute.logical_divide(tSrP, cute.make_layout(self.sf_vec_size))
+        tSrP_frag = cute.logical_divide(tSrP, cute.make_layout(self.sf_vec_size_pv))
         tSrPSF_u32_view = cute.recast_tensor(tSrPSF, cute.Int32)
 
         # Process in groups of 4 for UE4M3 conversion
@@ -3050,11 +3077,11 @@ class FlashAttentionForwardSm100:
         Peak live regs: 16 (group) + 1 (max) + 2 (packed) vs ~150 in the split path.
         """
         inv6 = Float32(1.0 / 6.0)
-        acc_S_frag = cute.logical_divide(tSrP_f32, cute.make_layout(self.sf_vec_size))
+        acc_S_frag = cute.logical_divide(tSrP_f32, cute.make_layout(self.sf_vec_size_pv))
         num_groups = cute.size(acc_S_frag, mode=[1])
-        tSrP_frag = cute.logical_divide(tSrP, cute.make_layout(self.sf_vec_size))
+        tSrP_frag = cute.logical_divide(tSrP, cute.make_layout(self.sf_vec_size_pv))
         tSrPSF_f32 = cute.make_rmem_tensor(cute.make_layout(num_groups), Float32)
-        tSrPSF = cute.make_rmem_tensor(tSrPSF_f32.layout, self.sf_dtype)
+        tSrPSF = cute.make_rmem_tensor(tSrPSF_f32.layout, self.sf_dtype_pv)
 
         for g in cutlass.range_constexpr(num_groups):
             # 1. Group max (reduction over sf_vec_size elements)
@@ -3063,7 +3090,7 @@ class FlashAttentionForwardSm100:
 
             # 2. Scale by 1/gmax
             inv_gmax = Float32(1.0) / cute.arch.fmax(gmax, 1e-20)
-            for j in cutlass.range(0, self.sf_vec_size, 2, unroll_full=True):
+            for j in cutlass.range(0, self.sf_vec_size_pv, 2, unroll_full=True):
                 acc_S_frag[j, g], acc_S_frag[j + 1, g] = utils.fma_packed_f32x2(
                     (acc_S_frag[j, g], acc_S_frag[j + 1, g]),
                     (inv_gmax, inv_gmax),
@@ -3126,12 +3153,14 @@ class FlashAttentionForwardSm100:
         sum exp2(s_i) up to FP32 rounding (summation order differs, so output
         is accuracy-equivalent but not bitwise vs baseline).
         """
-        LOG2_6 = math.log2(6.0)
-        acc_S_frag = cute.logical_divide(tSrS, cute.make_layout(self.sf_vec_size))
+        is_e8m0_sf = const_expr(self.sf_dtype_pv == Float8E8M0FNU)
+        # P range targets the quantized dtype's max (E2M1: 6, E4M3: 448).
+        LOG2_PMAX = math.log2(6.0) if const_expr(self.v_dtype.width == 4) else math.log2(448.0)
+        acc_S_frag = cute.logical_divide(tSrS, cute.make_layout(self.sf_vec_size_pv))
         num_groups = cute.size(acc_S_frag, mode=[1])
-        tSrP_frag = cute.logical_divide(tSrP, cute.make_layout(self.sf_vec_size))
+        tSrP_frag = cute.logical_divide(tSrP, cute.make_layout(self.sf_vec_size_pv))
         tSrPSF_f32 = cute.make_rmem_tensor(cute.make_layout(num_groups), Float32)
-        tSrPSF = cute.make_rmem_tensor(tSrPSF_f32.layout, self.sf_dtype)
+        tSrPSF = cute.make_rmem_tensor(tSrPSF_f32.layout, self.sf_dtype_pv)
 
         if const_expr(hw_group_maxes is not None):
             assert cute.size(hw_group_maxes) == num_groups, (
@@ -3148,38 +3177,52 @@ class FlashAttentionForwardSm100:
                 m = hw_group_maxes[g] * softmax.scale_log2 + hw_bias
             else:
                 m = softmax._compute_row_max(acc_S_frag[None, g].load())
-            bias = cute.arch.fmax(m, Float32(-100.0)) - LOG2_6
+            bias = cute.arch.fmax(m, Float32(-100.0)) - LOG2_PMAX
+            if const_expr(is_e8m0_sf):
+                # E8M0 SF is exponent-only: round the log-domain bias UP to an
+                # integer so P stays <= the dtype max. SF = 2^ceil(bias).
+                bias = sm100_utils.ceil_f32(bias)
 
             # exp2 with the group scale folded into the argument
-            for j in cutlass.range(0, self.sf_vec_size, 2, unroll_full=True):
+            for j in cutlass.range(0, self.sf_vec_size_pv, 2, unroll_full=True):
                 acc_S_frag[j, g], acc_S_frag[j + 1, g] = utils.fma_packed_f32x2(
                     (acc_S_frag[j, g], acc_S_frag[j + 1, g]),
                     (Float32(1.0), Float32(1.0)),
                     (-bias, -bias),
                 )
-            for j in cutlass.range_constexpr(0, self.sf_vec_size, 2):
+            for j in cutlass.range_constexpr(0, self.sf_vec_size_pv, 2):
                 acc_S_frag[j, g] = cute.arch.exp2(acc_S_frag[j, g])
                 acc_S_frag[j + 1, g] = cute.arch.exp2(acc_S_frag[j + 1, g])
 
             sf = cute.arch.exp2(bias)
             tSrPSF_f32[g] = sf
             # Reconstruct this group's contribution to row_sum from the
-            # scaled values (P in (0, 6]) weighted back by SF.
+            # scaled values weighted back by SF.
             row_sum_acc += sf * softmax._compute_row_sum(acc_S_frag[None, g].load())
 
-            # Quantize this group to E2M1
+            # Quantize this group to the P dtype
             tSrP_u32_view = cute.recast_tensor(tSrP_frag[None, g], cute.Int32)
-            for k in cutlass.range_constexpr(0, cute.size(tSrP_u32_view, mode=[0])):
-                tSrP_u32_view[k] = packed_float_to_e2m1(
-                    acc_S_frag[k * 8, g],
-                    acc_S_frag[k * 8 + 1, g],
-                    acc_S_frag[k * 8 + 2, g],
-                    acc_S_frag[k * 8 + 3, g],
-                    acc_S_frag[k * 8 + 4, g],
-                    acc_S_frag[k * 8 + 5, g],
-                    acc_S_frag[k * 8 + 6, g],
-                    acc_S_frag[k * 8 + 7, g],
-                )
+            if const_expr(self.v_dtype.width == 4):
+                for k in cutlass.range_constexpr(0, cute.size(tSrP_u32_view, mode=[0])):
+                    tSrP_u32_view[k] = packed_float_to_e2m1(
+                        acc_S_frag[k * 8, g],
+                        acc_S_frag[k * 8 + 1, g],
+                        acc_S_frag[k * 8 + 2, g],
+                        acc_S_frag[k * 8 + 3, g],
+                        acc_S_frag[k * 8 + 4, g],
+                        acc_S_frag[k * 8 + 5, g],
+                        acc_S_frag[k * 8 + 6, g],
+                        acc_S_frag[k * 8 + 7, g],
+                    )
+            else:
+                # MXFP8: E4M3 elements, 4 per u32
+                for k in cutlass.range_constexpr(0, cute.size(tSrP_u32_view, mode=[0])):
+                    tSrP_u32_view[k] = packed_float_to_ue4m3(
+                        acc_S_frag[k * 4, g],
+                        acc_S_frag[k * 4 + 1, g],
+                        acc_S_frag[k * 4 + 2, g],
+                        acc_S_frag[k * 4 + 3, g],
+                    )
 
         # row_sum update with the same rescale semantics as update_row_sum
         if const_expr(is_first):
@@ -3187,15 +3230,23 @@ class FlashAttentionForwardSm100:
         else:
             softmax.row_sum[0] = softmax.row_sum[0] * acc_scale + row_sum_acc
 
-        # Pack SF values to UE4M3
+        # Pack SF values (UE4M3 for NVFP4, UE8M0 for MXFP8)
         tSrPSF_u32_view = cute.recast_tensor(tSrPSF, cute.Int32)
-        for i in cutlass.range_constexpr(0, cute.size(tSrPSF_f32) // 4):
-            tSrPSF_u32_view[i] = packed_float_to_ue4m3(
-                tSrPSF_f32[i * 4],
-                tSrPSF_f32[i * 4 + 1],
-                tSrPSF_f32[i * 4 + 2],
-                tSrPSF_f32[i * 4 + 3],
-            )
+        for i in cutlass.range_constexpr(0, max(1, cute.size(tSrPSF_f32) // 4)):
+            if const_expr(is_e8m0_sf):
+                tSrPSF_u32_view[i] = sm100_utils.packed_float_to_ue8m0(
+                    tSrPSF_f32[i * 4],
+                    tSrPSF_f32[i * 4 + 1],
+                    tSrPSF_f32[i * 4 + 2],
+                    tSrPSF_f32[i * 4 + 3],
+                )
+            else:
+                tSrPSF_u32_view[i] = packed_float_to_ue4m3(
+                    tSrPSF_f32[i * 4],
+                    tSrPSF_f32[i * 4 + 1],
+                    tSrPSF_f32[i * 4 + 2],
+                    tSrPSF_f32[i * 4 + 3],
+                )
 
         return tSrPSF_f32, tSrPSF
 
@@ -3390,11 +3441,11 @@ class FlashAttentionForwardSm100:
         buffer right after its P_full wait.
         """
         inv6 = Float32(1.0 / 6.0)
-        acc_S_frag = cute.logical_divide(tSrP_f32, cute.make_layout(self.sf_vec_size))
+        acc_S_frag = cute.logical_divide(tSrP_f32, cute.make_layout(self.sf_vec_size_pv))
         num_groups = cute.size(acc_S_frag, mode=[1])
-        tSrP_frag = cute.logical_divide(tSrP, cute.make_layout(self.sf_vec_size))
+        tSrP_frag = cute.logical_divide(tSrP, cute.make_layout(self.sf_vec_size_pv))
         tSrPSF_f32 = cute.make_rmem_tensor(cute.make_layout(num_groups), Float32)
-        tSrPSF = cute.make_rmem_tensor(tSrPSF_f32.layout, self.sf_dtype)
+        tSrPSF = cute.make_rmem_tensor(tSrPSF_f32.layout, self.sf_dtype_pv)
 
         total = cute.size(tStP_r2t.shape[2])
         assert num_groups % total == 0, "store chunks must evenly divide SF groups"
@@ -3408,7 +3459,7 @@ class FlashAttentionForwardSm100:
 
                 # 2. Scale by 1/gmax
                 inv_gmax = Float32(1.0) / cute.arch.fmax(gmax, 1e-20)
-                for j in cutlass.range(0, self.sf_vec_size, 2, unroll_full=True):
+                for j in cutlass.range(0, self.sf_vec_size_pv, 2, unroll_full=True):
                     acc_S_frag[j, g], acc_S_frag[j + 1, g] = utils.fma_packed_f32x2(
                         (acc_S_frag[j, g], acc_S_frag[j + 1, g]),
                         (inv_gmax, inv_gmax),
@@ -3446,7 +3497,7 @@ class FlashAttentionForwardSm100:
         lane_id = thread_idx % 32
         warp_id = thread_idx // 32
         base_offset = lane_id * 16 + (warp_id % 4) * 4
-        k_groups_per_row = const_expr(self.mma_tiler_pv[2] // self.sf_vec_size)
+        k_groups_per_row = const_expr(self.mma_tiler_pv[2] // self.sf_vec_size_pv)
         k_inner = const_expr(min(k_groups_per_row, 4))
         k_outer = const_expr(k_groups_per_row // k_inner)
         sfp_thread_layout = cute.make_layout((k_inner, k_outer), stride=(1, 512))
@@ -3537,9 +3588,11 @@ class FlashAttentionForwardSm100:
         tSrS_t2r = cute.make_fragment(thr_tmem_load.partition_D(tScS).shape, self.qk_acc_dtype)
         hw_tile_maxes = None
         if const_expr(use_ldred):
-            if const_expr(self.quant_pv and self.sf_vec_size == 32 and self.fp4_pv_log2_quant):
+            if const_expr(self.quant_pv and self.sf_vec_size_pv == 32 and self.fp4_pv_log2_quant):
+                # One x32 tile per ld.red instruction (tiles = total / atom).
+                _n_ldred_tiles = cute.size(tStS_t2r.shape) // cute.size(tStS_t2r.shape[0])
                 hw_tile_maxes = cute.make_rmem_tensor(
-                    cute.make_layout(cute.size(tStS_t2r.shape[2])), Float32
+                    cute.make_layout(_n_ldred_tiles), Float32
                 )
             hw_max = sm100_utils.tmem_ld_red_max(tStS_t2r, tSrS_t2r, hw_tile_maxes)
         else:
@@ -3665,7 +3718,7 @@ class FlashAttentionForwardSm100:
                 # PV is (M=128, N=head_dim_v, K=n_block_size). SFP scales the
                 # P (=A) operand along the K dim, so per-row SF count is
                 # n_block_size // sf_vec_size.
-                k_groups_per_row = const_expr(self.mma_tiler_pv[2] // self.sf_vec_size)
+                k_groups_per_row = const_expr(self.mma_tiler_pv[2] // self.sf_vec_size_pv)
                 k_inner = const_expr(min(k_groups_per_row, 4))
                 k_outer = const_expr(k_groups_per_row // k_inner)
                 # cute.cosize of one atom = 512 bytes for both sf_vec sizes.

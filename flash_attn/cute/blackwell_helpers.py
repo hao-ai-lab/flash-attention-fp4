@@ -1788,3 +1788,47 @@ def tmem_ld_red_max(
             tile_maxes[k] = tile_max
         row_max = tile_max if cutlass.const_expr(k == 0) else cute.arch.fmax(row_max, tile_max)
     return row_max
+
+
+@dsl_user_op
+def ceil_f32(a: Float32, *, loc=None, ip=None) -> Float32:
+    """Round up to an integer-valued float (cvt.rpi.f32.f32)."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Float32(a).ir_value(loc=loc, ip=ip)],
+            "cvt.rpi.f32.f32 $0, $1;",
+            "=f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def packed_float_to_ue8m0(
+    f0: Float32, f1: Float32, f2: Float32, f3: Float32, *, loc=None, ip=None
+) -> Int32:
+    """Convert 4 FP32 values (exact powers of two) to UE8M0 packed in uint32."""
+    out_uint32 = llvm.inline_asm(
+        T.i32(),
+        [
+            Float32(f0).ir_value(loc=loc, ip=ip),
+            Float32(f1).ir_value(loc=loc, ip=ip),
+            Float32(f2).ir_value(loc=loc, ip=ip),
+            Float32(f3).ir_value(loc=loc, ip=ip),
+        ],
+        "{\n\t"
+        ".reg .b16 lo;\n\t"
+        ".reg .b16 hi;\n\t"
+        "cvt.rz.satfinite.ue8m0x2.f32   lo, $2, $1;\n\t"
+        "cvt.rz.satfinite.ue8m0x2.f32   hi, $4, $3;\n\t"
+        "mov.b32 $0, {lo, hi};\n\t"
+        "}\n",
+        "=r,f,f,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return Int32(out_uint32)

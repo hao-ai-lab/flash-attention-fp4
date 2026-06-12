@@ -248,7 +248,17 @@ def _flash_attn_fwd(
     # Handle CUTE tensors - use them directly, no conversion needed
     # Only make contiguous if they are torch tensors
     if not isinstance(q, cute.Tensor):
-        q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
+        q, k = [maybe_contiguous(t) for t in (q, k)]
+        # Block-scaled MXFP8 V is intentionally K-major (seqlen contiguous);
+        # don't flatten it back to headdim-contiguous.
+        v_is_kmajor_mxfp8 = (
+            mSFV is not None
+            and hasattr(v, "dtype")
+            and v.dtype == getattr(torch, "float8_e4m3fn", None)
+            and v.stride(1) == 1
+        )
+        if not v_is_kmajor_mxfp8:
+            v = maybe_contiguous(v)
     num_head, head_dim = q.shape[-2:]
     # For FP4 packed dtypes (float4_e2m1fn_x2), the last dim is headdim/2.
     # For int8 FP4 buffers (from cute_tensor_like), shape already has full headdim — no correction needed.
@@ -755,7 +765,14 @@ def _flash_attn_fwd(
             from cutlass.cute.runtime import make_ptr
             v_tensor = make_ptr(cutlass.Float4E2M1FN, 0, cute.AddressSpace.gmem, assumed_align=16)
         else:
-            v_tensor = to_cute_tensor(v)
+            # MXFP8 PV passes V K-major (seqlen contiguous, dim 1); everything
+            # else is headdim-contiguous.
+            _v_kmajor = (
+                mSFV is not None
+                and hasattr(v, "dtype")
+                and v.dtype == getattr(torch, "float8_e4m3fn", None)
+            )
+            v_tensor = to_cute_tensor(v, leading_dim=1 if _v_kmajor else -1)
         o_tensor = to_cute_tensor(out if not is_split_kv else out_partial)
         # Pass through scale factor tensors when using the SM100 block-scaled kernel.
         mSFQ_tensor = mSFK_tensor = mSFV_tensor = None
@@ -825,6 +842,16 @@ def _flash_attn_fwd(
                         f"Invalid dtype combination: ab_dtype={ab_dtype}, "
                         f"sf_dtype={sf_dtype}, sf_vec_size={sf_vec_size}"
                     )
+                # MXFP8 PV: NVFP4 QK with E4M3 V + SFV present -> P/V use
+                # sf_vec 32 with E8M0 scale factors.
+                _mxfp8_pv = (
+                    mSFV is not None
+                    and sf_vec_size == 16
+                    and (
+                        (isinstance(v, cute.Tensor) and v.element_type == cutlass.Float8E4M3FN)
+                        or (hasattr(v, "dtype") and v.dtype == getattr(torch, "float8_e4m3fn", None))
+                    )
+                )
                 fa_fwd = FlashAttentionForwardSm100FP4(
                     head_dim,
                     head_dim_v,
@@ -848,6 +875,8 @@ def _flash_attn_fwd(
                         or seqused_q is not None,
                     sf_dtype=sf_dtype,
                     sf_vec_size=sf_vec_size,
+                    sf_dtype_pv=cutlass.Float8E8M0FNU if _mxfp8_pv else None,
+                    sf_vec_size_pv=32 if _mxfp8_pv else None,
                 )
             else:
                 import os as _os
