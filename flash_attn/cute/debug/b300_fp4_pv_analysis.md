@@ -7,16 +7,17 @@
 
 B300 (SM 10.3) doubles MUFU.EX2 throughput (32 ops/clk/SM vs 16 on SM100),
 so exp2 is no longer the softmax co-bottleneck; the P conversion/quantization
-stream is. Two optimizations shipped (both default-on, see below):
+stream is. Three optimizations shipped (all default-on, see below):
+ld.red fused S-load+row-max, log-domain FP4 quant, and the 3/4 FP8 P-split.
 
-| PV mode (s=32768, h=24, d=128) | before | after | gain |
+| PV mode (s=32768, h=24, d=128) | session start | after | gain |
 |--------------------------------|--------|-------|------|
-| NVFP4 QK + BF16 PV             | 2069-2142 | same | — |
-| NVFP4 QK + FP8 PV              | 1909   | **2306-2369** | +21-24% |
-| NVFP4 QK + FP4 PV              | 1388   | **1595** | +15% |
+| NVFP4 QK + BF16 PV             | 2069-2142 | **2215-2246** | +4% |
+| NVFP4 QK + FP8 PV              | 1909   | **2549-2633** | +33-38% |
+| NVFP4 QK + FP4 PV              | 1388   | **1708-1718** | +23-24% |
 
-FP8 PV now beats BF16 PV on B300 (it previously lost), restoring the
-B200-style ordering. Full TFLOPS table at the end of this doc.
+FP8 PV now clearly beats BF16 PV on B300 (it previously lost), restoring
+the B200-style ordering. Full TFLOPS table at the end of this doc.
 
 Per-mode bottlenecks (measured, see trace section):
 - **BF16 PV**: MMA-bound (BF16 PV GEMM is the slow side).
@@ -208,7 +209,29 @@ they generate. The log-domain quantization (below) removes items 4's
 divisions and scaling pass entirely, taking FP4 PV from 1388 to 1595 TF;
 items 3, 5, 6 remain the floor.
 
-## Two Optimizations That Worked (June 11, default-on)
+## Optimizations That Worked (June 11-12, default-on)
+
+### 0. SM103 tcgen05.ld.red: fused S load + row max (+4-12%, all modes)
+
+`tcgen05.ld.red.sync.aligned.32x32b.x32.f32.max` (SM103-only) returns each
+x32 TMEM load's 32 values plus their max in a 33rd register, computed in
+the TMEM controller — row max becomes 3 `fmax` over tile maxes instead of
+a ~127-op `fmax_reduce` tree (`tmem_ld_red_max` in blackwell_helpers.py,
+ported from LopezCastroRoberto/flash-attention `perf/ld.red-upstream`;
+`update_row_max_precomputed` in softmax.py; default on via
+`FA4_LDRED_ROWMAX`). The hardware max is only used where masking is a
+compile-time no-op (the unmasked main loop); masked iterations
+(seqlen boundary, causal, mask_mod) and score_mod fall back to the
+software reduce over post-mask values. Outputs are bitwise identical
+(max is exact). Measured at s=32768 h=24 d=128:
+BF16 PV 2127→2215 (+4%), FP8 PV 2342→2633 (+12%), FP4 PV 1595→1718 (+8%).
+
+Bonus, pre-plumbed: for sf_vec_size=32 (MXFP8 P, group size 32) each x32
+tile max IS the scale-factor group max — `_fused_log2_group_quant` already
+accepts `hw_group_maxes` and converts the raw-S tile maxes with one FMA
+per group (`m'_g = m_raw_g*scale_log2 + (max_offset - row_max*scale_log2)`),
+eliminating the whole FMNMX group reduce. This activates once MXFP8 PV
+lands (below).
 
 ### 1. FP4 PV: log-domain group quantization (+15%)
 
@@ -243,6 +266,27 @@ K-tile count and crashes. FP4 is insensitive to the split (its PV GEMM is
 too cheap for handoff latency to bind; tested 1/2, 3/4, 7/8 with store rep
 8/4/2 via `FA4_FP4_PV_P_SPLIT_NUM/DEN`, `FA4_FP4_PV_TMEM_STORE_REP` —
 all ~1595 TF).
+
+### Next: MXFP8 PV (designed, not yet implemented)
+
+Goal: NVFP4 QK + MXFP8 P/V (P→E4M3 with E8M0 SF per 32 elements). Needs:
+1. **Per-GEMM sf params**: the kernel has a single `self.sf_vec_size` /
+   `self.sf_dtype` used by ~45 sites; split into `_qk` (16, E4M3) and
+   `_pv` (32, E8M0) — sfq/sfk layouts and tiled_mma_qk keep qk values;
+   sfp/sfv layouts, tiled_mma_pv, the quant helpers, and the SFP R2S
+   geometry (already handles both group sizes) take pv values. Also drop
+   the `q_dtype == v_dtype` assert for quant_pv.
+2. **MXFP8 P quant path**: pack with `packed_float_to_ue4m3` (exists),
+   `max_offset = log2(448)` (E4M3 max), and E8M0 SF encoding — natural in
+   the log-domain quant since E8M0 is exponent-only: round the log-domain
+   bias to an integer (`SF = 2^ceil(bias)`) instead of exp2-ing it.
+3. **Free group maxes**: sf_vec=32 matches the ld.red x32 tile width — the
+   `hw_group_maxes` hook is already plumbed into `_fused_log2_group_quant`
+   (one FMA per group), so MXFP8 P quant runs with ZERO group-max
+   reduction instructions once enabled.
+4. **Bench-side**: K-major MXFP8 V tensor creation + E8M0 SFV
+   (`--qk_mode mxfp8 --pv_mode fp4` is currently blocked only in the
+   benchmark's tensor creation).
 
 ## Overlap Investigation: F2FP/quant vs Other Hardware Units (measured)
 
@@ -342,26 +386,28 @@ python3 flash_attn/cute/debug/visualize_pipeline.py
 
 ## Results — PV Quantization (GB300)
 
-NVFP4 QK attention with BF16, FP8 or NVFP4 PV (triton `do_bench`, GB300,
-2026-06-12, log-domain FP4 quant + 3/4 FP8 P-split defaults):
+All block-scaled QK x PV combinations (triton `do_bench`, GB300,
+2026-06-12 — includes the ld.red row-max, log-domain FP4 quant and
+3/4 FP8 P-split defaults):
 
-| Config | NVFP4+BF16 | NVFP4+FP8 | NVFP4+FP4 | BF16 ref |
-|--------|-----------|----------|----------|---------|
-| b=1 s=256 h=16 d=128 | 13 | 14 | 10 | **16** |
-| b=1 s=1024 h=16 d=128 | 205 | 230 | 168 | **279** |
-| b=4 s=4096 h=16 d=128 | 2130 | **2215** | 1428 | 1514 |
-| b=1 s=32768 h=16 d=128 | 2082 | **2182** | 1473 | 1651 |
-| b=4 s=4096 h=32 d=128 | 1770 | **1934** | 1274 | 1530 |
-| b=1 s=4096 h=12 d=128 | 1088 | **1152** | 768 | 984 |
-| b=1 s=32768 h=12 d=128 ¹ | 2087 | **2271** | 1506 | 1624 |
-| b=1 s=4096 h=24 d=128 | **1454** | 1356 | 1006 | 1303 |
-| b=1 s=32768 h=24 d=128 | 2041 | **2306** | 1596 | 1586 |
-| b=1 s=32768 h=24 d=64 | **1260** | 1114 | — | 1200 |
+| Config | NVFP4+BF16 | NVFP4+FP8 | NVFP4+FP4 | MXFP8+BF16 | MXFP8+FP8 | BF16 ref |
+|--------|----|----|----|----|----|----|
+| b=1 s=256 h=16 d=128 | 11 | 12 | 9 | 9 | 10 | **15** |
+| b=1 s=1024 h=16 d=128 | 181 | 192 | 166 | 159 | 195 | **259** |
+| b=4 s=4096 h=16 d=128 | 2218 | **2507** | 1525 | 1864 | 2291 | 1508 |
+| b=1 s=32768 h=16 d=128 | 2237 | **2430** | 1634 | 1957 | 2324 | 1675 |
+| b=4 s=4096 h=32 d=128 | 2103 | **2188** | 1320 | 1788 | 1887 | 1525 |
+| b=1 s=4096 h=12 d=128 | 1184 | **1279** | 799 | 1066 | 1130 | 984 |
+| b=1 s=32768 h=12 d=128 ¹ | 2277 | **2502** | 1636 | 2042 | 2344 | 1654 |
+| b=1 s=4096 h=24 d=128 | **1651** | 1544 | 1047 | 1352 | 1644 | 1291 |
+| b=1 s=32768 h=24 d=128 | 2246 | **2549** | 1708 | 1972 | 2338 | 1566 |
+| b=1 s=32768 h=24 d=64 | **1209** | 1205 | — | — | — | 1175 |
 
-All values in TFLOPS. Peak: **NVFP4+FP8 2306 TF**, **NVFP4+BF16 2130 TF**,
-**NVFP4+FP4 1596 TF**. **—** = unsupported (FP4 PV requires headdim ≥
-sf_vec_size × 4 = 128 from the block-scaled MMA atom K constraint). Small
-shapes (s ≤ 1024) are launch-latency dominated. The FP8 P-split gain grows
-with seqlen; at s=4096 h=24 BF16 PV still edges FP8 PV.
+All values in TFLOPS. Peak: **NVFP4+FP8 2549 TF**, **MXFP8+FP8 2344 TF**,
+**NVFP4+BF16 2277 TF**, **NVFP4+FP4 1708 TF**. **—** = unsupported
+(d=64 needs head_dim >= sf_vec_size x 4: FP4 PV and MXFP8 require 128).
+Small shapes (s <= 1024) are launch-latency dominated. MXFP8 columns are
+MXFP8 QK (sf_vec 32, E8M0) with BF16/plain-FP8 PV; MXFP8 PV is designed
+but not yet implemented (see the MXFP8 PV section).
 
-¹ Matches [Wan2.1-T2V-1.3B](https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B-Diffusers) inference (480×832 video, 81 frames → latent seqlen 32760, nheads=12, headdim=128).
+¹ Matches [Wan2.1-T2V-1.3B](https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B-Diffusers) inference (480x832 video, 81 frames -> latent seqlen 32760, nheads=12, headdim=128).
