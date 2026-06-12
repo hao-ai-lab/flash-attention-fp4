@@ -46,6 +46,49 @@ conversion. MMA throughput is unchanged vs SM100. For reference, FA4 paper
 Table 1 (B200, M=N=d=128 per tile): BF16 MMA 1024 cy, FP4 MMA 256 cy,
 SMEM 768 cy, Exp 1024 cy — i.e. exp2 WAS an MMA co-bottleneck on B200.
 
+### Pipeline Cycle Model (steady state, per iteration)
+
+MMA warp processes `q_stage=2` tiles per KV block:
+```
+Per KV block: PV[0] + PV[1] + QK[0] + QK[1]
+```
+
+Each softmax WG handles one stage, ping-pong between WG0 (stage 0) and WG1 (stage 1):
+```
+Wait S → Load S → row_max → exp2 → row_sum → P pack/quant → Write P → Signal P_full
+```
+
+Softmax cycle counts below use the measured throughputs with a 2x contention
+factor because in steady state the two softmax WGs overlap on the same SM and
+share the vector pipes. Per softmax step each WG executes 16384 ex2 and 8192
+packed-cvt thread-instructions (128×128 tile, 2 elements per cvt). This
+models the PRE-optimization baseline (the log-domain quant removes part of
+the FP4 P-quant row; the 3/4 split does not change per-step work):
+
+| Component                  | BF16 PV | FP8 PV  | FP4 PV  |
+|----------------------------|---------|---------|---------|
+| **MMA warp per KV block**    |         |         |         |
+| QK GEMM (FP4, ×2 stages)  | 512     | 512     | 512     |
+| PV GEMM (×2 stages)       | 2048    | 1024    | 512     |
+| Total MMA per block        | 2560    | 1536    | 1024    |
+| **Softmax WG per stage**   |         |         |         |
+| TMEM load + row_max        | 150     | 150     | 150     |
+| exp2 (16384 / (32/2))     | 1024    | 1024    | 1024    |
+| row_sum                    | 100     | 100     | 100     |
+| P pack/quant               | 256     | 512     | 1500    |
+| TMEM store + signal        | 60      | 60      | 60      |
+| Total softmax per stage    | 1590    | 1846    | 2834    |
+| **Bottleneck**             | MMA     | softmax | softmax |
+
+P pack: BF16 = 8192/(62/2) ≈ 256; FP8 = 8192/(32/2) = 512; FP4 quant is
+dominated by group_max + scale + register shuffling (+914 PTX instructions),
+not the E2M1 cvt itself (57/clk measured).
+
+The MMA warp must complete the full PV+QK cycle before the softmax results
+from the same stage are needed again. With ping-pong, each softmax WG has
+the entire MMA block cycle to complete its work. When softmax takes longer
+than the MMA cycle, the MMA warp stalls waiting for P_full.
+
 ## Real In-Kernel Trace
 
 Flashinfer-style timestamp instrumentation (`flash_attn/cute/profiler.py`),
@@ -75,6 +118,29 @@ h=24 d=128, 96 softmax iterations/WG):
 | MMA QK+PV GEMM (one stage)  | 732     | 639    | 622    |
 | MMA wait-P (per PV)          | 933     | 595    | 1,171  |
 
+Measured means per event (detailed mode — relative proportions only, see
+artifact warning above; pre-optimization baseline, block 0, b=1 s=4096
+h=24 d=128, 96 softmax iterations per WG):
+
+| Event (mean cycles)        | BF16 PV | FP8 PV  | FP4 PV  |
+|----------------------------|---------|---------|---------|
+| **MMA warp**                 |         |         |         |
+| wait P (stall)             | 841 (33%)| 950 (38%)| 1306 (42%)|
+| PV GEMM issue              | 560     | 405     | 549     |
+| QK GEMM issue              | 262     | 267     | 246     |
+| wait KV (TMA)              | 95      | 120     | 105     |
+| **Softmax WG (per iter)**  |         |         |         |
+| S load + row_max           | 697     | 821     | 666     |
+| exp2 (+fused pack)         | 1581    | 1674    | 1579    |
+| P quant / pack             | 75      | 325     | 1283    |
+| P store + signal           | 380     | 230     | 177     |
+| wait S                     | 581     | 759     | 594     |
+| wait corr                  | 867     | 173     | 1013    |
+
+(FP8's visible quant span is only ~325 cy because most of the F2FP work
+interleaves into the exp2 span; FP4's ~1283-cy quant sat on top of the same
+exp2 cost, which is what the log-domain quant attacked.)
+
 Key trace facts:
 - GEMM *issue* spans are short (~250-650 cy) — tcgen05 MMAs execute
   asynchronously; the MMA warp's real exposure is its waits.
@@ -86,23 +152,61 @@ Key trace facts:
 - FP4 PV (pre-log2-quant) spent ~1,250 cy/step on quantization on top of
   ~1,600 cy of exp — the MMA warp stalled 42% of its time waiting for P.
 
-## PTX Instruction Census (baseline kernels, e2e=OFF, SM103)
+## PTX Instruction Analysis
 
-| Category              | BF16 PV | FP8 PV  | FP4 PV (pre-log2) |
-|-----------------------|---------|---------|---------|
-| **Total instructions**| 5089    | 5089    | 6003    |
-| ex2.approx (MUFU)    | 257     | 257     | 257     |
-| cvt.rn.bf16x2.f32     | 128     | —       | —       |
-| cvt.e4m3x2 (F2FP)    | —       | 128     | 8 (SF)  |
-| cvt.e2m1x2            | —       | —       | 128     |
-| max.f32               | 132     | 132     | 308     |
-| fma/mul/add .f32x2    | 511     | 511     | 639     |
-| mov (data movement)   | 2277    | 2277    | 2703    |
+Static instruction counts from PTX (pre-optimization baseline kernels,
+e2e=OFF, SM103 target, full kernel):
 
-BF16 PV and FP8 PV differ ONLY in the 128 P-cast cvts — the perf gap is
-pure hardware cvt throughput (table above). FP4 PV's +914 instructions are
-the group quant: +176 max (group_max), +128 fma (scale; removed by
-log-domain quant), +128 e2m1 cvt, +426 mov (group register traffic).
+| Category              | BF16 PV | FP8 PV  | FP4 PV  | FP4 delta |
+|-----------------------|---------|---------|---------|-----------|
+| **Total instructions**| 5089    | 5089    | 6003    | +914 (18%)|
+| ex2.approx (MUFU)    | 257     | 257     | 257     | 0         |
+| fma.rn.f32x2          | 128     | 128     | 256     | +128      |
+| mul.rn.f32x2          | 256     | 256     | 256     | 0         |
+| add.rn.f32x2          | 127     | 127     | 127     | 0         |
+| max.f32               | 132     | 132     | 308     | +176      |
+| cvt (total)           | 266     | 266     | 276     | +10       |
+| cvt.rn.bf16x2.f32     | 128     | 128     | 128     | 0         |
+| cvt.e4m3x2 (F2FP)    | 0       | 128     | 8       | +8 (SF)   |
+| cvt.e2m1x2            | 0       | 0       | 128     | +128      |
+| selp                  | 160     | 160     | 157     | –3        |
+| tcgen05 (MMA/TMEM)   | 107     | 107     | 119     | +12       |
+| mbarrier              | 107     | 107     | 125     | +18       |
+| mov (data movement)   | 2277    | 2277    | 2703    | +426      |
+| INT ALU               | 1086    | 1086    | 1238    | +152      |
+
+**FP8 PV vs BF16 PV**: Identical instruction count (5089). The only
+difference is 128 `cvt.rn.bf16x2.f32` (BF16 P pack) replaced by 128
+`cvt.rn.satfinite.e4m3x2.f32` (FP8 P pack / F2FP) — the perf gap is pure
+hardware cvt throughput (table above).
+
+**FP4 PV extra instructions** (+914, all in softmax WG, pre-log2-quant):
+- +128 fma.f32x2: scale computation in `_fused_group_max_scale_quant`
+  (removed by the log-domain quant)
+- +176 max.f32: group_max reduction (16-element groups × 8 groups)
+- +128 cvt.e2m1x2: E2M1 packing
+- +426 mov: register shuffling for group processing
+- +18 mbarrier: extra sync for SFP SMEM copy
+
+## Why FP4 PV is Slower than BF16 Reference
+
+The softmax WG does significantly more work for FP4 PV (baseline path):
+1. `exp2()` — same MUFU cost as BF16
+2. `update_row_sum()` — same (but moved BEFORE quant so it uses original
+   P values)
+3. **`compute_group_max()`** — per-group (16-element) max reduction → +176 max.f32
+4. **`scale_groupwise()`** — per-element division by group_max → +128 fma.f32x2
+   plus 8 `div.rn.f32` sequences per thread
+5. **`_quant_fp4()` (E2M1 pack)** — 8 floats → 1 uint32 → +128 cvt.e2m1x2 + bit ops
+6. **SF packing + R2S copy** — pack scale factors to UE4M3, copy to SMEM
+
+Items 3–6 added ~1500 cycles per softmax stage vs the 1024-cycle MMA block
+for FP4×FP4 PV GEMM — the MMA warp spent ~42% of its time stalled waiting
+for P. Note the E2M1 cvt itself is fast (57/clk measured); the cost is the
+group_max reduction, per-group scaling/divisions, and the register traffic
+they generate. The log-domain quantization (below) removes items 4's
+divisions and scaling pass entirely, taking FP4 PV from 1388 to 1595 TF;
+items 3, 5, 6 remain the floor.
 
 ## Two Optimizations That Worked (June 11, default-on)
 
@@ -140,41 +244,74 @@ too cheap for handoff latency to bind; tested 1/2, 3/4, 7/8 with store rep
 8/4/2 via `FA4_FP4_PV_P_SPLIT_NUM/DEN`, `FA4_FP4_PV_TMEM_STORE_REP` —
 all ~1595 TF).
 
-## Overlap Investigation: Negative Results (measured)
+## Overlap Investigation: F2FP/quant vs Other Hardware Units (measured)
 
-Attempts to overlap the F2FP/quant stream with other hardware units
-(MUFU, TMEM stores, st.shared) produced **no speedup — the overlap already
-exists in the compiled SASS**:
+We tried to speed up FP8/FP4 PV by overlapping the bottleneck F2FP/quant
+stream with instructions on other units (MUFU, TMEM stores, st.shared).
+Result: **no speedup — the overlap already exists in the compiled SASS.**
 
-1. Source-order knobs (`FA4_FP8_PV_USE_FUSED_PACK`, `FA4_FORCE_E2E`): all
-   variants identical (1909-1910 TF).
-2. Chunk-pipelined exp2/pack/TMEM-store paths
-   (`FA4_FP8_PV_PACK_STORE_PIPELINE`, `FA4_FP4_PV_QUANT_STORE_PIPELINE`,
-   kept env-gated off): bitwise-correct, exact parity at all shapes.
-3. SASS comparison (ptxas -O3): baseline and pipelined compile to
-   equivalently interleaved schedules (FP8: identical MUFU↔F2FP run
-   structure; FP4: the per-group RCP→FMNMX→F2FP pattern already interleaves
-   with the ex2 stream). The whole softmax step is one fully-unrolled
-   branch-free region, so ptxas schedules across all source-level phases.
-4. Materialized-loop control: rebuilding the FP8 exp+pack as a real
-   `cutlass.range` loop (`FA4_FP8_PV_RANGE_UNROLL`) makes the fragment
-   index dynamic → register-resident S/P spill to local memory
-   (240 st.local/208 ld.local vs 0) → **227 TF, 8.4x slower**; with
-   `unroll_full` the unroller restores constant indices and exactly matches
-   baseline. Register residency REQUIRES the unrolled form; `range_constexpr`
-   ≡ fully-unrolled `cutlass.range` (its `unroll=` kwarg is silently
-   discarded by the DSL preprocessor).
+What was tried (all bitwise-validated against baseline outputs):
 
-Conclusion: the residual FP8/FP4 softmax cost is raw issue-slot count on
-the cvt/MUFU/ALU ports, not scheduling — which is what pointed at
-instruction elimination (log-domain quant) and handoff tuning (split)
-instead of reordering.
+1. **Knob sweep** (`FA4_FP8_PV_USE_FUSED_PACK`, `FA4_FORCE_E2E`, combinations):
+   all variants land at 1909-1910 TF on (1, 32768, 24, 128). Source-order
+   interleaving of exp2/F2FP has no effect.
+2. **Chunk-pipelined FP8 path** (`FA4_FP8_PV_PACK_STORE_PIPELINE=1`,
+   `_pack_fp8_store_pipelined`): software-pipelines exp2(chunk c) with
+   F2FP-pack(c-1) and tcgen05.st(c-1) — three data-independent streams on
+   MUFU / cvt / TMEM ports — and fires P_full right after the first
+   `mbar_p_split` chunks. Measured: 1521/1638/1909 TF at s=4096/8192/32768,
+   identical to baseline (1521/1638/1909).
+3. **Chunk-pipelined FP4 path** (`FA4_FP4_PV_QUANT_STORE_PIPELINE=1`,
+   `_fused_group_max_scale_quant_store_pipelined`): issues each P chunk's
+   TMEM store as soon as its groups are quantized. Measured 1389 vs 1387
+   TF baseline — parity.
+
+Why: dumping SASS for baseline vs pipelined (ptxas -O3, sm_103a) shows
+**ptxas already produces an equivalently interleaved schedule for the
+baseline**. FP8: identical MUFU.EX2/F2FP run structure (83 transitions in
+both). FP4: the per-group `MUFU.RCP → FMNMX×10 → F2FP×8` quant pattern is
+already finely interleaved with the MUFU.EX2 stream (160 vs 168 unit-runs).
+The whole softmax step is one fully-unrolled basic block, so ptxas freely
+schedules across the source-level phases, and the hardware scoreboard
+dual-issues across ports where possible (measured mixed ex2+F2FP throughput
+54.6/clk vs 32 each in isolation — already reflected in kernel timing).
+
+**Materialized-loop control (measured)**: to verify that the full unrolling
+(not compiler magic) is what enables the overlap, we rebuilt the FP8
+exp2+pack as a real `cutlass.range` IR loop over fragments
+(`FA4_FP8_PV_RANGE_UNROLL`, `_exp2_pack_fp8_range`). With a live loop
+(unroll=1 or 2), the dynamic fragment index makes the register-resident
+S/P tensors unaddressable, so they spill to local memory (240 st.local +
+208 ld.local in PTX vs 0 baseline): **227 TF, an 8.4x slowdown**. With
+`unroll_full` the IR unroller restores constant indices and the result is
+exactly baseline (1909 TF) — confirming `range_constexpr` ≡ fully-unrolled
+`cutlass.range`, and that register residency requires the unrolled form.
+(Also: the `unroll=` kwarg on `range_constexpr` is silently discarded by
+the DSL preprocessor — it only means something on `cutlass.range`.)
+
+**Instrumentation artifact warning**: with `FA4_PROFILE_PIPELINE=1`, the
+chunk-pipelined FP8 variant looks ~14% faster per CTA than the instrumented
+baseline (MMA wait-P 1055→713 cy). This is an artifact: the profiler's
+side-effecting `%clock` inline asm between the exp/pack/store phases acts
+as a scheduling barrier and prevents ptxas from interleaving the baseline.
+The clean kernels are identical. Do not tune from instrumented runs alone.
+
+The remaining FP8/FP4 PV gap is therefore raw issue-slot count on the
+cvt/MUFU/ALU ports, not scheduling — which pointed at instruction
+ELIMINATION (log-domain quant) and pipeline-handoff tuning (split) instead
+of reordering. Both paid off (previous section).
 
 ## Other Findings
 
-- **e2e exp2 emulation hurts on SM103** (hardware exp2 already fast):
-  BF16 PV 1945→2142 TF with e2e off. Disabled via
-  `_FP4_TUNING_CONFIG_SM103` (`enable_e2e: False`).
+- **e2e exp2 emulation hurts on SM103** (hardware exp2 already fast at
+  32/clk). Disabled by default via `_FP4_TUNING_CONFIG_SM103`
+  (`enable_e2e: False`):
+
+  | Mode    | e2e=ON  | e2e=OFF | Reason                                 |
+  |---------|---------|---------|----------------------------------------|
+  | BF16 PV | 1945 TF | 2142 TF | exp2 already fast; e2e adds FFMA work  |
+  | FP8 PV  | 1851 TF | 1824 TF | F2FP is the bottleneck, not exp2       |
+  | FP4 PV  | 1243 TF | 1340 TF | e2e adds instructions to overloaded WG |
 - **Register allocation is not the bottleneck**: sweeping
   `num_regs_softmax` 168-224 changed nothing for FP4 PV.
 - **Pre-existing FP4 PV nondeterminism**: ~1 in 20 runs of the unmodified
