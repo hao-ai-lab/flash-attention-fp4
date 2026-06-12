@@ -286,9 +286,38 @@ group, zero FMNMX group reduces).
 
 **Accuracy** (vs FP32 sdpa, b=1 s=4096 h=24 d=128, mean_abs): MXFP8 PV
 **0.0029** ≈ BF16 PV 0.0028 < FP4 PV 0.0039 ≈ FP8 PV 0.0040 — the best
-of the quantized-PV modes, at FP4-PV-level speed (see table). It shares
-the unpipelined block-scaled quant+S2T path with FP4 PV; the FP8-PV-style
-pack/store pipelining hasn't been ported to it yet.
+of the quantized-PV modes, at FP4-PV-level speed (see table).
+
+**Why MXFP8 PV (1755 TF) is ~30% slower than FP8 PV (2578 TF)** — PTX
+instruction counts of the fwd kernel (per thread, whole 2-stage softmax
+body; `CUTE_DSL_KEEP_PTX=1`, same NVFP4 QK in all modes):
+
+| instruction | FP8 PV | MXFP8 PV | FP4 PV | what it is |
+|---|---|---|---|---|
+| `ex2.approx` | 257 | 265 | 273 | exp2 (+SF exp2 for quant modes) |
+| `fma.rn.f32x2` | 128 | **256** | 256 | scale: row-wise only vs per-group bias |
+| `max.f32` | 70 | **150** | 246 | sw group-max fallback for masked steps † |
+| `cvt` P pack | 128 e4m3x2 | 128 e4m3x2 | 128 e2m1x2 | same pack count |
+| `cvt.rpi.f32` | 0 | 8 | 0 | E8M0 ceil |
+| `tcgen05.cp` (S2T) | 16 | **24** | 32 | +SFP/SFV smem→tmem copies |
+| `st.shared.v4` | 32 | 32 | 32 | (FP8's are P chunks, quant modes' are SF) |
+| PV MMA ×16 | `f8f6f4` | `mxf8f6f4 1X` | `mxf4nvf4 4X` | block-scaled needs SF tmem reads |
+
+† unmasked main-loop steps use the free hw group maxes (ld.red); the
+software FMNMX reduce remains compiled in for masked iterations.
+
+The P-pack cvt count is identical to FP8 PV — the gap is (a) **+128
+`fma.f32x2` on the FMA pipe** for per-group bias application (FP8 PV folds
+its single row-wise scale into values it already computes), (b) the **SFP
+R2S + S2T round-trip and its barriers** sitting on the softmax→MMA
+critical path, and (c) the **handoff structure**: FP8 PV releases the PV
+MMA after 3/4 of plain P chunks (chunk-pipelined pack/store), while the
+block-scaled path must also stage SFs through smem→tmem before the MMA
+can start — the FP8-style pack/store pipelining hasn't been ported to it
+(`fp4_pv_quant_store_pipeline` is asserted off for MXFP8). Same reasons
+FP4 PV sits at ~1726 (see "Why FP4 PV is Slower than BF16 Reference");
+MXFP8 PV inherits the block-scaled-PV cost structure, paying for accuracy
+with the SF machinery rather than with element width.
 
 ### Found along the way: block-scaled PV read K-tile 0's SFs for every K-tile
 

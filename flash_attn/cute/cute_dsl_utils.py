@@ -252,6 +252,11 @@ def cute_compile_patched(*args, **kwargs):
     if cubin_path is not None:
         cutlass.base_dsl.runtime.cuda.load_cubin_module_data = load_cubin_module_data_og
         if extract is not None:
-            sass = extract(cubin_path, None)
-            pathlib.Path(cubin_path).with_suffix(".annotated.sass").write_text(sass)
+            try:
+                sass = extract(cubin_path, None)
+                pathlib.Path(cubin_path).with_suffix(".annotated.sass").write_text(sass)
+            except Exception as e:
+                # e.g. a bundled cuobjdump that doesn't know a new SM —
+                # keep the cubin (disassemble manually) instead of dying.
+                print(f"CUTE_CUBIN_PATH: SASS extraction failed ({e}); cubin kept at {cubin_path}")
     return output
