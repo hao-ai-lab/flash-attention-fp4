@@ -311,6 +311,12 @@ class FlashAttentionForwardSm100:
         # EXPERIMENT: materialized cutlass.range loop over fragments for the
         # FP8 exp2+pack (0 = off; N = unroll factor; -1 = unroll_full).
         self.fp8_pv_range_unroll = int(os.getenv("FA4_FP8_PV_RANGE_UNROLL", "0"))
+        # Log-domain NVFP4 P quantization: group max on pre-exp scores, the
+        # 1/group_max scale folded into the exp2 argument — removes all
+        # per-group divisions and the post-exp scaling pass. Default ON:
+        # +8-15% FP4 PV on GB300 (1388 -> 1595 TF at s=32768) at identical
+        # measured accuracy vs the FP32 reference.
+        self.fp4_pv_log2_quant = os.getenv("FA4_FP4_PV_LOG2_QUANT", "1") == "1"
         # Pipeline-trace granularity (FA4_PROFILE_PIPELINE=1). Coarse (default)
         # records only at wait/store boundaries that are already side-effect
         # ordered, so the softmax compute stream contains no timestamps and
@@ -1056,10 +1062,16 @@ class FlashAttentionForwardSm100:
         self.mbar_sfpv_load_offset = self.mbar_sfqk_load_offset + self.q_stage
         self.mbar_total = self.mbar_sfpv_load_offset + self.q_stage
         # self.mbar_total = self.mbar_P_full_2_offset + self.q_stage
-        # Pure FP8 PV benefits from releasing P to the PV MMA earlier than the
-        # FP4 quantized path; keep env overrides for additional tuning sweeps.
-        fp8_pv_split_num = int(os.getenv("FA4_FP8_PV_P_SPLIT_NUM", "1"))
-        fp8_pv_split_den = int(os.getenv("FA4_FP8_PV_P_SPLIT_DEN", "2"))
+        # P handoff split: fraction of P store chunks (and matching PV MMA
+        # K-tiles) released at the first P_full signal; the rest go through
+        # P_full_2's embedded wait inside the PV GEMM.
+        # 3/4 measured best for FP8 PV on GB300: 1909 -> 2366 TF at s=32768
+        # (the old 1/2 default came from B200 tuning). BF16 PV already used
+        # 3/4; FP4 PV split is num/den of its store chunks (k//2 when only 2).
+        fp8_pv_split_num = int(os.getenv("FA4_FP8_PV_P_SPLIT_NUM", "3"))
+        fp8_pv_split_den = int(os.getenv("FA4_FP8_PV_P_SPLIT_DEN", "4"))
+        fp4_pv_split_num = int(os.getenv("FA4_FP4_PV_P_SPLIT_NUM", "1"))
+        fp4_pv_split_den = int(os.getenv("FA4_FP4_PV_P_SPLIT_DEN", "2"))
         fp8_pv_small_d = self.head_dim_v_padded <= 64
         self.mbar_p_split = lambda k: (
             max(
@@ -1072,7 +1084,10 @@ class FlashAttentionForwardSm100:
                 ),
             )
             if cutlass.const_expr(self.v_dtype.width == 8 and k > 1) else
-            ((k // 4 * 3) if cutlass.const_expr(self.v_dtype.width > 8) else k // 2)
+            (
+                (k // 4 * 3) if cutlass.const_expr(self.v_dtype.width > 8) else
+                max(1, min(k - 1, k * fp4_pv_split_num // fp4_pv_split_den))
+            )
         )
         sO_size = cute.cosize(sO_layout) if const_expr(not self.overlap_sO_sQ) else 1
         sQ_size = (
@@ -2704,6 +2719,9 @@ class FlashAttentionForwardSm100:
         tStScale_r2t = thr_tmem_store_scale.partition_D(tStScale)
         fp8_pv_store_rep = int(os.getenv("FA4_FP8_PV_TMEM_STORE_REP", "8"))
         fp8_pv_default_store_rep = 4 if self.head_dim_v_padded <= 64 else 8
+        # FP4 PV: smaller rep = more P store chunks = finer-grained P handoff
+        # to the PV MMA (combined with FA4_FP4_PV_P_SPLIT_NUM/DEN).
+        fp4_pv_store_rep = int(os.getenv("FA4_FP4_PV_TMEM_STORE_REP", "8"))
         tmem_store_atom = cute.make_copy_atom(
             tcgen05.copy.St32x32bOp(
                 tcgen05.copy.Repetition(
@@ -2711,7 +2729,7 @@ class FlashAttentionForwardSm100:
                         not self.quant_pv and self.v_dtype.width == 8 and "FA4_FP8_PV_TMEM_STORE_REP" in os.environ
                     ) else
                     fp8_pv_default_store_rep if const_expr(not self.quant_pv and self.v_dtype.width == 8) else
-                    8 if const_expr(self.quant_pv) else
+                    fp4_pv_store_rep if const_expr(self.quant_pv) else
                     16
                 )
             ),
@@ -3052,6 +3070,93 @@ class FlashAttentionForwardSm100:
                 )
 
         # 4. Pack SF values to UE4M3 (separate loop, small tensor)
+        tSrPSF_u32_view = cute.recast_tensor(tSrPSF, cute.Int32)
+        for i in cutlass.range_constexpr(0, cute.size(tSrPSF_f32) // 4):
+            tSrPSF_u32_view[i] = packed_float_to_ue4m3(
+                tSrPSF_f32[i * 4],
+                tSrPSF_f32[i * 4 + 1],
+                tSrPSF_f32[i * 4 + 2],
+                tSrPSF_f32[i * 4 + 3],
+            )
+
+        return tSrPSF_f32, tSrPSF
+
+    @cute.jit
+    def _fused_log2_group_quant(
+        self,
+        softmax: SoftmaxSm100,
+        tSrS: cute.Tensor,   # PRE-exp scaled scores (scale_subtract_rowmax done)
+        tSrP: cute.Tensor,   # fp4 view of the P r2t backing storage
+        acc_scale: Float32,
+        is_first: cutlass.Constexpr[bool],
+    ):
+        """Log-domain NVFP4 P quantization (FA4_FP4_PV_LOG2_QUANT=1).
+
+        Exploits exp2 monotonicity: max(exp2(s)) = exp2(max(s)). The group max
+        is taken on the PRE-exp scores and the 1/group_max scaling folds into
+        the exp2 argument:
+            m_g  = max_{i in g} s_i
+            P_i  = exp2(s_i - m_g + log2 6)   in (0, 6], group max exactly 6.0
+            SF_g = exp2(m_g - log2 6)         (== max(exp2 s)/6, as baseline)
+        vs the baseline exp-all -> group_max -> 1/x divide -> scale pass, this
+        removes all per-group divisions and the post-exp scaling pass, and
+        shortens the per-group dependency chain to max -> subtract -> exp2.
+        row_sum is rebuilt as sum_g SF_g * sum_{i in g} P_i — equal to
+        sum exp2(s_i) up to FP32 rounding (summation order differs, so output
+        is accuracy-equivalent but not bitwise vs baseline).
+        """
+        LOG2_6 = math.log2(6.0)
+        acc_S_frag = cute.logical_divide(tSrS, cute.make_layout(self.sf_vec_size))
+        num_groups = cute.size(acc_S_frag, mode=[1])
+        tSrP_frag = cute.logical_divide(tSrP, cute.make_layout(self.sf_vec_size))
+        tSrPSF_f32 = cute.make_rmem_tensor(cute.make_layout(num_groups), Float32)
+        tSrPSF = cute.make_rmem_tensor(tSrPSF_f32.layout, self.sf_dtype)
+
+        row_sum_acc = Float32(0.0)
+        for g in cutlass.range_constexpr(num_groups):
+            # Group max in log space; clamp so fully-masked groups (all -inf)
+            # don't produce NaN from (-inf) - (-inf) below.
+            m = softmax._compute_row_max(acc_S_frag[None, g].load())
+            bias = cute.arch.fmax(m, Float32(-100.0)) - LOG2_6
+
+            # exp2 with the group scale folded into the argument
+            for j in cutlass.range(0, self.sf_vec_size, 2, unroll_full=True):
+                acc_S_frag[j, g], acc_S_frag[j + 1, g] = utils.fma_packed_f32x2(
+                    (acc_S_frag[j, g], acc_S_frag[j + 1, g]),
+                    (Float32(1.0), Float32(1.0)),
+                    (-bias, -bias),
+                )
+            for j in cutlass.range_constexpr(0, self.sf_vec_size, 2):
+                acc_S_frag[j, g] = cute.arch.exp2(acc_S_frag[j, g])
+                acc_S_frag[j + 1, g] = cute.arch.exp2(acc_S_frag[j + 1, g])
+
+            sf = cute.arch.exp2(bias)
+            tSrPSF_f32[g] = sf
+            # Reconstruct this group's contribution to row_sum from the
+            # scaled values (P in (0, 6]) weighted back by SF.
+            row_sum_acc += sf * softmax._compute_row_sum(acc_S_frag[None, g].load())
+
+            # Quantize this group to E2M1
+            tSrP_u32_view = cute.recast_tensor(tSrP_frag[None, g], cute.Int32)
+            for k in cutlass.range_constexpr(0, cute.size(tSrP_u32_view, mode=[0])):
+                tSrP_u32_view[k] = packed_float_to_e2m1(
+                    acc_S_frag[k * 8, g],
+                    acc_S_frag[k * 8 + 1, g],
+                    acc_S_frag[k * 8 + 2, g],
+                    acc_S_frag[k * 8 + 3, g],
+                    acc_S_frag[k * 8 + 4, g],
+                    acc_S_frag[k * 8 + 5, g],
+                    acc_S_frag[k * 8 + 6, g],
+                    acc_S_frag[k * 8 + 7, g],
+                )
+
+        # row_sum update with the same rescale semantics as update_row_sum
+        if const_expr(is_first):
+            softmax.row_sum[0] = row_sum_acc
+        else:
+            softmax.row_sum[0] = softmax.row_sum[0] * acc_scale + row_sum_acc
+
+        # Pack SF values to UE4M3
         tSrPSF_u32_view = cute.recast_tensor(tSrPSF, cute.Int32)
         for i in cutlass.range_constexpr(0, cute.size(tSrPSF_f32) // 4):
             tSrPSF_u32_view[i] = packed_float_to_ue4m3(
@@ -3451,15 +3556,23 @@ class FlashAttentionForwardSm100:
         if const_expr(self.quant_pv):
             if const_expr(prof is not None and self.prof_detail):
                 prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_SOFTMAX_EXP, fa4_prof.EVENT_BEGIN, prof_pred)
-            # Exp2 with softmax scale and sp1 scaling
-            softmax.apply_exp2_convert(
-                tSrS_t2r,
-                e2e=self.force_e2e,
-                e2e_freq=self.e2e_freq,
-                    e2e_start_frg=self.e2e_start_frg,
+            fp4_log2_active = const_expr(
+                self.fp4_pv_log2_quant
+                and not self.force_e2e
+                and not self.fp4_pv_quant_store_pipeline
             )
-            # update_row_sum BEFORE scale_groupwise so it uses original P values
-            softmax.update_row_sum(tSrS_t2r.load(), acc_scale, is_first)
+            if const_expr(not fp4_log2_active):
+                # Exp2 with softmax scale and sp1 scaling
+                softmax.apply_exp2_convert(
+                    tSrS_t2r,
+                    e2e=self.force_e2e,
+                    e2e_freq=self.e2e_freq,
+                    e2e_start_frg=self.e2e_start_frg,
+                )
+                # update_row_sum BEFORE scale_groupwise so it uses original P values
+                softmax.update_row_sum(tSrS_t2r.load(), acc_scale, is_first)
+            # else: exp2, row_sum and quant are all fused in
+            # _fused_log2_group_quant below.
             if const_expr(prof is not None and self.prof_detail):
                 prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_SOFTMAX_EXP, fa4_prof.EVENT_END, prof_pred)
                 prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_SOFTMAX_QUANT, fa4_prof.EVENT_BEGIN, prof_pred)
@@ -3471,6 +3584,10 @@ class FlashAttentionForwardSm100:
                     thr_tmem_store, sSFP, thr_tmem_load, mbar_ptr, stage,
                 )
                 tSrPSF_f32, tSrPSF = None, None
+            elif const_expr(fp4_log2_active):
+                tSrPSF_f32, tSrPSF = self._fused_log2_group_quant(
+                    softmax, tSrS_t2r, tSrP_r2t, acc_scale, is_first,
+                )
             else:
                 tSrPSF_f32, tSrPSF = self._fused_group_max_scale_quant(
                     softmax, tSrS_t2r, tSrP_r2t,

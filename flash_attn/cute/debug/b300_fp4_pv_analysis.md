@@ -10,17 +10,19 @@
 
 B300 (SM 10.3) doubles MUFU.EX2 throughput (32 ops/clock/SM vs 16 on SM100).
 This makes exp2 no longer the softmax co-bottleneck. The benefit depends on
-the PV mode:
+the PV mode. After the June-11 optimizations (log-domain FP4 quant + P-split
+3/4 for FP8, both default-on; see "Two Optimizations That Worked"):
 
-| PV Mode | B300 TF | vs BF16 ref | B200 TF | B200 vs BF16 ref |
-|---------|---------|-------------|---------|------------------|
-| BF16    | 2142    | 1.37x       | ~1887   | 1.22x            |
-| FP8     | 1824    | 1.17x       | 2018    | 1.31x            |
-| FP4     | 1340    | 0.86x       | ~1310   | ~0.85x           |
-| BF16 ref| 1561    | 1.00x       | 1545    | 1.00x            |
+| PV Mode | B300 TF (s=32768) | before | gain  |
+|---------|-------------------|--------|-------|
+| BF16    | 2069-2142         | same   | —     |
+| FP8     | **2306-2369**     | 1909   | +21-24% |
+| FP4     | **1595**          | 1388   | +15%  |
 
-Shape: b=1, s=4096, h=24, d=128 (BF16 ref uses non-FP4 QK).
-Peak numbers (s=32768): BF16 PV 2142 TF, FP8 PV 1774 TF, FP4 PV 1340 TF.
+FP8 PV now beats BF16 PV on B300 (it previously lost, 1909 vs 2142),
+restoring the B200-style ordering. Earlier baseline numbers
+(b=1 s=4096 h=24 d=128, BF16 ref = non-FP4 QK at 1561 TF / 1.00x):
+BF16 PV 2142 (1.37x), FP8 PV 1824 (1.17x), FP4 PV 1340 (0.86x).
 
 **Key finding**: On B300, exp2 is no longer the bottleneck for any PV mode.
 The new bottlenecks are:
@@ -339,9 +341,50 @@ as a scheduling barrier and prevents ptxas from interleaving the baseline.
 The clean kernels are identical. Do not tune from instrumented runs alone.
 
 The remaining FP8/FP4 PV gap is therefore raw issue-slot count on the
-cvt/MUFU/ALU ports, not scheduling. Real improvement options:
-- Fewer instructions: coarser SF groups (fewer group_max FMNMX), approximate
-  group_max, packed-max if a 2-wide min/max op exists on SM103.
+cvt/MUFU/ALU ports, not scheduling — which pointed at instruction
+ELIMINATION and pipeline-handoff tuning instead of reordering. Both paid
+off (next section).
+
+## Two Optimizations That Worked (June 11, default-on)
+
+### 1. FP4 PV: log-domain group quantization (+15%)
+
+`_fused_log2_group_quant` (`FA4_FP4_PV_LOG2_QUANT=1`, default). The baseline
+quantized P as: exp2 all elements → per group: max → 1/x divide →
+multiply-scale pass → E2M1 cvt. Using exp2 monotonicity
+(`max(exp2 s) = exp2(max s)`), the group max moves to the PRE-exp scores and
+the scale folds into the exp2 argument:
+
+    m_g  = max(s_i)                      (same FMNMX count)
+    P_i  = exp2(s_i - m_g + log2 6)      (subtract replaces the scale pass)
+    SF_g = exp2(m_g - log2 6)            (1 extra ex2; == max(exp2 s)/6)
+
+This deletes all 8 per-group `div.rn.f32` sequences (RCP + Newton FFMAs)
+and the 64-FFMA post-exp scaling pass, and shortens the per-group dependency
+chain from max→rcp→fma→cvt to max→sub→ex2. row_sum is rebuilt as
+`sum_g SF_g * partial_g` (same value up to FP32 summation order). Measured:
+1388 → 1595 TF at s=32768 (+15%), +8-9% at s=4096/8192, with error vs the
+FP32 reference identical to baseline to all printed digits.
+
+### 2. FP8 PV: P-handoff split 3/4 instead of 1/2 (+21-24%)
+
+The first `mbar_P_full` signal releases the PV MMA after a fraction of P's
+store chunks; the rest go through the embedded P_full_2 wait. The FP8
+default (1/2, a B200 tuning) was far too early-release-biased for B300:
+raising it to 3/4 (`FA4_FP8_PV_P_SPLIT_NUM/DEN`, now the default — same
+fraction BF16 PV always used) gives 1909 → 2366 TF at s=32768 and
+1521 → 1812 at s=4096, bitwise-identical outputs. FP8 PV now beats BF16 PV
+on B300. Note the safety contract: the softmax-side split fraction must be
+>= the GEMM-side pre_mbar fraction (both derive from `mbar_p_split`); 1/4
+violates it for FP8's K-tile count and crashes (illegal access). FP4 is
+insensitive to the split (PV GEMM too cheap for handoff latency to bind;
+tested 1/2, 3/4, 7/8 with store rep 8/4/2 — all ~1595 TF, rep 4 worse).
+
+Also: with the new defaults the FP4 nondeterminism repro went 1/20 → 0/20
+mismatches; possibly timing-masked rather than fixed — keep watching.
+
+Remaining (unexplored) improvement options:
+- Coarser SF groups (fewer group_max FMNMX) — accuracy trade-off.
 - Move quant work to the underutilized correction WG (requires a register →
   TMEM/SMEM round-trip of P — likely costs more than it saves).
 - Hardware-assisted E2M1 packing (future arch).
