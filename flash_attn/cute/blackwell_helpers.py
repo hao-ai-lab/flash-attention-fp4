@@ -1,4 +1,5 @@
 # Copyright (c) 2025, Tri Dao.
+import os
 from typing import Optional, Tuple
 from dataclasses import dataclass, field
 
@@ -1267,16 +1268,32 @@ def gemm_ptx_partial_fp4(
     offset_a_diff = [offset_a[k] - offset_a[k - 1] for k in range(1, cute.size(tCrA.shape[2]))]
     offset_b = [cute.crd2idx((0, 0, k), tCrB.layout) for k in range(cute.size(tCrB.shape[2]))]
     offset_b_diff = [offset_b[k] - offset_b[k - 1] for k in range(1, cute.size(tCrB.shape[2]))]
-    scale_A_base_col = tcgen05.find_tmem_tensor_col_offset(tScaleA[None, None, 0])
-    scale_B_base_col = tcgen05.find_tmem_tensor_col_offset(tScaleB[None, None, 0])
-    offset_sfa = [
-        tcgen05.find_tmem_tensor_col_offset(tScaleA[None, None, k]) - scale_A_base_col
-        for k in range(cute.size(tCrA.shape[2]))
+    # Per-K-tile scale-factor stepping. The SF tmem layout places the SFs for
+    # K-tile k at a static element offset crd2idx((0,0,k)); SF elements are
+    # bytes, and tmem byte addressing decomposes into a 32-bit word column
+    # (elem // 4) plus a sub-word SF-ID (elem % 4). The column goes into the
+    # tmem address operand; the SF-ID goes into idesc bits 30:29 (SFA) /
+    # 5:4 (SFB). scale_vec::4X layouts step whole columns (ID stays 0);
+    # scale_vec::1X (e.g. MXFP8) steps the sub-word ID.
+    assert tScaleA.element_type.width == 8 and tScaleB.element_type.width == 8
+    sfa_elem_off = [
+        cute.crd2idx((0, 0, k), tScaleA.layout) for k in range(cute.size(tCrA.shape[2]))
     ]
-    offset_sfb = [
-        tcgen05.find_tmem_tensor_col_offset(tScaleB[None, None, k]) - scale_B_base_col
-        for k in range(cute.size(tCrB.shape[2]))
+    sfb_elem_off = [
+        cute.crd2idx((0, 0, k), tScaleB.layout) for k in range(cute.size(tCrB.shape[2]))
     ]
+    offset_sfa = [o // 4 for o in sfa_elem_off]
+    offset_sfb = [o // 4 for o in sfb_elem_off]
+    sfa_id = [o % 4 for o in sfa_elem_off]
+    sfb_id = [o % 4 for o in sfb_elem_off]
+    if os.getenv("FA4_DEBUG_SF_OFFSETS", "0") == "1":
+        print(
+            f"GEMM_PTX_FP4 kind={_mma_inst_kind(op)} is_ts={is_ts}\n"
+            f"  offset_sfa={offset_sfa} sfa_id={sfa_id}\n"
+            f"  offset_sfb={offset_sfb} sfb_id={sfb_id}\n"
+            f"  tScaleA.layout={tScaleA.layout}\n  tScaleB.layout={tScaleB.layout}\n"
+            f"  tCrA.layout={tCrA.layout} tCrB.layout={tCrB.layout}"
+        )
     if const_expr(not is_ts):
         smem_desc_start_a_lo = Int32(
             smem_desc_base_a_lo | sm100_desc.make_smem_desc_start_addr(sA[None, None, 0].iterator)
@@ -1417,6 +1434,17 @@ def gemm_ptx_partial_fp4(
         else:
             mbar_wait_str = ""
 
+        def _ts_k_block(k):
+            # idesc with this tile's static SF-IDs, plus any dynamic sub-word
+            # bits carried in the base tmem scale addresses.
+            return (
+                f"add.u32 smem_desc_b_lo, smem_desc_b_lo_start, {hex(offset_b[k])};\n\t"
+                f"mov.b64 smem_desc_b, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
+                f"mov.b32 idesc, {hex(idesc | (sfa_id[k] << 29) | (sfb_id[k] << 4))};\n\t"
+                "or.b32 idesc, idesc, sf_dyn;\n\t"
+                f"@leader_thread {mma_inst_str} [tmem_acc], [tmem_a + {hex(offset_a[k])}], smem_desc_b, idesc, [tmem_scale_a + {hex(offset_sfa[k])}], [tmem_scale_b + {hex(offset_sfb[k])}], 1;\n\t"
+            )
+
         llvm.inline_asm(
             None,
             input_args,
@@ -1425,6 +1453,7 @@ def gemm_ptx_partial_fp4(
             ".reg .pred p;\n\t"
             ".reg .b32 idesc;\n\t"
             ".reg .b32 sf_id_bits;\n\t"
+            ".reg .b32 sf_dyn;\n\t"
             ".reg .b32 tmem_acc;\n\t"
             ".reg .b32 tmem_a;\n\t"
             ".reg .b32 smem_desc_b_lo_start;\n\t"
@@ -1434,28 +1463,24 @@ def gemm_ptx_partial_fp4(
             ".reg .b32 tmem_scale_a;\n\t"
             ".reg .b32 tmem_scale_b;\n\t"
             "elect.sync _|leader_thread, -1;\n\t"
-            f"mov.b32 idesc, {hex(idesc)};\n\t"
             f"mov.b32 tmem_acc, $3;\n\t"
             f"mov.b32 tmem_a, $0;\n\t"
             f"mov.b32 tmem_scale_a, $4;\n\t"
             f"mov.b32 tmem_scale_b, $5;\n\t"
             "and.b32 sf_id_bits, tmem_scale_a, 0xC0000000;\n\t"
-            "shr.u32 sf_id_bits, sf_id_bits, 1;\n\t"
-            "or.b32 idesc, idesc, sf_id_bits;\n\t"
+            "shr.u32 sf_dyn, sf_id_bits, 1;\n\t"
             "and.b32 sf_id_bits, tmem_scale_b, 0xC0000000;\n\t"
             "shr.u32 sf_id_bits, sf_id_bits, 26;\n\t"
-            "or.b32 idesc, idesc, sf_id_bits;\n\t"
+            "or.b32 sf_dyn, sf_dyn, sf_id_bits;\n\t"
+            f"mov.b32 idesc, {hex(idesc | (sfa_id[0] << 29) | (sfb_id[0] << 4))};\n\t"
+            "or.b32 idesc, idesc, sf_dyn;\n\t"
             f"mov.b32 smem_desc_b_lo_start, $1;\n\t"
             f"mov.b32 smem_desc_b_hi, {hex(smem_desc_b_hi)};\n\t"
             f"mov.b64 smem_desc_b, {{smem_desc_b_lo_start, smem_desc_b_hi}};\n\t"
             "setp.ne.b32 p, $2, 0;\n\t"
             f"@leader_thread {mma_inst_str} [tmem_acc], [tmem_a], smem_desc_b, idesc, [tmem_scale_a], [tmem_scale_b], {pred_str};\n\t"
             + "".join(
-                (
-                    f"add.u32 smem_desc_b_lo, smem_desc_b_lo_start, {hex(offset_b[k])};\n\t"
-                    f"mov.b64 smem_desc_b, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
-                    f"@leader_thread {mma_inst_str} [tmem_acc], [tmem_a + {hex(offset_a[k])}], smem_desc_b, idesc, [tmem_scale_a + {hex(offset_sfa[k])}], [tmem_scale_b + {hex(offset_sfb[k])}], 1;\n\t"
-                )
+                _ts_k_block(k)
                 for k in range(
                     1,
                     cute.size(tCrA.shape[2])
@@ -1470,11 +1495,7 @@ def gemm_ptx_partial_fp4(
             + mbar_wait_str
             + (
                 "".join(
-                    (
-                        f"add.u32 smem_desc_b_lo, smem_desc_b_lo_start, {hex(offset_b[k])};\n\t"
-                        f"mov.b64 smem_desc_b, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
-                        f"@leader_thread {mma_inst_str} [tmem_acc], [tmem_a + {hex(offset_a[k])}], smem_desc_b, idesc, [tmem_scale_a + {hex(offset_sfa[k])}], [tmem_scale_b + {hex(offset_sfb[k])}], 1;\n\t"
-                    )
+                    _ts_k_block(k)
                     for k in range(
                         max(
                             1,
