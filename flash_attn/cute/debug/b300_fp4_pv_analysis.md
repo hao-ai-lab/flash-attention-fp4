@@ -411,7 +411,7 @@ All block-scaled QK x PV combinations (triton `do_bench`, GB300,
 2026-06-12 — includes the ld.red row-max (incl. BF16 ref), log-domain FP4
 quant, 3/4 FP8 P-split, MXFP8 PV, and the block-scaled-PV SF-stepping fix):
 
-| Config | NVFP4+BF16 | NVFP4+FP8 | NVFP4+FP4 | NVFP4+MXFP8 | MXFP8+BF16 | MXFP8+FP8 | BF16 ref |
+| Config | NVFP4+BF16 | NVFP4+FP8 | NVFP4+FP4 | NVFP4+MXFP8 | MXFP8+BF16 | MXFP8+FP8 | BF16 ref ² |
 |--------|----|----|----|----|----|----|----|
 | b=1 s=256 h=16 d=128 | 13 | 11 | 10 | 12 | 9 | 10 | **17** |
 | b=1 s=1024 h=16 d=128 | 212 | 195 | 172 | 220 | 196 | 197 | **290** |
@@ -434,3 +434,8 @@ PV (E4M3 P/V, E8M0 SFs per 32) — slowest-but-most-accurate of the
 quantized-PV modes (mean_abs 0.0029 vs FP8 PV's 0.0040, FP4 PV's 0.0039).
 
 ¹ Matches [Wan2.1-T2V-1.3B](https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B-Diffusers) inference (480x832 video, 81 frames -> latent seqlen 32760, nheads=12, headdim=128).
+
+² **BF16 ref** is the non-block-scaled SM100 reference kernel
+(`flash_fwd_sm100.py`), and it too uses the SM103 ld.red fused S-load+row-max
+(`FA4_LDRED_ROWMAX`, default-on) — every column in this table includes it.
+The BF16-ref figures here are post-ld.red (~+1-4% over the pre-ld.red ref).
