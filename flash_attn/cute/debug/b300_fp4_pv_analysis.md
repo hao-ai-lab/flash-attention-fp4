@@ -15,7 +15,7 @@ MXFP8 PV, and a block-scaled-PV SF-stepping correctness fix.
 |--------------------------------|--------|-------|------|------|
 | NVFP4 QK + BF16 PV             | 2069-2142 | **2176-2246** | +4% | 0.0028 |
 | NVFP4 QK + FP8 PV              | 1909   | **2549-2633** | +33-38% | 0.0040 |
-| NVFP4 QK + FP4 PV              | 1388   | **1708-1726** | +23-24% | 0.0039 |
+| NVFP4 QK + NVFP4 PV           | 1388   | **1708-1726** | +23-24% | 0.0039 |
 | NVFP4 QK + MXFP8 PV (new)      | —      | **1755** | — | **0.0029** |
 
 FP8 PV now clearly beats BF16 PV on B300 (it previously lost), restoring
@@ -107,11 +107,13 @@ Two granularities:
   already side-effect ordered — no timestamps inside the compute stream, so
   per-step numbers stay close to the clean kernel. One combined
   "softmax compute" span per step.
-- **Detailed (`FA4_PROFILE_DETAIL=1`)**: per-phase load/exp/quant spans.
-  **Each phase boundary's side-effecting `%clock` asm blocks ptxas from
-  interleaving across it**, inflating spans 15-30% and shifting where waits
-  land. Use for relative phase proportions only; never tune from detailed
-  or instrumented runs alone — verify on clean kernels (and SASS).
+- **Detailed (`FA4_PROFILE_DETAIL=1`)**: per-phase load/exp/quant spans —
+  this is where the group-wise P quant (red) is broken out from the exp2
+  (`figures/pipeline_trace_{mode}_pv_detailed.png`). **Each phase
+  boundary's side-effecting `%clock` asm blocks ptxas from interleaving
+  across it**, inflating spans 15-30% and shifting where waits land. Use
+  for relative phase proportions only; never tune from detailed or
+  instrumented runs alone — verify on clean kernels (and SASS).
 
 Metric definitions (`trace_pipeline.py:step_stats`): one softmax **step**
 is one KV iteration = `wait S` → compute (S load + row_max + exp2 + P
@@ -474,7 +476,7 @@ All block-scaled QK x PV combinations (triton `do_bench`, GB300,
 2026-06-12 — includes the ld.red row-max (incl. BF16 ref), log-domain FP4
 quant, 3/4 FP8 P-split, MXFP8 PV, and the block-scaled-PV SF-stepping fix):
 
-| Config | NVFP4+BF16 | NVFP4+FP8 | NVFP4+FP4 | NVFP4+MXFP8 | MXFP8+BF16 | MXFP8+FP8 | BF16 ref ² |
+| Config | NVFP4+BF16 | NVFP4+FP8 | NVFP4+NVFP4 | NVFP4+MXFP8 | MXFP8+BF16 | MXFP8+FP8 | BF16 ref ² |
 |--------|----|----|----|----|----|----|----|
 | b=1 s=256 h=16 d=128 | 13 | 11 | 10 | 12 | 9 | 10 | **17** |
 | b=1 s=1024 h=16 d=128 | 212 | 195 | 172 | 220 | 196 | 197 | **290** |
@@ -489,8 +491,8 @@ quant, 3/4 FP8 P-split, MXFP8 PV, and the block-scaled-PV SF-stepping fix):
 
 All values in TFLOPS. Peak: **NVFP4+FP8 2578 TF**, **MXFP8+FP8 2342 TF**,
 **NVFP4+BF16 2262 TF**, **MXFP8+BF16 2025 TF**, **NVFP4+MXFP8 1755 TF**,
-**NVFP4+FP4 1726 TF**. **—** = unsupported (d=64 needs head_dim >=
-sf_vec_size x 4: FP4 PV and MXFP8 require 128). Small shapes (s <= 1024)
+**NVFP4+NVFP4 1726 TF**. **—** = unsupported (d=64 needs head_dim >=
+sf_vec_size x 4: NVFP4 PV and MXFP8 require 128). Small shapes (s <= 1024)
 are launch-latency dominated. MXFP8+x columns are MXFP8 QK (sf_vec 32,
 E8M0) with BF16/plain-FP8 PV; NVFP4+MXFP8 is NVFP4 QK with the new MXFP8
 PV (E4M3 P/V, E8M0 SFs per 32) — slowest-but-most-accurate of the

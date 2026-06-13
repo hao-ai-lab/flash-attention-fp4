@@ -63,6 +63,9 @@ WAIT_EVENTS = {
     fa4_prof.EVT_MMA_WAIT_KV,
 }
 
+# Display names: the "fp4" mode is NVFP4 block-scaled P/V (E2M1 + per-16 SF).
+DISPLAY_NAME = {"fp4": "NVFP4", "mxfp8": "MXFP8", "fp8": "FP8", "bf16": "BF16"}
+
 
 def run_attention(pv_mode, batch, seqlen, nheads, headdim):
     import torch
@@ -147,10 +150,11 @@ def render(spans_by_bg, block, output_path, title, start_iter, num_iters,
         (fa4_prof.GRP_SOFTMAX0, "Softmax WG0"),
         (fa4_prof.GRP_SOFTMAX1, "Softmax WG1"),
     ]
-    # BF16/FP8 P conversion is a plain cast (F2FP in SASS); only FP4 does
-    # real quantization (group_max + scale + E2M1 pack).
+    # BF16/FP8 P conversion is a plain cast (F2FP in SASS); only FP4/MXFP8 do
+    # real (group-wise) quantization (group_max + scale + E2M1/E4M3 pack).
+    disp = DISPLAY_NAME.get(pv_mode, pv_mode.upper())
     quant_label = "quant" if pv_mode in ("fp4", "mxfp8") else "F2FP"
-    quant_legend = f"P quant ({pv_mode.upper()})" if pv_mode in ("fp4", "mxfp8") else "P cast (F2FP)"
+    quant_legend = f"P quant ({disp})" if pv_mode in ("fp4", "mxfp8") else "P cast (F2FP)"
     # Coarse traces (default) have no per-phase events: EVT_SOFTMAX_EXP is one
     # combined compute span. Detect by the absence of ROWMAX spans.
     detail = any(
@@ -322,17 +326,21 @@ def main():
     spans = fa4_prof.pair_spans(events)
     summarize(spans, args.block)
 
+    disp = DISPLAY_NAME.get(args.pv_mode, args.pv_mode.upper())
+    detail = os.environ.get("FA4_PROFILE_DETAIL", "0") == "1"
+    suffix = "_pv_detailed" if detail else "_pv"
     out = args.out or os.path.join(
         os.path.dirname(os.path.abspath(__file__)),
         "figures",
-        f"pipeline_trace_{args.pv_mode}_pv.png",
+        f"pipeline_trace_{args.pv_mode}{suffix}.png",
     )
     os.makedirs(os.path.dirname(out), exist_ok=True)
     render(
         spans, args.block, out,
         title=(
-            f"FA4 real pipeline trace — {args.pv_mode.upper()} PV, "
-            f"b={args.batch} s={args.seqlen} h={args.nheads} d={args.headdim}, "
+            f"FA4 real pipeline trace — {disp} PV"
+            + (" (detailed; instrumented spans inflated 15-30%)" if detail else "")
+            + f", b={args.batch} s={args.seqlen} h={args.nheads} d={args.headdim}, "
             f"block {args.block} (GB300)"
         ),
         start_iter=args.start_iter, num_iters=args.num_iters,
