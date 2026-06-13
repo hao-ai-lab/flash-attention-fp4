@@ -117,11 +117,8 @@ Metric definitions (`trace_pipeline.py:step_stats`): one softmax **step**
 is one KV iteration = `wait S` → compute (S load + row_max + exp2 + P
 quant/pack) → `P store + signal` → `wait corr`. **softmax step period**
 is the full iteration wall-clock (median gap between consecutive `wait S`
-starts, stalls included); **softmax step busy** is that minus the two
-stall categories (`wait S`, `wait corr`) — i.e. the time the softmax WG
-is actually computing/storing, not blocked on an mbarrier. So
-`period − busy` ≈ softmax-side stall, and `busy` is the metric to compare
-P-quant cost across PV modes independent of the MMA warp's pace.
+starts, stalls included); **softmax step busy** is the time the softmax WG
+is actually computing/storing, not blocked on an mbarrier.
 
 Pre-optimization baseline characterization (coarse, block 0, b=1 s=4096
 h=24 d=128, 96 softmax iterations/WG):
