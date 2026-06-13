@@ -10,6 +10,7 @@ Usage:
     python3 flash_attn/cute/debug/trace_pipeline.py --pv_mode bf16
     python3 flash_attn/cute/debug/trace_pipeline.py --pv_mode fp8
     python3 flash_attn/cute/debug/trace_pipeline.py --pv_mode fp4
+    python3 flash_attn/cute/debug/trace_pipeline.py --pv_mode mxfp8
 """
 
 import argparse
@@ -148,8 +149,8 @@ def render(spans_by_bg, block, output_path, title, start_iter, num_iters,
     ]
     # BF16/FP8 P conversion is a plain cast (F2FP in SASS); only FP4 does
     # real quantization (group_max + scale + E2M1 pack).
-    quant_label = "quant" if pv_mode == "fp4" else "F2FP"
-    quant_legend = "P quant (FP4)" if pv_mode == "fp4" else "P cast (F2FP)"
+    quant_label = "quant" if pv_mode in ("fp4", "mxfp8") else "F2FP"
+    quant_legend = f"P quant ({pv_mode.upper()})" if pv_mode in ("fp4", "mxfp8") else "P cast (F2FP)"
     # Coarse traces (default) have no per-phase events: EVT_SOFTMAX_EXP is one
     # combined compute span. Detect by the absence of ROWMAX spans.
     detail = any(
@@ -267,7 +268,7 @@ def render(spans_by_bg, block, output_path, title, start_iter, num_iters,
 
     if detail:
         sm_legend = [
-            mpatches.Patch(color="#9966CC", label="MUFU (exp2)" if pv_mode == "fp4" else "MUFU (exp2, fused cast)"),
+            mpatches.Patch(color="#9966CC", label="MUFU (exp2)" if pv_mode in ("fp4", "mxfp8") else "MUFU (exp2, fused cast)"),
             mpatches.Patch(color="#CC3355", label=quant_legend),
             mpatches.Patch(color="#77BBDD", label="S load + row_max"),
         ]
@@ -275,7 +276,7 @@ def render(spans_by_bg, block, output_path, title, start_iter, num_iters,
         sm_legend = [
             mpatches.Patch(color="#9966CC",
                            label="softmax compute (S load + row_max + MUFU + "
-                                 + ("quant" if pv_mode == "fp4" else "F2FP cast") + ")"),
+                                 + ("quant" if pv_mode in ("fp4", "mxfp8") else "F2FP cast") + ")"),
         ]
     legend = [
         mpatches.Patch(color="#4488CC", label="QK GEMM"),
@@ -298,7 +299,7 @@ def render(spans_by_bg, block, output_path, title, start_iter, num_iters,
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--pv_mode", default="bf16", choices=["bf16", "fp8", "fp4"])
+    p.add_argument("--pv_mode", default="bf16", choices=["bf16", "fp8", "fp4", "mxfp8"])
     p.add_argument("--batch", type=int, default=1)
     p.add_argument("--seqlen", type=int, default=4096)
     p.add_argument("--nheads", type=int, default=24)

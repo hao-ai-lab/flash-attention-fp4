@@ -123,6 +123,27 @@ h=24 d=128, 96 softmax iterations/WG):
 | MMA QK+PV GEMM (one stage)  | 732     | 639    | 622    |
 | MMA wait-P (per PV)          | 933     | 595    | 1,171  |
 
+Post-optimization (2026-06-12 defaults: ld.red row-max, log-domain quant,
+3/4 FP8 P-split, SF-stepping fix; coarse, same shape — the current
+`pipeline_trace_{bf16,fp8,fp4,mxfp8}_pv.png` figures):
+
+| Per step (cycles)            | BF16 PV | FP8 PV | FP4 PV | MXFP8 PV |
+|------------------------------|---------|--------|--------|----------|
+| softmax step period          | 4,800   | 3,962  | 4,381  | 4,140    |
+| softmax step busy            | 2,369   | 2,242  | 2,429  | 2,280    |
+| MMA QK+PV GEMM (one stage)  | 707     | 632    | 618    | 615      |
+| MMA wait-P (per PV)          | 973     | 619    | 633    | 625      |
+
+FP4's softmax busy dropped 3,469 → 2,429 (log-domain quant + ld.red) and
+its step period 5,389 → 4,381. MXFP8 PV's busy time sits just +38 cycles
+over FP8's — in the *instrumented* kernel the extra group-bias FMA pass
+largely hides under MUFU latency. The end-to-end TFLOPS gap to FP8 PV
+(1148 vs 1555 at this shape) is much larger than the step-period delta
+(4,140 vs 3,962), so most of it lives in what the coarse softmax span
+doesn't isolate: the SF S2T staging + extra barriers on the softmax→MMA
+handoff and the per-tile tails (see the PTX-count section; remember the
+instrumentation caveat above — clean-kernel TFLOPS is the ground truth).
+
 Measured means per event (detailed mode — relative proportions only, see
 artifact warning above; pre-optimization baseline, block 0, b=1 s=4096
 h=24 d=128, 96 softmax iterations per WG):
@@ -307,8 +328,14 @@ body; `CUTE_DSL_KEEP_PTX=1`, same NVFP4 QK in all modes):
 software FMNMX reduce remains compiled in for masked iterations.
 
 The P-pack cvt count is identical to FP8 PV — the gap is (a) **+128
-`fma.f32x2` on the FMA pipe** for per-group bias application (FP8 PV folds
-its single row-wise scale into values it already computes), (b) the **SFP
+`fma.f32x2` on the FMA pipe**: the log-domain quant runs a *second*
+packed-FMA pass over every element to subtract the per-group bias
+(`_fused_log2_group_quant`), on top of the scale-subtract-rowmax pass both
+modes share — FP8 PV's single row-wise scale folds entirely into that
+first pass. (The two passes could in principle fuse into one FMA with a
+per-group constant `c_g = -(row_max*scale_log2 + bias_g)`; that needs the
+quant path to own the exp2 prep instead of receiving pre-subtracted
+scores — a future lever worth ~128 f32x2 FMAs/step.) (b) the **SFP
 R2S + S2T round-trip and its barriers** sitting on the softmax→MMA
 critical path, and (c) the **handoff structure**: FP8 PV releases the PV
 MMA after 3/4 of plain P chunks (chunk-pipelined pack/store), while the
