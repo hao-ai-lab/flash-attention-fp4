@@ -153,8 +153,16 @@ def render(spans_by_bg, block, output_path, title, start_iter, num_iters,
     # BF16/FP8 P conversion is a plain cast (F2FP in SASS); only FP4/MXFP8 do
     # real (group-wise) quantization (group_max + scale + E2M1/E4M3 pack).
     disp = DISPLAY_NAME.get(pv_mode, pv_mode.upper())
-    quant_label = "quant" if pv_mode in ("fp4", "mxfp8") else "F2FP"
-    quant_legend = f"P quant ({disp})" if pv_mode in ("fp4", "mxfp8") else "P cast (F2FP)"
+    # FP4/MXFP8 default to the log-domain path where exp2 is FUSED into the
+    # per-group quant loop — there is no separable exp2 phase, so the EXP
+    # span is ~empty and the red span covers exp2 + group quant together.
+    fused_exp_quant = pv_mode in ("fp4", "mxfp8")
+    quant_label = "exp2+quant" if fused_exp_quant else "F2FP"
+    quant_legend = (
+        f"exp2 + P quant (fused log-domain, {disp})"
+        if fused_exp_quant
+        else "P cast (F2FP)"
+    )
     # Coarse traces (default) have no per-phase events: EVT_SOFTMAX_EXP is one
     # combined compute span. Detect by the absence of ROWMAX spans.
     detail = any(
@@ -197,6 +205,11 @@ def render(spans_by_bg, block, output_path, title, start_iter, num_iters,
             evt = s["event_idx"]
             # Count every span (even outside the window) so indices stay global.
             counters[evt] = counters.get(evt, 0) + 1
+            # Log-domain FP4/MXFP8: exp2 is fused into the quant loop, so the
+            # detailed EXP span is empty instrumentation noise — drop it and
+            # let the combined "exp2+quant" span stand alone.
+            if detail and fused_exp_quant and evt == fa4_prof.EVT_SOFTMAX_EXP:
+                continue
             if grp == fa4_prof.GRP_MMA:
                 if evt == fa4_prof.EVT_PV_GEMM:
                     pv_idx += 1
@@ -271,11 +284,19 @@ def render(spans_by_bg, block, output_path, title, start_iter, num_iters,
     )
 
     if detail:
-        sm_legend = [
-            mpatches.Patch(color="#9966CC", label="MUFU (exp2)" if pv_mode in ("fp4", "mxfp8") else "MUFU (exp2, fused cast)"),
-            mpatches.Patch(color="#CC3355", label=quant_legend),
-            mpatches.Patch(color="#77BBDD", label="S load + row_max"),
-        ]
+        if fused_exp_quant:
+            # exp2 is fused into the per-group quant loop; the EXP span is
+            # empty noise and is not drawn — show one combined span.
+            sm_legend = [
+                mpatches.Patch(color="#CC3355", label=quant_legend),
+                mpatches.Patch(color="#77BBDD", label="S load + row_max"),
+            ]
+        else:
+            sm_legend = [
+                mpatches.Patch(color="#9966CC", label="MUFU (exp2, fused cast)"),
+                mpatches.Patch(color="#CC3355", label=quant_legend),
+                mpatches.Patch(color="#77BBDD", label="S load + row_max"),
+            ]
     else:
         sm_legend = [
             mpatches.Patch(color="#9966CC",

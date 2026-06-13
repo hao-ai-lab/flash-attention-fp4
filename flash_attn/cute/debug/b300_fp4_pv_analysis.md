@@ -107,13 +107,17 @@ Two granularities:
   already side-effect ordered — no timestamps inside the compute stream, so
   per-step numbers stay close to the clean kernel. One combined
   "softmax compute" span per step.
-- **Detailed (`FA4_PROFILE_DETAIL=1`)**: per-phase load/exp/quant spans —
-  this is where the group-wise P quant (red) is broken out from the exp2
-  (`figures/pipeline_trace_{mode}_pv_detailed.png`). **Each phase
-  boundary's side-effecting `%clock` asm blocks ptxas from interleaving
-  across it**, inflating spans 15-30% and shifting where waits land. Use
-  for relative phase proportions only; never tune from detailed or
-  instrumented runs alone — verify on clean kernels (and SASS).
+- **Detailed (`FA4_PROFILE_DETAIL=1`)**: per-phase load/exp/quant spans
+  (`figures/pipeline_trace_{mode}_pv_detailed.png`). For BF16/FP8 the exp2
+  and the P cast are separable phases. For **NVFP4/MXFP8 the exp2 is fused
+  into the per-group quant loop** (log-domain path: fma → exp2 → pack per
+  group), so there is no separable exp2 phase — the figure shows one
+  combined **exp2 + P quant** span (red), not an empty MUFU sliver next to
+  a quant block. **Each phase boundary's side-effecting `%clock` asm blocks
+  ptxas from interleaving across it**, inflating spans 15-30% and shifting
+  where waits land. Use for relative phase proportions only; never tune
+  from detailed or instrumented runs alone — verify on clean kernels (and
+  SASS).
 
 Metric definitions (`trace_pipeline.py:step_stats`): one softmax **step**
 is one KV iteration = `wait S` → compute (S load + row_max + exp2 + P
