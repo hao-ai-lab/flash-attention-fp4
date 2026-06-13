@@ -125,7 +125,7 @@ h=24 d=128, 96 softmax iterations/WG):
 
 Post-optimization (2026-06-12 defaults: ld.red row-max, log-domain quant,
 3/4 FP8 P-split, SF-stepping fix; coarse, same shape — the current
-`pipeline_trace_{bf16,fp8,fp4,mxfp8}_pv.png` figures):
+`figures/pipeline_trace_{bf16,fp8,fp4,mxfp8}_pv.png` figures):
 
 | Per step (cycles)            | BF16 PV | FP8 PV | FP4 PV | MXFP8 PV |
 |------------------------------|---------|--------|--------|----------|

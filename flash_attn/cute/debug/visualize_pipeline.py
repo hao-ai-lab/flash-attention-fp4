@@ -490,7 +490,8 @@ def make_legend(fig, modes=None):
 
 
 def main():
-    out_dir = os.path.dirname(os.path.abspath(__file__))
+    out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "figures")
+    os.makedirs(out_dir, exist_ok=True)
 
     # --- Combined figure with all 3 PV modes ---
     fig, axes = plt.subplots(3, 1, figsize=(18, 9.5), dpi=150)

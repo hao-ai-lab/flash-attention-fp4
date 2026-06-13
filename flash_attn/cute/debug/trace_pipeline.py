@@ -324,8 +324,10 @@ def main():
 
     out = args.out or os.path.join(
         os.path.dirname(os.path.abspath(__file__)),
+        "figures",
         f"pipeline_trace_{args.pv_mode}_pv.png",
     )
+    os.makedirs(os.path.dirname(out), exist_ok=True)
     render(
         spans, args.block, out,
         title=(
