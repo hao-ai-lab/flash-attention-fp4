@@ -245,7 +245,7 @@ def render(spans_by_bg, block, output_path, title, start_iter, num_iters,
                 # Fused log-domain box: second line names the quant phase so
                 # the iteration number stays on its own (clean) line.
                 if fused_exp_quant and evt == fa4_prof.EVT_SOFTMAX_QUANT:
-                    label = f"{label}\n+ P quant"
+                    label = f"{label}\n+ quant"
             if isinstance(color, tuple):
                 color = color[0]
 
