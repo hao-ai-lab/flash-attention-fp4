@@ -444,20 +444,29 @@ adding scale factors to the FP8 PV/QK paths would close that max-diff gap.
 Conclusion: not worth it. All measurements via torch emulation of the
 exact quant before any kernel change.
 
-**1. FP8 V descale (sm100.py per-head `v_descale`): no precision benefit.**
-E4M3 is *floating point*, so a uniform per-head (or per-group) descale is
-scale-invariant — relative quant error doesn't change. Isolated V-quant
-error on the attention output (**torch emulation of the quant, not the
-kernel** — b1 s1024 h16 d128): direct cast max 0.0165 / mean 0.00108,
-per-head 0.0171 / 0.00109, per-128 0.0184, per-32 0.0205. These deltas are
-within run-to-run noise (mean is flat to 1e-5) — i.e. **no meaningful
-change**, exactly as floating-point scale-invariance predicts; do not read
-the tiny max-diff wiggle as a real "worse." The emulation applies the
-descale algebraically (exact pre-matmul), so it is a faithful proxy for
-what the kernel would compute — that is why we did not wire `v_descale`
-into the kernel just to re-measure a settled result. The sm100 `v_descale`
-is a dequant API for externally-quantized FP8 V, not a precision lever; V
-is not where the error lives anyway.
+**1. FP8 V descale (sm100.py per-head `v_descale`): implemented, no
+precision benefit.** E4M3 is *floating point*, so a uniform per-head
+descale is scale-invariant — relative quant error doesn't change. This was
+**implemented in the kernel** (`v_descale` arg on the fp4 kernel /
+interface / `flash_attn_func`; loaded per `[batch, kv_head]` in
+`correction_loop` and folded into the output-norm `scale`, mirroring
+sm100.py) and measured directly. NVFP4 QK + FP8 V, b1 s1024 h16 d128, vs
+the BF16 reference:
+
+| path | max | mean |
+|---|---|---|
+| A: direct cast V→fp8, no descale (current) | 0.5942 | 0.00737 |
+| B: per-head amax-scaled V→fp8 + `v_descale` | 0.5922 | 0.00737 |
+| C: scaled V, **descale omitted** (control) | 44.74 | 3.817 |
+
+B ≡ A to 5 digits → no precision change, as scale-invariance predicts; C
+blows up → confirms the descale path is actually exercised (not silently
+ignored). Speed is unchanged: 2538 → 2562 TF at s=32768 h=24 d=128 (the
+per-row global load + multiply in the correction warp is free). So
+`v_descale` is a correct **dequant API for externally-quantized FP8 V**
+(FA3 semantics), not a precision lever — V is not where the error lives.
+(The full-kernel mean 0.0074 ≫ the isolated V-quant ~0.001 because QK+P
+error dominates.)
 
 **2. FP8 P error is underflow, but the kernel already mitigates it.** ~88%
 of softmax probs sit below E4M3's subnormal floor (2⁻⁹) and would flush to

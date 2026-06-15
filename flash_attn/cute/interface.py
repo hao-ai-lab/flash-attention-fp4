@@ -231,6 +231,7 @@ def _flash_attn_fwd(
     mSFQ: Optional[Union[torch.Tensor, cute.Tensor]] = None,  # Scale factor for Q
     mSFK: Optional[Union[torch.Tensor, cute.Tensor]] = None,  # Scale factor for K
     mSFV: Optional[Union[torch.Tensor, cute.Tensor]] = None,  # Scale factor for V
+    v_descale: Optional[torch.Tensor] = None,  # Per-(batch, kv-head) FP8 V dequant scale
     force_fp4_impl: bool = False, # Test fp4 attn impl under bf16 precision w/o sf
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Forward pass for FlashAttention.
@@ -669,6 +670,7 @@ def _flash_attn_fwd(
         mSFQ is not None,  # Include scale factor flags
         mSFK is not None,
         mSFV is not None,
+        v_descale is not None,  # FP8 V dequant scale present
         force_fp4_impl,
         _key_qk_ab_dtype,  # NVFP4 (Float4E2M1FN) vs MXFP8 (Float8E4M3FN/E5M2)
         _key_sf_dtype,     # E4M3 (NVFP4) vs E8M0 (MXFP8) — was previously not in the
@@ -776,10 +778,13 @@ def _flash_attn_fwd(
         o_tensor = to_cute_tensor(out if not is_split_kv else out_partial)
         # Pass through scale factor tensors when using the SM100 block-scaled kernel.
         mSFQ_tensor = mSFK_tensor = mSFV_tensor = None
+        v_descale_tensor = None
         if use_blockscaled_impl:
             mSFQ_tensor = to_cute_tensor(mSFQ, leading_dim=3, assumed_align=16) if mSFQ is not None else None
             mSFK_tensor = to_cute_tensor(mSFK, leading_dim=3, assumed_align=16) if mSFK is not None else None
             mSFV_tensor = to_cute_tensor(mSFV, leading_dim=3, assumed_align=16) if mSFV is not None else None
+            # Per-(batch, kv-head) FP8 V dequant scale (Float32, shape [b, h_kv]).
+            v_descale_tensor = to_cute_tensor(v_descale, leading_dim=1, assumed_align=4) if v_descale is not None else None
         if is_split_kv:
             lse_tensor = to_cute_tensor(lse_partial, assumed_align=4)
         elif lse is not None:
@@ -963,7 +968,7 @@ def _flash_attn_fwd(
                 profiler_tensor = to_cute_tensor(
                     fa4_profiler.LAST_BUFFER, assumed_align=16, leading_dim=0
                 )
-            compile_args.extend([mSFQ_tensor, mSFK_tensor, mSFV_tensor, profiler_tensor])
+            compile_args.extend([mSFQ_tensor, mSFK_tensor, mSFV_tensor, profiler_tensor, v_descale_tensor])
         # Add q/k shapes for the block-scaled kernel (it always builds tensors from pointer + shape)
         if use_blockscaled_impl:
             if fp4_qk:
@@ -1037,7 +1042,7 @@ def _flash_attn_fwd(
             if fa4_profiler.LAST_BUFFER is None:
                 fa4_profiler.LAST_BUFFER = fa4_profiler.allocate_profiler_buffer()
             profiler_buf = fa4_profiler.LAST_BUFFER
-        call_args.extend([mSFQ, mSFK, mSFV, profiler_buf])
+        call_args.extend([mSFQ, mSFK, mSFV, profiler_buf, v_descale])
     # Add q/k shapes for the block-scaled kernel
     if use_blockscaled_impl:
         call_args.extend([q_ptr_shape, k_ptr_shape])
@@ -1616,6 +1621,7 @@ class FlashAttnFunc(torch.autograd.Function):
         mSFQ: Optional[torch.Tensor] = None,
         mSFK: Optional[torch.Tensor] = None,
         mSFV: Optional[torch.Tensor] = None,
+        v_descale: Optional[torch.Tensor] = None,
         force_fp4_impl: bool = False,
     ):
         # Only create block sparse tensors if at least one block sparse parameter is provided
@@ -1644,6 +1650,7 @@ class FlashAttnFunc(torch.autograd.Function):
             mSFQ=mSFQ,
             mSFK=mSFK,
             mSFV=mSFV,
+            v_descale=v_descale,
             force_fp4_impl=force_fp4_impl,
         )
         ctx.save_for_backward(q, k, v, out, lse)
@@ -1667,7 +1674,7 @@ class FlashAttnFunc(torch.autograd.Function):
             ctx.causal,
             ctx.softcap,
         )
-        return dq, dk, dv, *((None,) * 20)  # Extra Nones is fine
+        return dq, dk, dv, *((None,) * 21)  # Extra Nones is fine
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
@@ -1758,6 +1765,7 @@ def flash_attn_func(
     mSFQ: Optional[torch.Tensor] = None,
     mSFK: Optional[torch.Tensor] = None,
     mSFV: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
     force_fp4_impl: bool = False,
 ):
     return FlashAttnFunc.apply(
@@ -1779,6 +1787,7 @@ def flash_attn_func(
         mSFQ,
         mSFK,
         mSFV,
+        v_descale,
         force_fp4_impl,
     )
 

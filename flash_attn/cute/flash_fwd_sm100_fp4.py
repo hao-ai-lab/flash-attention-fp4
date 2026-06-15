@@ -465,6 +465,9 @@ class FlashAttentionForwardSm100:
         # In-kernel pipeline trace buffer (int32, see flash_attn.cute.profiler).
         # Pass a buffer to compile the kernel with timestamp instrumentation.
         mProfiler: Optional[cute.Tensor] = None,
+        # Per-(batch, kv-head) V dequant scale for externally-quantized FP8 V
+        # (FA3 semantics); folded into the output normalization.
+        v_descale: Optional[cute.Tensor] = None,
         # For pointer-based Q/K: separate shapes to handle cross-attention (seqlen_q != seqlen_k)
         q_ptr_shape: tuple = (),
         k_ptr_shape: tuple = (),
@@ -1303,6 +1306,7 @@ class FlashAttentionForwardSm100:
             sfp_smem_layout_staged,
             sfv_smem_layout_staged,
             mProfiler,
+            v_descale,
         ).launch(
             grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
@@ -1359,6 +1363,7 @@ class FlashAttentionForwardSm100:
         sfp_smem_layout_staged: Optional[cute.Layout] = None,
         sfv_smem_layout_staged: Optional[cute.Layout] = None,
         mProfiler: Optional[cute.Tensor] = None,
+        v_descale: Optional[cute.Tensor] = None,
     ):
         """The device kernel implementation of the Fused Multi-Head Attention.
 
@@ -1922,6 +1927,7 @@ class FlashAttentionForwardSm100:
                 SeqlenInfoCls,
                 TileSchedulerCls,
                 blocksparse_tensors,
+                v_descale=v_descale,
             )
             cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_tmem_dealloc_offset)
 
@@ -3859,6 +3865,7 @@ class FlashAttentionForwardSm100:
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        v_descale: Optional[cute.Tensor] = None,
     ):
         tidx = cute.arch.thread_idx()[0] % (cute.arch.WARP_SIZE * len(self.correction_warp_ids))
         tScS = thr_mma_qk.partition_C(cute.make_identity_tensor(self.mma_tiler_qk[:2]))
@@ -3889,6 +3896,17 @@ class FlashAttentionForwardSm100:
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
+            # Per-(batch, kv-head) V dequant scale for externally-quantized FP8
+            # V (FA3 semantics): folds into the output normalization. Identity
+            # when not provided.
+            v_descale_val = Float32(1.0)
+            if const_expr(v_descale is not None):
+                kv_head_idx = (
+                    head_idx
+                    if const_expr(self.pack_gqa)
+                    else head_idx // self.qhead_per_kvhead
+                )
+                v_descale_val = Float32(v_descale[batch_idx, kv_head_idx])
             seqlen = SeqlenInfoCls(batch_idx)
             n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx, num_splits)
 
@@ -3991,6 +4009,8 @@ class FlashAttentionForwardSm100:
                     acc_O_mn_row_is_zero_or_nan = row_sum == 0.0 or row_sum != row_sum
                     stats[stage] = (row_sum, row_max, acc_O_mn_row_is_zero_or_nan)
                     scale = cute.arch.rcp_approx(row_sum if not acc_O_mn_row_is_zero_or_nan else 1.0)
+                    # Externally-quantized FP8 V dequant (identity if v_descale is None).
+                    scale = scale * v_descale_val
                     cute.arch.mbarrier_wait(
                         mbar_ptr + self.mbar_O_full_offset + stage, o_corr_consumer_phase
                     )
