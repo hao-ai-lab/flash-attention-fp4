@@ -447,11 +447,17 @@ exact quant before any kernel change.
 **1. FP8 V descale (sm100.py per-head `v_descale`): no precision benefit.**
 E4M3 is *floating point*, so a uniform per-head (or per-group) descale is
 scale-invariant — relative quant error doesn't change. Isolated V-quant
-error on the attention output (b1 s1024 h16 d128): direct cast
-max 0.0165, per-head 0.0171, per-128 0.0184, per-32 0.0205 (descaling
-slightly *worse*, from the extra rounding). The sm100 `v_descale` is a
-dequant API for externally-quantized FP8 V, not a precision lever. V is
-not where the error lives anyway.
+error on the attention output (**torch emulation of the quant, not the
+kernel** — b1 s1024 h16 d128): direct cast max 0.0165 / mean 0.00108,
+per-head 0.0171 / 0.00109, per-128 0.0184, per-32 0.0205. These deltas are
+within run-to-run noise (mean is flat to 1e-5) — i.e. **no meaningful
+change**, exactly as floating-point scale-invariance predicts; do not read
+the tiny max-diff wiggle as a real "worse." The emulation applies the
+descale algebraically (exact pre-matmul), so it is a faithful proxy for
+what the kernel would compute — that is why we did not wire `v_descale`
+into the kernel just to re-measure a settled result. The sm100 `v_descale`
+is a dequant API for externally-quantized FP8 V, not a precision lever; V
+is not where the error lives anyway.
 
 **2. FP8 P error is underflow, but the kernel already mitigates it.** ~88%
 of softmax probs sit below E4M3's subnormal floor (2⁻⁹) and would flush to
