@@ -434,6 +434,57 @@ cvt/MUFU/ALU ports, not scheduling — which pointed at instruction
 ELIMINATION (log-domain quant) and pipeline-handoff tuning (split) instead
 of reordering. Both paid off (previous section).
 
+## Precision: descale / two-level quant (investigated, not adopted)
+
+Motivating observation (README precision tables): **NVFP4+FP8 has lower
+overall error** (higher cos, lower mean_diff) than NVFP4+NVFP4 — FP8's
+wider mantissa wins on average — yet at some shapes its **max_diff is
+higher** (e.g. (1,1024,16,128): 0.2119 vs 0.1504). We chased whether
+adding scale factors to the FP8 PV/QK paths would close that max-diff gap.
+Conclusion: not worth it. All measurements via torch emulation of the
+exact quant before any kernel change.
+
+**1. FP8 V descale (sm100.py per-head `v_descale`): no precision benefit.**
+E4M3 is *floating point*, so a uniform per-head (or per-group) descale is
+scale-invariant — relative quant error doesn't change. Isolated V-quant
+error on the attention output (b1 s1024 h16 d128): direct cast
+max 0.0165, per-head 0.0171, per-128 0.0184, per-32 0.0205 (descaling
+slightly *worse*, from the extra rounding). The sm100 `v_descale` is a
+dequant API for externally-quantized FP8 V, not a precision lever. V is
+not where the error lives anyway.
+
+**2. FP8 P error is underflow, but the kernel already mitigates it.** ~88%
+of softmax probs sit below E4M3's subnormal floor (2⁻⁹) and would flush to
+zero on a naive [0,1] cast (max 0.093 / mean 0.0137 isolated). But the
+kernel scales P per *row* via `max_offset = log2(448)` (row max → 448,
+full E4M3 range), which already recovers most of it: per-row 0.0133 /
+0.00108. Going finer helps the tail — per-128 0.0062, per-32 0.0051,
+per-16 0.0048 — but a per-key-group P scale **requires block-scaled MMA
+along the contraction (keys) dim**, which is exactly NVFP4 PV (g16) and
+MXFP8 PV (g32). Those already exist; and they need per-group SF computed
+in the softmax WG (register pressure, the very thing the log-domain quant
+fights). End-to-end the PV improvement (~3e-4 mean) is swamped by the
+NVFP4 QK error (~2.9e-3 mean), so it doesn't move the table.
+
+**3. Two-level QK quant (per-head E8M0 coarse + per-16 NVFP4 fine): also
+dropped.** The level-1 per-head scale dequantizes as `qk_descale` folded
+into `softmax_scale_log2` — and with an E8M0 (power-of-2) coarse scale the
+dequant is a pure *add* in the log domain (no mantissa lost, no multiply).
+The bench currently runs single-level (`nvfp4_quantize(t, one)`, global
+scale = 1). But the per-16 E4M3 block SF *already adapts to local
+magnitude*, so level-1 is redundant except when per-head magnitude spread
+is extreme enough to push the per-block SF out of E4M3's range
+(448 … ~2⁻⁹) — not the case for LayerNorm-scale Q/K. And quantization
+needs a **second pass over Q/K** (a global per-head amax reduction before
+the per-block pass), which is too costly for ~no gain on well-scaled data.
+Cheap dequant, expensive quant.
+
+Net: the existing per-row P scaling + per-16/32 block SF (in the NVFP4/
+MXFP8 PV modes) already cover the realistic precision range; the extra
+descale/two-level machinery only helps pathological per-head magnitude
+spread, which the benchmark (and typical post-LayerNorm activations) don't
+exhibit.
+
 ## Other Findings
 
 - **e2e exp2 emulation hurts on SM103** (hardware exp2 already fast at
