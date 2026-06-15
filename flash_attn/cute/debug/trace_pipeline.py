@@ -157,9 +157,11 @@ def render(spans_by_bg, block, output_path, title, start_iter, num_iters,
     # per-group quant loop — there is no separable exp2 phase, so the EXP
     # span is ~empty and the red span covers exp2 + group quant together.
     fused_exp_quant = pv_mode in ("fp4", "mxfp8")
-    quant_label = "exp2+quant" if fused_exp_quant else "F2FP"
+    # In-box label is the short phase name only (no "exp2" — its trailing 2
+    # reads as part of the iteration number); the legend carries the detail.
+    quant_label = "MUFU" if fused_exp_quant else "F2FP"
     quant_legend = (
-        f"exp2 + P quant (fused log-domain, {disp})"
+        f"MUFU (exp2) + P quant (fused log-domain, {disp})"
         if fused_exp_quant
         else "P cast (F2FP)"
     )
