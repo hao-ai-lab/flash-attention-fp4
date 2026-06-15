@@ -242,6 +242,10 @@ def render(spans_by_bg, block, output_path, title, start_iter, num_iters,
                 n = counters[evt]
                 glob = 2 * (n - 1) + (1 if grp == fa4_prof.GRP_SOFTMAX0 else 2)
                 label = f"{label}{glob}"
+                # Fused log-domain box: second line names the quant phase so
+                # the iteration number stays on its own (clean) line.
+                if fused_exp_quant and evt == fa4_prof.EVT_SOFTMAX_QUANT:
+                    label = f"{label}\n+ P quant"
             if isinstance(color, tuple):
                 color = color[0]
 
@@ -263,7 +267,9 @@ def render(spans_by_bg, block, output_path, title, start_iter, num_iters,
             # (~2550 usable px at figsize 20in x 150dpi).
             bar_px = vis_dur * 2550.0 / (w1 - w0)
             dark_text = is_wait or evt == fa4_prof.EVT_PV_WAIT_P2
-            if label and bar_px >= 10 * len(label) + 8:
+            # Width gate uses the widest line (labels may be multi-line).
+            label_w = max((len(ln) for ln in label.split("\n")), default=0)
+            if label and bar_px >= 10 * label_w + 8:
                 ax.text(vis_start - w0 + vis_dur / 2, 0.5, label,
                         ha="center", va="center", fontsize=7,
                         color="#555555" if dark_text else "white",
