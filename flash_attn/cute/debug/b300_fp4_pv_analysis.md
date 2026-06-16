@@ -510,6 +510,65 @@ descale/two-level machinery only helps pathological per-head magnitude
 spread, which the benchmark (and typical post-LayerNorm activations) don't
 exhibit.
 
+## External compiler autotuning: NVIDIA CompileIQ (assessment)
+
+[CompileIQ](https://nvidia.github.io/CompileIQ/stable/compilers_overview.html)
+(v1.0.1, pip) is NVIDIA's black-box HPO autotuner for the NVIDIA compilers.
+It searches **ptxas** (and nvcc) control settings and emits an **Advanced
+Controls File (ACF)** — a per-workload set of compiler knobs that change
+**SASS generation, register allocation, instruction scheduling, and memory
+behavior** *without touching kernel source*. The ACF is applied at PTX→SASS
+with `ptxas --apply-controls candidate.acf kernel.ptx` (requires **ptxas
+13.3+**). The search is evolutionary (`pool_size`/`generations`/
+`mutate_rate`, `problem_type=min`); the objective is a user function
+returning measured kernel latency (e.g. `triton.testing.do_bench`).
+Curated "Booster Packs" (Helion) already show gains on **FlashInfer's
+BatchDecodeWithPagedKVCache** — so attention kernels are in scope.
+
+**Why it's relevant to us.** Our inline-vs-standalone gap and the softmax
+warp's cross-pipe behavior are *ptxas codegen-quality / instruction-
+scheduling* issues (see the inline-vs-standalone analysis: the gap is IPC/
+scheduling, not barrier count). ACF scheduling controls are exactly the
+lever for that — they bias ptxas's instruction ordering / ILP / dual-issue,
+which is what governs interleaving the softmax warp's MUFU / FMA / cvt
+streams. So in principle CompileIQ could tune the very thing we can't
+express in the DSL.
+
+**The catch — integration gap.** cutlass-dsl compiles PTX→SASS **in-process
+via the linked nvPTXCompiler** (12.9 in 4.4.2, 13.1 in the 4.5.2 cu13
+libs), *not* by shelling out to a `ptxas` binary, and exposes no
+`--apply-controls` hook. ACF needs **13.3+**, which neither linked compiler
+is. So tuning can't be injected in-place; it requires a harness:
+1. dump the kernel PTX (`CUTE_DSL_KEEP_PTX=1`),
+2. per candidate ACF: `ptxas-13.3 --apply-controls acf kernel.ptx -o cand.cubin`
+   (ptxas 13.3 + `--apply-controls` are both present in this env:
+   `nvidia/cu13/bin/ptxas`),
+3. load `cand.cubin` via the CUDA driver and launch with the DSL's captured
+   grid/block/smem/args → measure TFLOPS = CompileIQ objective.
+Step 3 (a standalone cubin-launch harness mirroring the DSL's launch
+config) is the real engineering cost.
+
+**Caveats.**
+- **CUDA 13.x ptxas regression (measured).** On B200, the 13.1 compiler
+  ran the hand-tuned standalone kernel **−25%** vs 12.9 (see the
+  inline-vs-standalone doc's live cu13 table). ACF tuning on 13.3 starts
+  from that worse baseline — it must first recover the regression before
+  beating the 12.9 default. Uncertain net win for the already-tight
+  standalone (1 BAR.SYNC, hand-scheduled).
+- **Whole-kernel, not surgical.** ACF controls bias ptxas globally; you
+  can't target "interleave these pipes in the softmax warp" specifically —
+  the softmax interleaving would improve only as a side effect of global
+  scheduling tuning.
+- Best target is the **softmax-bound modes (NVFP4+FP8, NVFP4+FP4 PV)** where
+  scheduling/ILP dominates, on B200/B300 (the FP4 kernel is sm_9x/10.x only
+  — it won't run on this sm_120 workstation card).
+
+**Verdict.** Plausible fit and worth a *bounded* experiment on the
+FP8/FP4-PV modes, but gated on (a) building the dump-PTX → ptxas-13.3
+`--apply-controls` → cubin-launch objective harness, and (b) the 13.x-ptxas
+regression risk. Not a drop-in: the DSL's in-process nvPTXCompiler means
+there's no zero-effort path like Triton's `ptx_options="--apply-controls"`.
+
 ## Other Findings
 
 - **e2e exp2 emulation hurts on SM103** (hardware exp2 already fast at
