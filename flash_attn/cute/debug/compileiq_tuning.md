@@ -5,8 +5,12 @@ to tune ptxas controls for our NVFP4+FP8 / NVFP4+BF16 / MXFP8+FP8 kernels —
 in particular to let ptxas interleave the softmax warp's different-pipe
 instructions (MUFU / FMA / cvt) better.
 
-**Bottom line: CompileIQ does not improve these kernels — verified three
-ways with real measurements on this GB300 box (GPU 1), DSL 4.5.2:**
+**Bottom line:** CompileIQ produces a **real but small (~0.9%) reproducible
+speedup** on a softmax-warp-style (MUFU/FMA cross-pipe) kernel via its curated
+**Helion booster pack** — but it **cannot be applied to the actual FA4
+kernels** (their cute-DSL load path is sealed), and the win is marginal
+because these kernels are pipe-throughput-bound (little scheduling headroom).
+Verified on this GB300 box (GPU 1), DSL 4.5.2, ptxas 13.3:
 
 1. **FA4 kernels can't be runtime-wired.** The cutlass-DSL load path is fully
    sealed (7 interception methods tested, all dead — table below) and its
@@ -15,16 +19,17 @@ ways with real measurements on this GB300 box (GPU 1), DSL 4.5.2:**
 2. **Static ACF search on the FA4 PTX** (28 evals, ptxas 13.3): no ACF beats
    the `-O3` default (best 2984 vs 2968 inst; registers launch-bounds-capped
    at 128 → CompileIQ's main lever removed; some ACFs add spills).
-3. **Real runtime ACF tuning on Triton proxies** (the only end-to-end-
-   tunable path — CompileIQ's first-class integration): no win.
-   - bandwidth-bound fused softmax: best **1.003×** (within noise);
-   - compute-bound multi-pipe kernel (independent exp+fma chains — the
-     faithful softmax-warp interleaving proxy): best **0.930×** (every ACF
-     *slower* than `-O3`).
+3. **Real runtime ACF tuning on Triton proxies** (the only end-to-end-tunable
+   path — CompileIQ's first-class integration):
+   - random `PtxasSearchSpace` search: no win (never tries the identity ACF);
+   - **curated Helion booster pack**: `fp8_group_quant_4` →
+     **1.0093× (−0.9%), reproducible** on the compute-bound exp+fma kernel
+     (0.4755 vs 0.4799 ms, 5 runs each, non-overlapping). The real win.
+   - memory-bound kernels (fused softmax, fp8 group-quant): ≈ noise — no
+     scheduling headroom.
 
-Across static FA4 codegen and real runtime on both a memory- and a
-compute-bound softmax-style kernel, the ptxas `-O3` default is at/near the
-scheduling optimum and ACF perturbations don't help (often hurt).
+So the lever exists and the booster pack finds it, but the gain is small here
+and the FA4 kernels themselves remain un-wireable.
 
 ## What CompileIQ does
 
@@ -131,6 +136,13 @@ throughput-bound, so ptxas scheduling has little headroom — but it confirms
 CompileIQ *can* improve a softmax-warp-style (MUFU/FMA cross-pipe) kernel,
 and that the curated booster pack beats a blind ptxas search. The win comes
 from a booster ACF, not the from-scratch search.
+
+I also built the **matched** FP8 group-quant kernel (`bench_fp8quant.py` —
+per-group amax → scale → e4m3 cvt → store, exactly FA4's P-quant shape, the
+workload the `fp8_group_quant_*` ACFs were tuned for): all ACFs land within
+noise of the 0.093 ms baseline. That kernel is memory-bound (read fp32, write
+fp8+scales), so ptxas scheduling has no headroom — the booster ACFs only help
+when the kernel is actually compute/scheduling-limited.
 
 ## Verdict & path forward
 
