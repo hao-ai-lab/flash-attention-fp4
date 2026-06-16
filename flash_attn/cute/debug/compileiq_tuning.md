@@ -149,10 +149,18 @@ when the kernel is actually compute/scheduling-limited.
 1. **Only ptxas 13.3 has `--apply-controls`.** Verified directly: ptxas 13.0
    and 13.2 don't even expose the flag (and 13.2 errors "not in expected
    format" on a real ACF); only 13.3 accepts it.
-2. **The DSL's nvPTXCompiler maxes at 13.1.** It compiles PTX→SASS in-process
-   via a *statically linked* nvPTXCompiler — 12.9 (base libs) or **13.1**
-   (`[cu13]` libs, the newest available, 4.5.2). 13.1 < 13.3 → can't apply an
-   ACF even though the DSL *does* forward `ptxas_options` to it.
+2. **The DSL's nvPTXCompiler maxes at 13.1, which silently ignores ACFs —
+   directly tested on the real FA4 kernel.** It compiles PTX→SASS in-process
+   via a *statically linked* nvPTXCompiler: 12.9 (base) or **13.1** (`[cu13]`,
+   newest, 4.5.2). The DSL *does* forward `ptxas_options` to it (verified:
+   injecting `--apply-controls=<acf>` via `PtxasOptions`/`ptx-options` into the
+   real NVFP4+FP8 compile on cu13 raises **no error** and runs correctly).
+   But it's a no-op: the real kernel's latency is **identical (6.30 ms / 2093
+   TF) across no-ACF and 3 different ACFs**, including `fp8_group_quant_5`
+   which is 9% *slower* on a proxy — so 13.1 accepts the flag but silently
+   ignores the 13.3-format ACF (the 13.2 *binary* rejects it outright as "not
+   in expected format"). ACF support is genuinely 13.3-only, and no
+   13.3 nvPTXCompiler is available to the DSL.
 3. **The compiled-cubin load is sealed.** 7 interception methods all fail
    (table above) — no way to swap in an externally ptxas-13.3-built cubin.
 4. **Disk-cache `.o` swap doesn't work.** The FA cache doesn't populate a
