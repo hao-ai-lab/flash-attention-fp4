@@ -362,9 +362,19 @@ with the SF machinery rather than with element width.
 ### Found along the way: block-scaled PV read K-tile 0's SFs for every K-tile
 
 `gemm_ptx_partial_fp4`'s TMEM-A path computed per-K-tile scale-factor
-offsets with `find_tmem_tensor_col_offset` on a *sliced* SF tensor — the
-slice layout is k-independent, so `offset_sfa/offset_sfb` were always
-all-zero and every K-tile of the PV MMA read K-tile 0's SFs. NVFP4 PV
+offsets with `find_tmem_tensor_col_offset(tScaleA[None, None, k])`. The
+catch: slicing `[None, None, k]` *fixes* the MMA_K coordinate and folds
+`k * stride_k` into the tensor's **iterator base address**, dropping the
+MMA_K mode from the resulting `.layout` entirely — so the slice layout is
+**byte-identical for every k** (verified: `slice[:,:,0]` and `slice[:,:,1]`
+print the same layout). `find_tmem_tensor_col_offset` reads **only**
+`.layout` (`cosize(layout) & 0xFFFF`), never the iterator base, so it
+returns the same column span for every k and `offset_sfa[k] = col(k) -
+col(0) = 0` for all k. The real per-tile stride is there — the full
+(unsliced) layout has `stride 16` on MMA_K, i.e. `crd2idx((0,0,k))` steps
++16 columns — but slicing had hidden it in the base pointer that the
+helper ignores. Result: `offset_sfa/offset_sfb` were always all-zero and
+every K-tile of the PV MMA read K-tile 0's SFs. NVFP4 PV
 (vec16: SFs step whole tmem columns) silently lost half its V/P scale
 factors — fixing it improved FP4 PV accuracy **0.0146 → 0.0039** mean_abs.
 MXFP8 PV (vec32) was completely broken: its 4 per-tile SFs live in the 4
