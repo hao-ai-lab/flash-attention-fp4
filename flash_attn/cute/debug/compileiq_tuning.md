@@ -112,13 +112,25 @@ CUDA), `do_bench` latency = objective. Scripts: `agent_space/bench_softmax.py`,
 | fused softmax (bandwidth-bound) | 0.0484 ms | 0.0483 ms | **1.003×** (noise) | 0.0556 ms |
 | 4× independent exp+fma chains (compute-bound, register-resident — faithful proxy for the FA4 softmax warp's MUFU/FMA cross-pipe interleaving) | 0.4792 ms | 0.5152 ms | **0.930×** | 0.5639 ms |
 
-On the compute-bound kernel — the case where ptxas instruction
-scheduling/interleaving *should* matter most — **every** ACF was slower than
-the plain `-O3` default (best 0.93×, i.e. −7%). So the runtime objective
-confirms the static result: ptxas's default scheduling already interleaves
-the MUFU/FMA pipes near-optimally for these kernels, and the ACF search only
-perturbs it unfavorably. The softmax-cross-pipe-interleaving idea does not
-yield a speedup via CompileIQ here.
+On the compute-bound kernel the *random* `PtxasSearchSpace` search found
+nothing (it never tries the identity ACF, only perturbations). But the
+curated **Helion Booster Pack** (24 pre-validated ACFs) *does* contain a
+winner:
+
+| ACF | compute kernel latency | vs `-O3` 0.4799 ms |
+|---|---|---|
+| `-O3` baseline (no ACF) | 0.4799 ± 0.0001 ms | — |
+| **`fp8_group_quant_4`** | **0.4755 ± 0.0001 ms** | **1.0093× (−0.9%)** |
+| `chunk_fwd_o_4` | 0.4757 ms | 1.009× |
+| (18 others) | ~0.479 ms | ≈ noise |
+| `fp8_group_quant_5` | 0.525 ms | 0.91× (worse) |
+
+`fp8_group_quant_4` is a **real, reproducible** ~0.9% speedup (5 runs each,
+tight non-overlapping distributions). It's small — this kernel is MUFU-
+throughput-bound, so ptxas scheduling has little headroom — but it confirms
+CompileIQ *can* improve a softmax-warp-style (MUFU/FMA cross-pipe) kernel,
+and that the curated booster pack beats a blind ptxas search. The win comes
+from a booster ACF, not the from-scratch search.
 
 ## Verdict & path forward
 
