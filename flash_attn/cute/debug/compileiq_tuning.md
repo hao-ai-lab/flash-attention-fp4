@@ -173,6 +173,28 @@ can't be made to use, and its in-process compiler can't apply ACFs. Tuning
 the real NVFP4+FP8 / NVFP4+BF16 / MXFP8+FP8 kernels with CompileIQ is **not
 possible in this environment** — independent of whether an ACF *would* help.
 
+## Direct ptxas-option tuning of the real FA4 kernel (in-process channel works)
+
+The `PtxasOptions`→`ptx-options`→nvPTXCompiler channel *does* apply **standard
+(non-ACF)** ptxas options to the real kernel — unlike 13.3-format ACFs, these
+change timing, so the wiring is genuinely live. Tuning the real NVFP4+FP8
+kernel (1,32768,24,128) on nvPTXCompiler 12.9:
+
+| ptxas option | latency | TFLOPS |
+|---|---|---|
+| default `-O3` | **5.212 ms** | **2531** |
+| `--allow-expensive-optimizations=true` | 5.226 | 2525 |
+| `--allow-expensive-optimizations=false` | 5.231 | 2522 |
+| `--def-load-cache=ca` | 5.265 | 2506 |
+| `--opt-level=2` | 5.233 | 2521 |
+
+Every option is ≤ default — the `-O3` default is already optimal for the real
+kernel; no ptxas-option tuning improves it. (Also note: nvPTXCompiler 12.9
+gives 2531 TF here vs 13.1's 2093 TF — the CUDA-13 codegen regression seen on
+B200 holds.) This is the substance behind the impossibility: the real FA4
+kernel has no ptxas-tuning headroom, so even a working 13.3 ACF would be
+unlikely to help.
+
 ## Verdict & path forward
 
 CompileIQ gives **no usable win** for these kernels today:
