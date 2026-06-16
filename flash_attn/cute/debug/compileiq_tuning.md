@@ -144,17 +144,35 @@ noise of the 0.093 ms baseline. That kernel is memory-bound (read fp32, write
 fp8+scales), so ptxas scheduling has no headroom — the booster ACFs only help
 when the kernel is actually compute/scheduling-limited.
 
+## Why the *actual* FA4 kernels can't be ACF-tuned here (5 proven blockers)
+
+1. **Only ptxas 13.3 has `--apply-controls`.** Verified directly: ptxas 13.0
+   and 13.2 don't even expose the flag (and 13.2 errors "not in expected
+   format" on a real ACF); only 13.3 accepts it.
+2. **The DSL's nvPTXCompiler maxes at 13.1.** It compiles PTX→SASS in-process
+   via a *statically linked* nvPTXCompiler — 12.9 (base libs) or **13.1**
+   (`[cu13]` libs, the newest available, 4.5.2). 13.1 < 13.3 → can't apply an
+   ACF even though the DSL *does* forward `ptxas_options` to it.
+3. **The compiled-cubin load is sealed.** 7 interception methods all fail
+   (table above) — no way to swap in an externally ptxas-13.3-built cubin.
+4. **Disk-cache `.o` swap doesn't work.** The FA cache doesn't populate a
+   standalone swappable cubin (`.o` is a pickled JIT fn; DSL cache empty).
+5. **A standalone launcher is infeasible** — the kernel `.entry` has 19
+   params incl. packed CuTe descriptor blobs (ABI can't be rebuilt by hand).
+
+So: the only ACF-capable compiler (ptxas 13.3) is a standalone binary the DSL
+can't be made to use, and its in-process compiler can't apply ACFs. Tuning
+the real NVFP4+FP8 / NVFP4+BF16 / MXFP8+FP8 kernels with CompileIQ is **not
+possible in this environment** — independent of whether an ACF *would* help.
+
 ## Verdict & path forward
 
-CompileIQ gives **no win** for these kernels today, on two independent
-grounds:
-- **Mechanism**: the FA4 cute-DSL kernel is un-wireable for runtime tuning
-  (sealed native load, nvPTXCompiler < 13.3).
-- **Substance**: even where CompileIQ *can* run a real runtime loop (Triton
-  proxies, incl. a compute-bound MUFU/FMA cross-pipe kernel) it finds no
-  speedup — ptxas `-O3` already schedules these near-optimally and ACFs only
-  regress them. The static FA4-PTX search agrees (no improvement, regs
-  capped).
+CompileIQ gives **no usable win** for these kernels today:
+- **The real kernels are unreachable** (5 blockers above) — can't apply an ACF.
+- **The proxy evidence is marginal**: on runnable Triton proxies, the curated
+  booster pack gives at most ~0.9% (compute-bound MUFU/FMA kernel) and ≈noise
+  on memory-bound ones; the static FA4-PTX search finds nothing over `-O3`
+  (regs capped). ptxas `-O3` already schedules these near-optimally.
 
 So CompileIQ is not the lever for the softmax-warp interleaving here. If we
 still wanted to *try* it on the real FA4 kernel (e.g. on a future bigger/
