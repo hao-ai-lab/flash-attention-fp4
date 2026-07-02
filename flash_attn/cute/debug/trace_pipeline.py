@@ -106,45 +106,35 @@ def summarize(spans_by_bg, block):
             print(f"  {nm:12s} n={cnt:5d} total={tot:9d} cy ({100.0*tot/total_window:5.1f}%) mean={tot/cnt:7.1f} cy")
 
 
-def step_stats(spans_by_bg, block):
-    """Average cycles of one softmax step and one MMA step (QK+PV) at block.
+def stage_totals(spans_by_bg, block):
+    """Per-stage softmax compute: the mean per-K-block softmax compute cycles
+    (one 128x128x128 stage == one K-step == one QK + one softmax + one PV).
+    Reporting per-step (not a sum) makes it comparable across PV modes — the
+    smem-buffered trace captures a fixed event count, so different modes capture
+    different step counts. softmax compute = the non-wait spans of the busier WG
+    divided by that WG's number of steps (its wait-S count).
 
-    Softmax step = median gap between consecutive wait-S starts (per WG,
-    averaged over both WGs); its busy part = mean per-step non-wait time.
-    MMA step (QK+PV) = mean QK span + mean PV span (one stage's GEMM pair;
-    the PV span includes the embedded P2 wait). MMA wait-P = mean stall
-    before each PV.
+    EXCLUDES the P-store (EVT_SOFTMAX_STORE_P): it is not compute (it has its own
+    "P store + signal" legend entry), and including it masks the real F2FP-cast
+    cost — fp8's pricier e4m3 cast (2x bf16's, exponent rebias + saturate) is
+    almost exactly cancelled by its cheaper 8-bit P-store (half bf16's TMEM
+    traffic), so summing them falsely reads bf16 == fp8.
     """
-    import statistics
+    compute = (fa4_prof.EVT_SOFTMAX_EXP, fa4_prof.EVT_SOFTMAX_QUANT,
+               fa4_prof.EVT_SOFTMAX_ROWMAX)
 
-    sm_periods, sm_busys = [], []
-    for grp in (fa4_prof.GRP_SOFTMAX0, fa4_prof.GRP_SOFTMAX1):
-        spans = spans_by_bg.get((block, grp), [])
-        starts = [s["start"] for s in spans if s["event_idx"] == fa4_prof.EVT_SOFTMAX_WAIT_S]
-        if len(starts) > 1:
-            sm_periods.append(statistics.median(
-                b - a for a, b in zip(starts, starts[1:])
-            ))
-        waits = (fa4_prof.EVT_SOFTMAX_WAIT_S, fa4_prof.EVT_SOFTMAX_WAIT_CORR)
-        busy = sum(s["end"] - s["start"] for s in spans if s["event_idx"] not in waits)
-        if starts:
-            sm_busys.append(busy / len(starts))
+    def _per_step(g):
+        spans = spans_by_bg.get((block, g), [])
+        nsteps = sum(1 for s in spans if s["event_idx"] == fa4_prof.EVT_SOFTMAX_WAIT_S)
+        busy = sum(s["end"] - s["start"] for s in spans if s["event_idx"] in compute)
+        return busy / nsteps if nsteps else 0.0
 
-    mma = spans_by_bg.get((block, fa4_prof.GRP_MMA), [])
-    def _mean(evt):
-        d = [s["end"] - s["start"] for s in mma if s["event_idx"] == evt]
-        return sum(d) / len(d) if d else 0.0
-
-    return {
-        "softmax_period": sum(sm_periods) / len(sm_periods) if sm_periods else 0.0,
-        "softmax_busy": sum(sm_busys) / len(sm_busys) if sm_busys else 0.0,
-        "mma_qk_pv": _mean(fa4_prof.EVT_QK_GEMM) + _mean(fa4_prof.EVT_PV_GEMM),
-        "mma_wait_p": _mean(fa4_prof.EVT_MMA_WAIT_P),
-    }
+    softmax = max(_per_step(fa4_prof.GRP_SOFTMAX0), _per_step(fa4_prof.GRP_SOFTMAX1))
+    return {"softmax": softmax}
 
 
 def render(spans_by_bg, block, output_path, title, start_iter, num_iters,
-           pv_mode="bf16"):
+           pv_mode="bf16", tile_str="128×128×128"):
     rows = [
         (fa4_prof.GRP_MMA, "MMA warp"),
         (fa4_prof.GRP_SOFTMAX0, "Softmax WG0"),
@@ -238,7 +228,7 @@ def render(spans_by_bg, block, output_path, title, start_iter, num_iters,
                     label = quant_label
                 elif not detail:
                     # Coarse trace: one combined compute span per step.
-                    label = "smax"
+                    label = "sfm"
                 n = counters[evt]
                 glob = 2 * (n - 1) + (1 if grp == fa4_prof.GRP_SOFTMAX0 else 2)
                 label = f"{label}{glob}"
@@ -280,15 +270,14 @@ def render(spans_by_bg, block, output_path, title, start_iter, num_iters,
     axes[-1].set_xlabel("Cycles (%clock, same SM)")
     fig.suptitle(title, fontsize=12, fontweight="bold", y=1.02)
 
-    # Average step costs measured over the whole trace (not just the window).
-    st = step_stats(spans_by_bg, block)
+    # Whole-stage tensor-core totals: summed QK and PV GEMM spans over the full
+    # K-loop. PV scales with operand precision (bf16 PV >> NVFP4 PV); QK is
+    # always NVFP4 so its total is ~flat. softmax total is the bottleneck.
+    tot = stage_totals(spans_by_bg, block)
     fig.text(
-        0.5, 0.965,
-        f"avg per step — softmax: {st['softmax_period']:,.0f} cy "
-        f"(busy {st['softmax_busy']:,.0f} cy)  ·  "
-        f"MMA QK+PV GEMM: {st['mma_qk_pv']:,.0f} cy  ·  "
-        f"MMA wait-P: {st['mma_wait_p']:,.0f} cy",
-        ha="center", fontsize=10, color="#333333",
+        0.5, 0.95,
+        f"per stage ({tile_str}) — softmax compute: {tot['softmax']:,.0f} cy / K-step",
+        ha="center", fontsize=11, color="#333333",
     )
 
     if detail:
@@ -337,6 +326,8 @@ def main():
     p.add_argument("--seqlen", type=int, default=4096)
     p.add_argument("--nheads", type=int, default=24)
     p.add_argument("--headdim", type=int, default=128)
+    p.add_argument("--m_block", type=int, default=128, help="m_block_size (Q tile)")
+    p.add_argument("--n_block", type=int, default=128, help="n_block_size (K tile)")
     p.add_argument("--block", type=int, default=0, help="CTA to visualize")
     p.add_argument("--start-iter", type=int, default=0,
                    help="first softmax iteration of the window")
@@ -364,6 +355,9 @@ def main():
         f"pipeline_trace_{args.pv_mode}{suffix}.png",
     )
     os.makedirs(os.path.dirname(out), exist_ok=True)
+    # MMA tile per K-block step: QK is (m_block, n_block, head_dim_qk), PV is
+    # (m_block, head_dim_v, n_block); both 128×128×128 with the FA4 defaults.
+    tile_str = f"{args.m_block}×{args.n_block}×{args.headdim}"
     render(
         spans, args.block, out,
         title=(
@@ -373,7 +367,7 @@ def main():
             f"block {args.block} (GB300)"
         ),
         start_iter=args.start_iter, num_iters=args.num_iters,
-        pv_mode=args.pv_mode,
+        pv_mode=args.pv_mode, tile_str=tile_str,
     )
 
 

@@ -217,3 +217,85 @@ more-scheduling-sensitive kernel), the wireup needs one of:
 
 Given the substance result (no speedup even on the runnable proxies), none of
 these is worth building right now — the payoff would very likely be ~0.
+
+### Addendum: no version-matched ACF exists
+
+A last attempt to close the version gap from the CompileIQ side: the DSL's
+nvPTXCompiler accepts `--apply-controls` on cu13 (13.1) but silently ignores
+the 13.3-format ACFs. The fix would be to generate a **13.1-format** ACF via
+`PtxasSearchSpace(version="13.1")`. But CompileIQ's manifest ships **only** a
+13.3 search space — querying 12.9/13.0/13.1/13.2 all raise
+`LookupError: No manifest entry`. So there is no ACF format that CompileIQ can
+emit *and* the DSL's linked compiler can apply. This independently confirms
+blocker #2: the only path is a DSL whose nvPTXCompiler is ≥13.3.
+
+## Update (2026-06-16): found a ≥13.3 DSL build, but it regresses + still can't apply ACFs
+
+Pursued path-forward #2 directly: **is there a cutlass-DSL build whose
+nvPTXCompiler is ≥13.3 that doesn't regress the TFLOPS table?**
+
+**The only ≥13.3 build is `nvidia-cutlass-dsl==4.6.0.dev0`** (and its
+`-libs-cu13==4.6.0.dev0`), whose `_cutlass_ir.cu13` static compiler is
+`Build cuda_13.3.r13.3` → **libnvptxcompiler V13.3.27**. All released
+versions (4.4.x–4.5.2) top out at 13.1 on cu13 / 12.9 on base. No 13.2/13.3
+search-space-matched stable exists.
+
+### FA4 frontend compat for 4.6.0.dev0 (4 aliases + 2 enums, source-free)
+
+4.6 renamed/moved a handful of `cute` symbols; FA4 (+ quack) were built
+against 4.5.x. A pure runtime shim (no kernel-source edits) covers all of it —
+`agent_space`-style shim imported before `flash_attn`:
+- `cute.core.ThrMma`, `cute.core.ThrCopy` → top-level `cute.ThrMma`/`ThrCopy`
+  (moved to `cute.atom`).
+- `cute.make_fragment(shape,dtype)` → `cute.make_rmem_tensor` (identical sig).
+- `cute.recast(src,dtype)` → `cute.recast_tensor` (identical sig).
+- `cute.arch.ProxyKind.async_shared` / `SharedSpace.shared_cta` → string
+  literals `"async.shared"` / `"cta"` (4.6 `fence_proxy` is string-based;
+  `tile_scheduler.py` already uses that form, only `flash_fwd_sm100_fp4.py`
+  used the old enums).
+
+With that shim the full FP4 forward path compiles and runs correctly on 13.3.
+
+### Raw 13.3 regresses the entire table 11–21% (GB300, GPU 1)
+
+| mode / seqlen | 12.9 (4.5.2) TF | 13.3 (4.6.0.dev0) TF | Δ |
+|---|---|---|---|
+| fp8 4096   | 2055 | 1679 | −18% |
+| fp8 8192   | 2283 | 1798 | −21% |
+| fp8 32768  | 2514 | 2096 | −17% |
+| bf16 4096  | 1968 | 1669 | −15% |
+| bf16 8192  | 2049 | 1742 | −15% |
+| bf16 32768 | 2187 | 1933 | −12% |
+| mxfp8 4096 | 1357 | 1178 | −13% |
+| mxfp8 8192 | 1461 | 1254 | −14% |
+| mxfp8 32768| 1809 | 1607 | −11% |
+
+Same direction/magnitude as the earlier 13.1 regression — CUDA-13 nvptx
+codegen is simply worse than 12.9 for these kernels by default.
+
+### …and the 13.3 in-process compiler *still* can't apply ACFs
+
+The whole reason to want 13.3 was to apply CompileIQ ACFs in-process. It
+doesn't work, for two independent reasons proven on this box:
+1. **The embedded libnvptxcompiler V13.3.27 rejects `--apply-controls`.**
+   Delivered via the only channel that reaches the compiler
+   (`CUTE_DSL_COMPILER_OPT="ptx-options=…"`), every dash-count fails with
+   `ptxas fatal : Unknown option '…apply-controls'`. The `.so` *contains* the
+   `apply-controls` strings (incl. `--apply-controls is not supported on this
+   target`) but the option parser refuses it. (The `CompileOptions.__init__`
+   monkeypatch is a no-op — the default `cute.compile` callable is built at
+   import, before any patch; `-O0` vs `-O3` through it produced identical
+   cubins. Only the env channel reaches the compiler.)
+2. **By contrast the standalone ptxas 13.3.33 *binary* applies ACFs fine on
+   sm_103a** — dumped FA4 PTX + `ptxas --apply-controls=<acf>` yields a
+   different cubin (`fc5ff3c4` vs no-acf `fc0c2d5b`). So the feature works in
+   the binary, just not in the DSL's statically-linked 13.3.27 library.
+
+**Verdict:** no available ≥13.3 cutlass-DSL build satisfies "≥13.3 without
+regression": 4.6.0.dev0 regresses 11–21% *and* its embedded compiler can't
+apply ACFs to recover. Environment restored to 4.5.2 / cu12.9 (baseline TFLOPS
+reproduced). The genuine path forward is unchanged and now sharper:
+a cutlass-DSL release that (a) statically links nvptxcompiler **≥13.3.33 with
+apply-controls enabled for sm_103a**, *and* (b) doesn't regress default
+codegen — or a DSL hook that shells out to the standalone ptxas 13.3.33 binary
+(which already works) for the PTX→cubin step.

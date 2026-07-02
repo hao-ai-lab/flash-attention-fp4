@@ -415,9 +415,11 @@ def gemm_ptx_partial(
     tA_addr: Optional[Int32] = None,
     cta_group: int = 1,
     pre_mbar_tiles: Optional[cutlass.Constexpr[int]] = None,
-    # (ts_addr_begin, ts_addr_end): global addresses where %clock is stored
-    # right before / after the embedded mbarrier wait (pipeline tracing).
+    # (ts_addr_begin, ts_addr_end): addresses where %clock is stored right
+    # before / after the embedded mbarrier wait (pipeline tracing).
     prof_ts_addrs: Optional[tuple] = None,
+    # When True the ts addresses are in shared memory: cvta.to.shared + st.shared.
+    prof_ts_smem: cutlass.Constexpr[bool] = False,
 ) -> None:
     # acc_tmem_addr += acc_offset
     is_ts = op.a_src == cute.nvgpu.tcgen05.OperandSource.TMEM
@@ -556,18 +558,32 @@ def gemm_ptx_partial(
                 # measured wait window instead of an estimate.
                 input_args.append(Int64(prof_ts_addrs[0]).ir_value())
                 input_args.append(Int64(prof_ts_addrs[1]).ir_value())
+                if const_expr(prof_ts_smem):
+                    _ts_store = (
+                        ".reg .u64 prof_sb; \n\t"
+                        ".reg .u64 prof_se; \n\t"
+                        "cvta.to.shared.u64 prof_sb, $6; \n\t"
+                        "cvta.to.shared.u64 prof_se, $7; \n\t"
+                    )
+                    _ts_b = "@leader_thread st.shared.u32 [prof_sb], prof_clk; \n\t"
+                    _ts_e = "@leader_thread st.shared.u32 [prof_se], prof_clk; \n\t"
+                else:
+                    _ts_store = ""
+                    _ts_b = "@leader_thread st.global.u32 [$6], prof_clk; \n\t"
+                    _ts_e = "@leader_thread st.global.u32 [$7], prof_clk; \n\t"
                 mbar_wait_str = (
                     ".reg .pred P1; \n\t"
                     ".reg .b32 prof_clk; \n\t"
+                    + _ts_store +
                     "mov.u32 prof_clk, %clock; \n\t"
-                    "@leader_thread st.global.u32 [$6], prof_clk; \n\t"
+                    + _ts_b +
                     "LAB_WAIT: \n\t"
                     "mbarrier.try_wait.parity.shared::cta.b64 P1, [$4], $5, 10000000; \n\t"
                     "@P1 bra DONE; \n\t"
                     "bra     LAB_WAIT; \n\t"
                     "DONE: \n\t"
                     "mov.u32 prof_clk, %clock; \n\t"
-                    "@leader_thread st.global.u32 [$7], prof_clk; \n\t"
+                    + _ts_e
                 )
             else:
                 mbar_wait_str = (
@@ -1219,9 +1235,12 @@ def gemm_ptx_partial_fp4(
     zero_init: bool | Boolean = False,
     tA_addr: Optional[Int32] = None,
     pre_mbar_tiles: Optional[cutlass.Constexpr[int]] = None,
-    # (ts_addr_begin, ts_addr_end): global addresses where %clock is stored
-    # right before / after the embedded mbarrier wait (pipeline tracing).
+    # (ts_addr_begin, ts_addr_end): addresses where %clock is stored right
+    # before / after the embedded mbarrier wait (pipeline tracing).
     prof_ts_addrs: Optional[tuple] = None,
+    # When True the ts addresses are in shared memory: emit cvta.to.shared +
+    # st.shared instead of st.global (smem-buffered profiling).
+    prof_ts_smem: cutlass.Constexpr[bool] = False,
 ) -> None:
     is_ts = op.a_src == cute.nvgpu.tcgen05.OperandSource.TMEM
     if const_expr(not is_ts):
@@ -1409,18 +1428,34 @@ def gemm_ptx_partial_fp4(
                 # measured wait window instead of an estimate.
                 input_args.append(Int64(prof_ts_addrs[0]).ir_value())
                 input_args.append(Int64(prof_ts_addrs[1]).ir_value())
+                if const_expr(prof_ts_smem):
+                    # ts addresses are generic pointers into smem -> convert to
+                    # the shared window and store with st.shared.
+                    _ts_store = (
+                        ".reg .u64 prof_sb; \n\t"
+                        ".reg .u64 prof_se; \n\t"
+                        "cvta.to.shared.u64 prof_sb, $8; \n\t"
+                        "cvta.to.shared.u64 prof_se, $9; \n\t"
+                    )
+                    _ts_b = "@leader_thread st.shared.u32 [prof_sb], prof_clk; \n\t"
+                    _ts_e = "@leader_thread st.shared.u32 [prof_se], prof_clk; \n\t"
+                else:
+                    _ts_store = ""
+                    _ts_b = "@leader_thread st.global.u32 [$8], prof_clk; \n\t"
+                    _ts_e = "@leader_thread st.global.u32 [$9], prof_clk; \n\t"
                 mbar_wait_str = (
                     ".reg .pred P1; \n\t"
                     ".reg .b32 prof_clk; \n\t"
+                    + _ts_store +
                     "mov.u32 prof_clk, %clock; \n\t"
-                    "@leader_thread st.global.u32 [$8], prof_clk; \n\t"
+                    + _ts_b +
                     "LAB_WAIT: \n\t"
                     "mbarrier.try_wait.parity.shared::cta.b64 P1, [$6], $7, 10000000; \n\t"
                     "@P1 bra DONE; \n\t"
                     "bra     LAB_WAIT; \n\t"
                     "DONE: \n\t"
                     "mov.u32 prof_clk, %clock; \n\t"
-                    "@leader_thread st.global.u32 [$9], prof_clk; \n\t"
+                    + _ts_e
                 )
             else:
                 mbar_wait_str = (
@@ -1534,6 +1569,8 @@ def gemm_ptx_partial_fp8(
     zero_init: bool | Boolean = False,
     tA_addr: Optional[Int32] = None,
     pre_mbar_tiles: Optional[cutlass.Constexpr[int]] = None,
+    prof_ts_addrs: Optional[tuple] = None,
+    prof_ts_smem: cutlass.Constexpr[bool] = False,
 ) -> None:
     return gemm_ptx_partial_fp4(
         op,
@@ -1549,6 +1586,8 @@ def gemm_ptx_partial_fp8(
         zero_init=zero_init,
         tA_addr=tA_addr,
         pre_mbar_tiles=pre_mbar_tiles,
+        prof_ts_addrs=prof_ts_addrs,
+        prof_ts_smem=prof_ts_smem,
     )
 
 

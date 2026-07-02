@@ -82,6 +82,19 @@ def clock_lo(*, loc=None, ip=None) -> Int32:
     )
 
 
+@dsl_user_op
+def barrier_noop(*, loc=None, ip=None) -> None:
+    """An empty side-effecting asm: a pure scheduling barrier (ptxas can't
+    move instructions across it) with no clock read and no store. Used by
+    FA4_PROF_EMPTY to isolate the cost of *preventing compiler reordering*
+    from the clock-read and store costs."""
+    llvm.inline_asm(
+        None, [], "// prof barrier", "",
+        has_side_effects=True, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
 # ---------------------------------------------------------------------------
 # In-kernel trace recording (flashinfer-style, see flashinfer/profiler.cuh)
 #
@@ -120,11 +133,46 @@ def prof_record(
 ) -> Int32:
     """Record one event; returns the next slot counter (k + 1)."""
     if pred:
-        slot32 = 2 + 2 * (bg_index + k * stride)
-        if slot32 + 1 < cute.size(prof.shape):
-            prof[slot32] = tag_base | Int32((event_idx << 2) | event_type)
-            prof[slot32 + 1] = clock_lo()
+        # FA4_PROF_EMPTY: keep the per-call-site scheduling barrier but drop the
+        # clock read and the store — isolates the compiler-reorder-prevention cost.
+        if os.environ.get("FA4_PROF_EMPTY", "0") == "1":
+            barrier_noop()
+        else:
+            slot32 = 2 + 2 * (bg_index + k * stride)
+            if slot32 + 1 < cute.size(prof.shape):
+                prof[slot32] = tag_base | Int32((event_idx << 2) | event_type)
+                prof[slot32 + 1] = clock_lo()
     return k + 1
+
+
+@cute.jit
+def prof_flush(
+    smem_buf: cute.Tensor,
+    gmem_buf: cute.Tensor,
+    block_linear: Int32,
+    num_blocks: Int32,
+    num_groups: Int32,
+    group: Int32,
+    pred,
+):
+    """Copy one group's smem-buffered events to their global gmem slots so
+    decode_trace (which reads the gmem layout) works unchanged. Called once at
+    each warp's exit. Relies on the smem ring being zero-initialised: a zero
+    tag marks an unwritten slot and is skipped.
+
+    smem local slot for (group, j):  2 + 2*(group + j*num_groups)
+    gmem global slot for (block, group, j):
+        2 + 2*(block*num_groups + group + j*num_blocks*num_groups)
+    """
+    if pred:
+        for j in cutlass.range(PROF_SMEM_EVENTS_PER_GROUP):
+            ls = 2 + 2 * (group + j * num_groups)
+            tag = smem_buf[ls]
+            if tag != Int32(0):
+                gs = 2 + 2 * (block_linear * num_groups + group + j * num_blocks * num_groups)
+                if gs + 1 < cute.size(gmem_buf.shape):
+                    gmem_buf[gs] = tag
+                    gmem_buf[gs + 1] = smem_buf[ls + 1]
 
 
 @cute.jit
@@ -200,6 +248,24 @@ GROUP_NAMES = ["MMA warp", "Softmax WG0", "Softmax WG1", "Correction WG"]
 def is_profiling_enabled():
     """Check if trace-based profiling is enabled."""
     return os.environ.get("FA4_PROFILE_PIPELINE", "0") == "1"
+
+
+def is_smem_profiling():
+    """Buffer trace events in shared memory and flush once at kernel exit,
+    instead of one gmem store per event (which inflates runtime ~40-140%).
+    Holds ~one stage's events; the rest of the kernel runs uninstrumented.
+    Default ON — set FA4_PROF_SMEM=0 to compare against the gmem path."""
+    return os.environ.get("FA4_PROF_SMEM", "1") == "1"
+
+
+# Events buffered per (group) in the smem ring before recording stops. One
+# stage (~25-32 K-steps x ~5 events) fits; sized to stay within bf16's ~8KB
+# free smem: 2 + 2*NUM_GROUPS*EVENTS ints.
+PROF_SMEM_EVENTS_PER_GROUP = 128
+
+
+def prof_smem_capacity_ints(num_groups):
+    return 2 + 2 * num_groups * PROF_SMEM_EVENTS_PER_GROUP
 
 
 # Host-side handle to the buffer used by the most recent profiled kernel

@@ -1180,7 +1180,17 @@ class FlashAttentionForwardSm100:
                 cute.struct.MemRange[self.sf_dtype_pv, sfv_smem_size],
                 self.buffer_align_bytes,
             ]
-        
+            # In-kernel trace event ring (only when smem-buffered profiling is on;
+            # sized to 1 int otherwise so production builds pay no smem cost).
+            prof_smem: cute.struct.Align[
+                cute.struct.MemRange[
+                    Int32,
+                    fa4_prof.prof_smem_capacity_ints(fa4_prof.NUM_GROUPS)
+                    if (fa4_prof.is_profiling_enabled() and fa4_prof.is_smem_profiling()) else 1,
+                ],
+                16,
+            ]
+
         # Remove scale factors to avoid OOM. Seems I can't set their size to 0
         @cute.struct
         class SharedStorageBF16:
@@ -1415,6 +1425,20 @@ class FlashAttentionForwardSm100:
         storage = smem.allocate(self.shared_storage)
 
         mbar_ptr = storage.mbar_ptr.data_ptr()
+
+        # Smem-buffered trace ring: build a flat Int32 view and zero it (one
+        # warp) before recording. Flushed to gmem at each warp's exit. The
+        # init sync below (pipeline_kv ctor) orders the zero before any record.
+        prof_smem_tensor = None
+        if const_expr(mProfiler is not None and fa4_prof.is_smem_profiling()):
+            _prof_cap = fa4_prof.prof_smem_capacity_ints(fa4_prof.NUM_GROUPS)
+            prof_smem_tensor = storage.prof_smem.get_tensor(cute.make_layout(_prof_cap))
+            if warp_idx == 0:
+                for _i in cutlass.range(cute.ceil_div(_prof_cap, cute.arch.WARP_SIZE)):
+                    _idx = _i * cute.arch.WARP_SIZE + cute.arch.lane_idx()
+                    if _idx < _prof_cap:
+                        prof_smem_tensor[_idx] = Int32(0)
+
         # Use the first N warps to initialize barriers
         if warp_idx == 1:
             # Init "full" barrier with number of producers, "empty" barrier with number of consumers
@@ -1771,13 +1795,10 @@ class FlashAttentionForwardSm100:
 
             prof_mma = None
             if const_expr(mProfiler is not None and not self.use_block_sparsity):
-                prof_mma = (
-                    mProfiler,
-                    prof_block * fa4_prof.NUM_GROUPS + fa4_prof.GRP_MMA,
-                    prof_stride,
-                    prof_tag_base,
-                    cute.arch.lane_idx() == 0,
-                )
+                if const_expr(fa4_prof.is_smem_profiling()):
+                    prof_mma = (prof_smem_tensor, fa4_prof.GRP_MMA, fa4_prof.NUM_GROUPS, prof_tag_base, cute.arch.lane_idx() == 0)
+                else:
+                    prof_mma = (mProfiler, prof_block * fa4_prof.NUM_GROUPS + fa4_prof.GRP_MMA, prof_stride, prof_tag_base, cute.arch.lane_idx() == 0)
             self.mma(
                 tiled_mma_qk,
                 tiled_mma_pv,
@@ -1804,6 +1825,9 @@ class FlashAttentionForwardSm100:
                 tCtSFVs,
                 prof=prof_mma,
             )
+            if const_expr(mProfiler is not None and fa4_prof.is_smem_profiling() and not self.use_block_sparsity):
+                fa4_prof.prof_flush(prof_smem_tensor, mProfiler, prof_block, prof_nblocks,
+                                    Int32(fa4_prof.NUM_GROUPS), fa4_prof.GRP_MMA, cute.arch.lane_idx() == 0)
 
             # if warp_idx == self.mma_warp_id:
             # dealloc tmem buffer
@@ -1867,13 +1891,10 @@ class FlashAttentionForwardSm100:
             def _prof_softmax(group):
                 if const_expr(mProfiler is None or self.use_block_sparsity):
                     return None
-                return (
-                    mProfiler,
-                    prof_block * fa4_prof.NUM_GROUPS + group,
-                    prof_stride,
-                    prof_tag_base,
-                    cute.arch.thread_idx()[0] % 128 == 0,
-                )
+                _pred = cute.arch.thread_idx()[0] % 128 == 0
+                if const_expr(fa4_prof.is_smem_profiling()):
+                    return (prof_smem_tensor, group, fa4_prof.NUM_GROUPS, prof_tag_base, _pred)
+                return (mProfiler, prof_block * fa4_prof.NUM_GROUPS + group, prof_stride, prof_tag_base, _pred)
 
             if const_expr(not self.s0_s1_barrier):
                 stage = Int32(0 if warp_idx < self.softmax1_warp_ids[0] else 1)
@@ -1891,16 +1912,25 @@ class FlashAttentionForwardSm100:
                     tCtSFP=tCtSFP, # need to copy P sf to tmem after exp
                     prof=_prof_softmax(1 + stage),
                 )
+                if const_expr(mProfiler is not None and fa4_prof.is_smem_profiling() and not self.use_block_sparsity):
+                    fa4_prof.prof_flush(prof_smem_tensor, mProfiler, prof_block, prof_nblocks,
+                                        Int32(fa4_prof.NUM_GROUPS), Int32(1) + stage, cute.arch.thread_idx()[0] % 128 == 0)
                 cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_tmem_dealloc_offset)
             else:
                 # If there's s0_s1_barrier, it's faster to have 2 WGs having different code
                 if warp_idx < self.softmax1_warp_ids[0]:
                     tStSi = cute.make_tensor(tStS.iterator + self.tmem_s_offset[0], tStS.layout)
                     softmax_loop(stage=0, tStSi=tStSi, tCtSFP=tCtSFPs[0], prof=_prof_softmax(1))
+                    if const_expr(mProfiler is not None and fa4_prof.is_smem_profiling() and not self.use_block_sparsity):
+                        fa4_prof.prof_flush(prof_smem_tensor, mProfiler, prof_block, prof_nblocks,
+                                            Int32(fa4_prof.NUM_GROUPS), Int32(1), cute.arch.thread_idx()[0] % 128 == 0)
                     cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_tmem_dealloc_offset)
                 if warp_idx < self.correction_warp_ids[0] and warp_idx >= self.softmax1_warp_ids[0]:
                     tStSi = cute.make_tensor(tStS.iterator + self.tmem_s_offset[1], tStS.layout)
                     softmax_loop(stage=1, tStSi=tStSi, tCtSFP=tCtSFPs[1], prof=_prof_softmax(2))
+                    if const_expr(mProfiler is not None and fa4_prof.is_smem_profiling() and not self.use_block_sparsity):
+                        fa4_prof.prof_flush(prof_smem_tensor, mProfiler, prof_block, prof_nblocks,
+                                            Int32(fa4_prof.NUM_GROUPS), Int32(2), cute.arch.thread_idx()[0] % 128 == 0)
                     cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_tmem_dealloc_offset)
 
         # ///////////////////////////////////////////////////////////////////////////////
@@ -2515,7 +2545,8 @@ class FlashAttentionForwardSm100:
                         if const_expr(prof is not None):
                             prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_PV_GEMM, fa4_prof.EVENT_BEGIN, prof_pred)
                             # The PV issue sequence embeds a wait for P's 2nd
-                            # half; the GEMM's PTX stores %clock around it.
+                            # half; the GEMM's PTX stores %clock around it
+                            # (st.shared when the buffer is in smem).
                             prof_k, _pts_b, _pts_e = fa4_prof.prof_reserve_pair_ts(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_PV_WAIT_P2, prof_pred)
                             gemm_Pi[stage](
                                 tCrB=tOrVi,
@@ -2524,6 +2555,7 @@ class FlashAttentionForwardSm100:
                                 mbar_ptr=mbar_ptr + self.mbar_P_full_2_offset + stage,
                                 mbar_phase=P_full_O_rescaled_phase,
                                 prof_ts_addrs=(_pts_b, _pts_e),
+                                prof_ts_smem=fa4_prof.is_smem_profiling(),
                             )
                             prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_PV_GEMM, fa4_prof.EVENT_END, prof_pred)
                         else:
@@ -2659,6 +2691,7 @@ class FlashAttentionForwardSm100:
                             mbar_ptr=mbar_ptr + self.mbar_P_full_2_offset + stage,
                             mbar_phase=P_full_O_rescaled_phase,
                             prof_ts_addrs=(_pts_b, _pts_e),
+                            prof_ts_smem=fa4_prof.is_smem_profiling(),
                         )
                         prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_PV_GEMM, fa4_prof.EVENT_END, prof_pred)
                     else:
