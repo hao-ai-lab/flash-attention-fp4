@@ -756,7 +756,13 @@ def main(
 
     # Benchmark configurations: (batch, seqlen, nheads, headdim)
     # Covers bench_fp4 defaults, video-gen (Wan2.1-1.3B: nheads=12, hdim=128), and larger models
-    configs = [
+    import os as _os
+    if _os.environ.get("FA4_BENCH_SEQS"):
+        configs = [(1, int(s), 24, 128) for s in _os.environ["FA4_BENCH_SEQS"].split(",")]
+    elif _os.environ.get("FA4_BENCH_H24_SWEEP") == "1":
+        configs = [(1, s, 24, 128) for s in (1024, 2048, 4096, 8192, 16384, 32768)]
+    else:
+        configs = [
         # bench_fp4 defaults (nheads=16, headdim=128)
         (1, 256, 16, 128),
         (1, 1024, 16, 128),
@@ -770,7 +776,8 @@ def main(
         (1, 4096, 24, 128),
         (1, 32768, 24, 128),
     ]
-    if pv_mode not in ("fp4", "mxfp8") and sf_vec_size * 4 <= 64:
+    _cooldown = float(_os.environ.get("FA4_BENCH_COOLDOWN", "0"))
+    if pv_mode not in ("fp4", "mxfp8") and sf_vec_size * 4 <= 64 and not _os.environ.get("FA4_BENCH_H24_SWEEP") and not _os.environ.get("FA4_BENCH_SEQS"):
         # headdim=64 requires head_dim >= sf_vec_size*4 (block-scaled MMA atom K constraint).
         # MXFP8 (sf_vec_size=32) needs headdim >= 128; NVFP4 (sf_vec_size=16) supports d=64.
         configs.append((1, 32768, 24, 64))
@@ -793,6 +800,11 @@ def main(
         headdim_v = headdim
         seqlen_q = seqlen
         window_size = (None, None)
+
+        if _cooldown > 0:
+            import time as _time
+            torch.cuda.synchronize()
+            _time.sleep(_cooldown)  # let the GPU return to a consistent thermal/clock state
 
         print(f"\n### Batch={batch_size}, SeqLen={seqlen}, Nheads={nheads}, Headdim={headdim} ###")
 
