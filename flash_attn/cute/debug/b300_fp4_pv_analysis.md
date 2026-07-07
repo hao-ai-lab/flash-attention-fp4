@@ -565,16 +565,15 @@ quant, 3/4 FP8 P-split, MXFP8 PV, and the block-scaled-PV SF-stepping fix):
 | b=4 s=4096 h=32 d=128 | 2144 | **2224** | 1311 | 1254 | 1717 | 2090 | 1451 |
 | b=1 s=4096 h=12 d=128 | 1213 | **1256** | 832 | 846 | 1065 | 1217 | 947 |
 | b=1 s=32768 h=12 d=128 ¹ | 2262 | **2508** | 1646 | 1697 | 1991 | 2342 | 1616 |
-| b=1 s=4096 h=24 d=128 | 1494 | **1555** | 1118 | 1148 | 1363 | 1472 | 1228 |
-| b=1 s=32768 h=24 d=128 | 2176 | **2578** | 1726 | 1755 | 2025 | 2290 | 1524 |
+| b=1 s=4096 h=24 d=128 ³ | 1949 | **2046** | 1288 | 1360 | 1650 | 1974 | 1322 |
+| b=1 s=32768 h=24 d=128 ³ | 2235 | **2677** | 1722 | 1809 | 1960 | 2362 | 1533 |
 | b=1 s=32768 h=24 d=64 | **1209** | 1205 | — | — | — | — | 1201 |
 
-All values in TFLOPS. Peak: **NVFP4+FP8 2578 TF**, **MXFP8+FP8 2342 TF**,
-**NVFP4+BF16 2262 TF**, **MXFP8+BF16 2025 TF**, **NVFP4+MXFP8 1755 TF**,
-**NVFP4+NVFP4 1726 TF**. **—** = unsupported (d=64 needs head_dim >=
-sf_vec_size x 4: NVFP4 PV and MXFP8 require 128). Small shapes (s <= 1024)
-are launch-latency dominated. MXFP8+x columns are MXFP8 QK (sf_vec 32,
-E8M0) with BF16/plain-FP8 PV; NVFP4+MXFP8 is NVFP4 QK with the new MXFP8
+All values in **TFLOPS**. Peak: **NVFP4+FP8 2677 TF**, **MXFP8+FP8 2362 TF**,
+**NVFP4+BF16 2262 TF**, **MXFP8+BF16 1991 TF**, **NVFP4+MXFP8 1809 TF**,
+**NVFP4+NVFP4 1722 TF**. **—** = unsupported (d=64 needs head_dim >=
+sf_vec_size x 4: NVFP4 PV and MXFP8 require 128). MXFP8+x columns are MXFP8 QK GEMM (sf_vec 32,
+E8M0) with BF16/plain-FP8 PV GEMM; NVFP4+MXFP8 is NVFP4 QK with the new MXFP8
 PV (E4M3 P/V, E8M0 SFs per 32) — slowest-but-most-accurate of the
 quantized-PV modes (mean_abs 0.0029 vs FP8 PV's 0.0040, FP4 PV's 0.0039).
 
@@ -584,3 +583,19 @@ quantized-PV modes (mean_abs 0.0029 vs FP8 PV's 0.0040, FP4 PV's 0.0039).
 (`flash_fwd_sm100.py`), and it too uses the SM103 ld.red fused S-load+row-max
 (`FA4_LDRED_ROWMAX`, default-on) — every column in this table includes it.
 The BF16-ref figures here are post-ld.red (~+1-4% over the pre-ld.red ref).
+
+³ **h=24 rows re-measured 2026-07 with a 15 s per-shape cooldown.** The original
+2026-06 sweep ran every shape back-to-back with **no sleep**, and h=24 is the
+*last* group in `bench_fp4`'s config list — so it ran on an already-hot GPU
+(after the long s=32768 h=16 and b=4 s=4096 h=32 shapes) and was **thermally
+throttled**, most on the short s=4096 kernel. This was NOT a slower kernel: the
+throttle is a measurement artifact of no cooldown. Confirmed by construction —
+running s=4096 h=24 immediately after 3× hot s=32768 reproduces ~1618 TF, vs
+~1949 cool/isolated (both at 2070 MHz idle; the throttle is transient during the
+short kernel's do_bench window). So the old s=4096 h=24 numbers were ~15-30% low
+(e.g. NVFP4+FP8 1555 → 2046) and s=32768 slightly low (2578 → 2677). Reproduce:
+`FA4_BENCH_H24_SWEEP=1 FA4_BENCH_COOLDOWN=15 python -m flash_attn.cute.benchmarks.bench_fp4 --qk_mode nvfp4 --pv_mode {bf16,fp8}`
+(+ `--qk_mode mxfp8 --pv_mode {bf16,fp8}`, `--pv_mode {fp4,mxfp8}`). The other
+rows (h=12/16/32) were also measured without cooldown, so they are likely
+similarly depressed — re-sweep with `FA4_BENCH_COOLDOWN` to refresh them too.
+See the h=24 sweep figure: `flash_attn/cute/figures/gb300_tflops_h24.png`.

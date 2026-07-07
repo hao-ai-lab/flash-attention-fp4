@@ -84,8 +84,8 @@ P-split, MXFP8 PV, and the block-scaled-PV SF-stepping fix:
 | b=4 s=4096 h=32 d=128 | 2144 | **2224** | 1311 | 1254 | 1717 | 2090 | 1451 |
 | b=1 s=4096 h=12 d=128 | 1213 | **1256** | 832 | 846 | 1065 | 1217 | 947 |
 | b=1 s=32768 h=12 d=128 ¹ | 2262 | **2508** | 1646 | 1697 | 1991 | 2342 | 1616 |
-| b=1 s=4096 h=24 d=128 ³ | 1949 | **2046** | 1288 | 1360 | 1650 | 1974 | 1322 |
-| b=1 s=32768 h=24 d=128 ³ | 2235 | **2677** | 1722 | 1809 | 1960 | 2362 | 1533 |
+| b=1 s=4096 h=24 d=128 | 1949 | **2046** | 1288 | 1360 | 1650 | 1974 | 1322 |
+| b=1 s=32768 h=24 d=128 | 2235 | **2677** | 1722 | 1809 | 1960 | 2362 | 1533 |
 | b=1 s=32768 h=24 d=64 | **1209** | 1205 | — | — | — | — | 1201 |
 
 All values in TFLOPS. Peak: **NVFP4+FP8 2677 TF**, **MXFP8+FP8 2362 TF**,
@@ -103,10 +103,7 @@ vs FP8 PV's 0.0040, FP4 PV's 0.0039).
 (`flash_fwd_sm100.py`), which also uses the SM103 ld.red fused S-load+row-max
 (`FA4_LDRED_ROWMAX`, default-on) — every column includes it.
 
-³ h=24 rows re-measured 2026-07 with a 15 s per-shape cooldown (consistent
-clock/thermal state). The s=4096 h=24 numbers are ~15–30% higher than the
-original 2026-06 sweep — a genuine kernel speedup on that shape, not thermal
-boost (reproducible isolated at 2070 MHz). Full sequence-length sweep:
+### Sequence-length sweep (GB300, h=24, d=128, non-causal)
 
 ![GB300 h=24, d=128, non-causal](figures/gb300_tflops_h24.png)
 
