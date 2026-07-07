@@ -552,26 +552,27 @@ python3 flash_attn/cute/debug/visualize_pipeline.py
 
 ## Results — PV Quantization (GB300)
 
-All block-scaled QK x PV combinations (triton `do_bench`, GB300,
-2026-06-12 — includes the ld.red row-max (incl. BF16 ref), log-domain FP4
-quant, 3/4 FP8 P-split, MXFP8 PV, and the block-scaled-PV SF-stepping fix):
+All block-scaled QK x PV combinations (triton `do_bench`, GB300, 2026-07,
+re-measured with a per-shape cooldown ³ — includes the ld.red row-max (incl.
+BF16 ref), log-domain FP4 quant, 3/4 FP8 P-split, MXFP8 PV, and the
+block-scaled-PV SF-stepping fix):
 
 | Config | NVFP4+BF16 | NVFP4+FP8 | NVFP4+NVFP4 | NVFP4+MXFP8 | MXFP8+BF16 | MXFP8+FP8 | BF16 ref ² |
 |--------|----|----|----|----|----|----|----|
-| b=1 s=256 h=16 d=128 | 13 | 11 | 10 | 12 | 9 | 10 | **17** |
-| b=1 s=1024 h=16 d=128 | 212 | 195 | 172 | 220 | 196 | 197 | **290** |
-| b=4 s=4096 h=16 d=128 | 2212 | **2501** | 1525 | 1617 | 1856 | 2294 | 1497 |
-| b=1 s=32768 h=16 d=128 | 2195 | **2448** | 1617 | 1691 | 1951 | 2333 | 1630 |
-| b=4 s=4096 h=32 d=128 | 2144 | **2224** | 1311 | 1254 | 1717 | 2090 | 1451 |
-| b=1 s=4096 h=12 d=128 | 1213 | **1256** | 832 | 846 | 1065 | 1217 | 947 |
-| b=1 s=32768 h=12 d=128 ¹ | 2262 | **2508** | 1646 | 1697 | 1991 | 2342 | 1616 |
-| b=1 s=4096 h=24 d=128 ³ | 1949 | **2046** | 1288 | 1360 | 1650 | 1974 | 1322 |
-| b=1 s=32768 h=24 d=128 ³ | 2235 | **2677** | 1722 | 1809 | 1960 | 2362 | 1533 |
-| b=1 s=32768 h=24 d=64 | **1209** | 1205 | — | — | — | — | 1201 |
+| b=1 s=256 h=16 d=128 | 13 | 11 | 12 | 12 | 11 | 12 | **17** |
+| b=1 s=1024 h=16 d=128 | 232 | 203 | 200 | 209 | 221 | 242 | **289** |
+| b=4 s=4096 h=16 d=128 | 2227 | **2502** | 1524 | 1612 | 1849 | 2291 | 1508 |
+| b=1 s=32768 h=16 d=128 | 2337 | **2666** | 1720 | 1807 | 2072 | 2383 | 1585 |
+| b=4 s=4096 h=32 d=128 | 2196 | **2540** | 1544 | 1638 | 1879 | 2290 | 1475 |
+| b=1 s=4096 h=12 d=128 | 1458 | **1458** | 942 | 987 | 1227 | 1418 | 1017 |
+| b=1 s=32768 h=12 d=128 ¹ | 2276 | **2582** | 1646 | 1726 | 2021 | 2350 | 1584 |
+| b=1 s=4096 h=24 d=128 | 1949 | **2046** | 1291 | 1360 | 1611 | 1974 | 1322 |
+| b=1 s=32768 h=24 d=128 | 2235 | **2677** | 1725 | 1809 | 1974 | 2362 | 1533 |
+| b=1 s=32768 h=24 d=64 | 1209 | 1203 | — | — | — | — | **1221** |
 
-All values in **TFLOPS**. Peak: **NVFP4+FP8 2677 TF**, **MXFP8+FP8 2362 TF**,
-**NVFP4+BF16 2262 TF**, **MXFP8+BF16 1991 TF**, **NVFP4+MXFP8 1809 TF**,
-**NVFP4+NVFP4 1722 TF**. **—** = unsupported (d=64 needs head_dim >=
+All values in **TFLOPS**. Peak: **NVFP4+FP8 2677 TF**, **MXFP8+FP8 2383 TF**,
+**NVFP4+BF16 2337 TF**, **MXFP8+BF16 2072 TF**, **NVFP4+MXFP8 1809 TF**,
+**NVFP4+NVFP4 1725 TF**. **—** = unsupported (d=64 needs head_dim >=
 sf_vec_size x 4: NVFP4 PV and MXFP8 require 128). MXFP8+x columns are MXFP8 QK GEMM (sf_vec 32,
 E8M0) with BF16/plain-FP8 PV GEMM; NVFP4+MXFP8 is NVFP4 QK with the new MXFP8
 PV (E4M3 P/V, E8M0 SFs per 32) — slowest-but-most-accurate of the
@@ -584,18 +585,18 @@ quantized-PV modes (mean_abs 0.0029 vs FP8 PV's 0.0040, FP4 PV's 0.0039).
 (`FA4_LDRED_ROWMAX`, default-on) — every column in this table includes it.
 The BF16-ref figures here are post-ld.red (~+1-4% over the pre-ld.red ref).
 
-³ **h=24 rows re-measured 2026-07 with a 15 s per-shape cooldown.** The original
-2026-06 sweep ran every shape back-to-back with **no sleep**, and h=24 is the
-*last* group in `bench_fp4`'s config list — so it ran on an already-hot GPU
-(after the long s=32768 h=16 and b=4 s=4096 h=32 shapes) and was **thermally
-throttled**, most on the short s=4096 kernel. This was NOT a slower kernel: the
-throttle is a measurement artifact of no cooldown. Confirmed by construction —
-running s=4096 h=24 immediately after 3× hot s=32768 reproduces ~1618 TF, vs
-~1949 cool/isolated (both at 2070 MHz idle; the throttle is transient during the
-short kernel's do_bench window). So the old s=4096 h=24 numbers were ~15-30% low
-(e.g. NVFP4+FP8 1555 → 2046) and s=32768 slightly low (2578 → 2677). Reproduce:
-`FA4_BENCH_H24_SWEEP=1 FA4_BENCH_COOLDOWN=15 python -m flash_attn.cute.benchmarks.bench_fp4 --qk_mode nvfp4 --pv_mode {bf16,fp8}`
-(+ `--qk_mode mxfp8 --pv_mode {bf16,fp8}`, `--pv_mode {fp4,mxfp8}`). The other
-rows (h=12/16/32) were also measured without cooldown, so they are likely
-similarly depressed — re-sweep with `FA4_BENCH_COOLDOWN` to refresh them too.
+³ **Per-shape cooldown (now default-on in `bench_fp4`).** The original 2026-06
+table ran every shape back-to-back with **no sleep**, so shapes late in the
+config list ran on an already-hot GPU and were **thermally throttled** — a
+measurement artifact, not slower kernels. It hit the short shapes hardest:
+s=4096 h=24 NVFP4+FP8 read 1555 hot vs 2046 cool (~15-30% low); mid-size shapes
+(h=12/16/32 s=4096, s=32768) were ~5-20% low too. Confirmed by construction —
+running s=4096 h=24 right after 3× hot s=32768 reproduces ~1618 TF vs ~1949
+cool (both at 2070 MHz idle; the throttle is a transient boost-state dip during
+the short kernel's do_bench window). A brief settle before each shape fixes it;
+the **measured minimum is ~0.5 s** (0 s → ~86% of cool, 0.5 s → 100%, ≥1 s
+plateaus), so `bench_fp4` defaults to **0.8 s** — this whole table was
+re-measured 2026-07 with it on.
+
+The h=24 sequence-length sweep figure: `flash_attn/cute/figures/gb300_tflops_h24.png`.
 See the h=24 sweep figure: `flash_attn/cute/figures/gb300_tflops_h24.png`.

@@ -776,7 +776,13 @@ def main(
         (1, 4096, 24, 128),
         (1, 32768, 24, 128),
     ]
-    _cooldown = float(_os.environ.get("FA4_BENCH_COOLDOWN", "0"))
+    # Settle the GPU to a consistent clock/boost state before each shape so a
+    # long/hot preceding shape doesn't throttle the next one (default-on — the
+    # no-cooldown back-to-back sweep under-reported late shapes by ~15-30%).
+    # 0.8s is just above the measured minimum: 0s throttles a short shape to
+    # ~86%, 0.5s already recovers to 100%, ≥1s plateaus — 0.8s sits safely in
+    # the plateau while keeping the sweep's total idle time negligible.
+    _cooldown = 0.8
     if pv_mode not in ("fp4", "mxfp8") and sf_vec_size * 4 <= 64 and not _os.environ.get("FA4_BENCH_H24_SWEEP") and not _os.environ.get("FA4_BENCH_SEQS"):
         # headdim=64 requires head_dim >= sf_vec_size*4 (block-scaled MMA atom K constraint).
         # MXFP8 (sf_vec_size=32) needs headdim >= 128; NVFP4 (sf_vec_size=16) supports d=64.
