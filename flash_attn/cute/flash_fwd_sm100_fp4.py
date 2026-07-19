@@ -2865,8 +2865,13 @@ class FlashAttentionForwardSm100:
                 _max_offset = _math.log2(6) if const_expr(self.v_dtype.width == 4) else _math.log2(448)
                 _rescale_threshold = 0.0
             elif const_expr(not self.quant_pv and self.v_dtype.width == 8):
-                # FP8 PV: use max_offset to shift P range for better utilization.
-                _max_offset = float(os.getenv("FA4_FP8_PV_P_LOG2_OFFSET", "0.0" if self.head_dim_v_padded <= 64 else "8.0"))
+                # FP8 PV: P is already per-tile normalized to [0, 1] before the
+                # E4M3 cast, which sits in E4M3's dense region — no extra offset
+                # needed. A nonzero offset (the old d>64 default of 8.0) only
+                # pushes P up into coarser-mantissa E4M3 codes, dropping FP8-PV
+                # cos_sim from ~0.99 to ~0.977 (0.9985->0.984 for MXFP8 QK) with
+                # no throughput gain. Keep 0.0; override via env if ever needed.
+                _max_offset = float(os.getenv("FA4_FP8_PV_P_LOG2_OFFSET", "0.0"))
                 _rescale_threshold = 8.0
             else:
                 _max_offset = 0
