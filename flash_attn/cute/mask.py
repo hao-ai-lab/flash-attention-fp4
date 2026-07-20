@@ -1393,7 +1393,7 @@ class Sm100FusedMask:
             or mask_type is Sm100MaskEnum.WINDOW_MASK_BWD_INFERENCE
         ):
             offset = seqlen_k - seqlen_q
-        for i in cutlass.range_constexpr(cute.size(acc_qk), unroll_full=True):
+        for i in cutlass.range_constexpr(cute.size(acc_qk)):
             index_q, index_k = index_transform(*index_qk[i])
             if cutlass.const_expr(window_size_left is not None or window_size_right is not None):
                 if cutlass.const_expr(window_size_left is None):
@@ -1446,7 +1446,7 @@ class Sm100FusedMask:
         if cutlass.const_expr(apply_semantic_window):
             # Match WINDOW_MASK_INFERENCE semantics: end-align Q/K when lengths differ.
             offset = seqlen_k - seqlen_q
-        for i in cutlass.range_constexpr(cute.size(acc_qk), unroll_full=True):
+        for i in cutlass.range_constexpr(cute.size(acc_qk)):
             index_q, index_k = index_transform(*index_qk[i])
             if cutlass.const_expr(apply_semantic_window):
                 if cutlass.const_expr(is_causal and not is_local):

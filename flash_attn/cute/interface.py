@@ -231,6 +231,7 @@ def _flash_attn_fwd(
     mSFQ: Optional[Union[torch.Tensor, cute.Tensor]] = None,  # Scale factor for Q
     mSFK: Optional[Union[torch.Tensor, cute.Tensor]] = None,  # Scale factor for K
     mSFV: Optional[Union[torch.Tensor, cute.Tensor]] = None,  # Scale factor for V
+    v_descale: Optional[torch.Tensor] = None,  # Per-(batch, kv-head) FP8 V dequant scale
     force_fp4_impl: bool = False, # Test fp4 attn impl under bf16 precision w/o sf
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Forward pass for FlashAttention.
@@ -248,7 +249,17 @@ def _flash_attn_fwd(
     # Handle CUTE tensors - use them directly, no conversion needed
     # Only make contiguous if they are torch tensors
     if not isinstance(q, cute.Tensor):
-        q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
+        q, k = [maybe_contiguous(t) for t in (q, k)]
+        # Block-scaled MXFP8 V is intentionally K-major (seqlen contiguous);
+        # don't flatten it back to headdim-contiguous.
+        v_is_kmajor_mxfp8 = (
+            mSFV is not None
+            and hasattr(v, "dtype")
+            and v.dtype == getattr(torch, "float8_e4m3fn", None)
+            and v.stride(1) == 1
+        )
+        if not v_is_kmajor_mxfp8:
+            v = maybe_contiguous(v)
     num_head, head_dim = q.shape[-2:]
     # For FP4 packed dtypes (float4_e2m1fn_x2), the last dim is headdim/2.
     # For int8 FP4 buffers (from cute_tensor_like), shape already has full headdim — no correction needed.
@@ -659,12 +670,17 @@ def _flash_attn_fwd(
         mSFQ is not None,  # Include scale factor flags
         mSFK is not None,
         mSFV is not None,
+        v_descale is not None,  # FP8 V dequant scale present
         force_fp4_impl,
         _key_qk_ab_dtype,  # NVFP4 (Float4E2M1FN) vs MXFP8 (Float8E4M3FN/E5M2)
         _key_sf_dtype,     # E4M3 (NVFP4) vs E8M0 (MXFP8) — was previously not in the
                            # key; both modes shared a slot and the second silently
                            # reused the kernel compiled for the first.
         local,
+        # In-kernel pipeline trace (flash_attn/cute/profiler.py): instrumented
+        # and clean kernels must not share a cache slot, nor coarse vs detail.
+        os.environ.get("FA4_PROFILE_PIPELINE", "0") == "1",
+        os.environ.get("FA4_PROFILE_DETAIL", "0") == "1",
     )
     fp4_qk = use_fp4 and not is_cute_q
     # FP4 V also needs the make_ptr path: dlpack reports half-headdim shape for
@@ -751,14 +767,24 @@ def _flash_attn_fwd(
             from cutlass.cute.runtime import make_ptr
             v_tensor = make_ptr(cutlass.Float4E2M1FN, 0, cute.AddressSpace.gmem, assumed_align=16)
         else:
-            v_tensor = to_cute_tensor(v)
+            # MXFP8 PV passes V K-major (seqlen contiguous, dim 1); everything
+            # else is headdim-contiguous.
+            _v_kmajor = (
+                mSFV is not None
+                and hasattr(v, "dtype")
+                and v.dtype == getattr(torch, "float8_e4m3fn", None)
+            )
+            v_tensor = to_cute_tensor(v, leading_dim=1 if _v_kmajor else -1)
         o_tensor = to_cute_tensor(out if not is_split_kv else out_partial)
         # Pass through scale factor tensors when using the SM100 block-scaled kernel.
         mSFQ_tensor = mSFK_tensor = mSFV_tensor = None
+        v_descale_tensor = None
         if use_blockscaled_impl:
             mSFQ_tensor = to_cute_tensor(mSFQ, leading_dim=3, assumed_align=16) if mSFQ is not None else None
             mSFK_tensor = to_cute_tensor(mSFK, leading_dim=3, assumed_align=16) if mSFK is not None else None
             mSFV_tensor = to_cute_tensor(mSFV, leading_dim=3, assumed_align=16) if mSFV is not None else None
+            # Per-(batch, kv-head) FP8 V dequant scale (Float32, shape [b, h_kv]).
+            v_descale_tensor = to_cute_tensor(v_descale, leading_dim=1, assumed_align=4) if v_descale is not None else None
         if is_split_kv:
             lse_tensor = to_cute_tensor(lse_partial, assumed_align=4)
         elif lse is not None:
@@ -821,6 +847,16 @@ def _flash_attn_fwd(
                         f"Invalid dtype combination: ab_dtype={ab_dtype}, "
                         f"sf_dtype={sf_dtype}, sf_vec_size={sf_vec_size}"
                     )
+                # MXFP8 PV: NVFP4 QK with E4M3 V + SFV present -> P/V use
+                # sf_vec 32 with E8M0 scale factors.
+                _mxfp8_pv = (
+                    mSFV is not None
+                    and sf_vec_size == 16
+                    and (
+                        (isinstance(v, cute.Tensor) and v.element_type == cutlass.Float8E4M3FN)
+                        or (hasattr(v, "dtype") and v.dtype == getattr(torch, "float8_e4m3fn", None))
+                    )
+                )
                 fa_fwd = FlashAttentionForwardSm100FP4(
                     head_dim,
                     head_dim_v,
@@ -844,6 +880,8 @@ def _flash_attn_fwd(
                         or seqused_q is not None,
                     sf_dtype=sf_dtype,
                     sf_vec_size=sf_vec_size,
+                    sf_dtype_pv=cutlass.Float8E8M0FNU if _mxfp8_pv else None,
+                    sf_vec_size_pv=32 if _mxfp8_pv else None,
                 )
             else:
                 import os as _os
@@ -921,7 +959,16 @@ def _flash_attn_fwd(
         ]
         # Add scale factor tensors if using the block-scaled SM100 kernel
         if use_blockscaled_impl:
-            compile_args.extend([mSFQ_tensor, mSFK_tensor, mSFV_tensor])
+            # In-kernel pipeline trace buffer (FA4_PROFILE_PIPELINE=1).
+            profiler_tensor = None
+            if os.environ.get("FA4_PROFILE_PIPELINE", "0") == "1":
+                from flash_attn.cute import profiler as fa4_profiler
+                if fa4_profiler.LAST_BUFFER is None:
+                    fa4_profiler.LAST_BUFFER = fa4_profiler.allocate_profiler_buffer()
+                profiler_tensor = to_cute_tensor(
+                    fa4_profiler.LAST_BUFFER, assumed_align=16, leading_dim=0
+                )
+            compile_args.extend([mSFQ_tensor, mSFK_tensor, mSFV_tensor, profiler_tensor, v_descale_tensor])
         # Add q/k shapes for the block-scaled kernel (it always builds tensors from pointer + shape)
         if use_blockscaled_impl:
             if fp4_qk:
@@ -989,7 +1036,13 @@ def _flash_attn_fwd(
 
     # Add scale factor tensors if using the block-scaled SM100 kernel
     if use_blockscaled_impl:
-        call_args.extend([mSFQ, mSFK, mSFV])
+        profiler_buf = None
+        if os.environ.get("FA4_PROFILE_PIPELINE", "0") == "1":
+            from flash_attn.cute import profiler as fa4_profiler
+            if fa4_profiler.LAST_BUFFER is None:
+                fa4_profiler.LAST_BUFFER = fa4_profiler.allocate_profiler_buffer()
+            profiler_buf = fa4_profiler.LAST_BUFFER
+        call_args.extend([mSFQ, mSFK, mSFV, profiler_buf, v_descale])
     # Add q/k shapes for the block-scaled kernel
     if use_blockscaled_impl:
         call_args.extend([q_ptr_shape, k_ptr_shape])
@@ -1568,6 +1621,7 @@ class FlashAttnFunc(torch.autograd.Function):
         mSFQ: Optional[torch.Tensor] = None,
         mSFK: Optional[torch.Tensor] = None,
         mSFV: Optional[torch.Tensor] = None,
+        v_descale: Optional[torch.Tensor] = None,
         force_fp4_impl: bool = False,
     ):
         # Only create block sparse tensors if at least one block sparse parameter is provided
@@ -1596,6 +1650,7 @@ class FlashAttnFunc(torch.autograd.Function):
             mSFQ=mSFQ,
             mSFK=mSFK,
             mSFV=mSFV,
+            v_descale=v_descale,
             force_fp4_impl=force_fp4_impl,
         )
         ctx.save_for_backward(q, k, v, out, lse)
@@ -1619,7 +1674,7 @@ class FlashAttnFunc(torch.autograd.Function):
             ctx.causal,
             ctx.softcap,
         )
-        return dq, dk, dv, *((None,) * 20)  # Extra Nones is fine
+        return dq, dk, dv, *((None,) * 21)  # Extra Nones is fine
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
@@ -1710,6 +1765,7 @@ def flash_attn_func(
     mSFQ: Optional[torch.Tensor] = None,
     mSFK: Optional[torch.Tensor] = None,
     mSFV: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
     force_fp4_impl: bool = False,
 ):
     return FlashAttnFunc.apply(
@@ -1731,6 +1787,7 @@ def flash_attn_func(
         mSFQ,
         mSFK,
         mSFV,
+        v_descale,
         force_fp4_impl,
     )
 

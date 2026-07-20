@@ -14,6 +14,7 @@
 # https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/blackwell/fmha.py
 
 import math
+import os
 from typing import Tuple, Callable, Optional, Literal, NamedTuple
 from functools import partial
 
@@ -2258,8 +2259,18 @@ class FlashAttentionForwardSm100:
 
         # Wait for Si
         pipeline_s_p_o.consumer_wait_w_index_phase(stage, mma_si_consumer_phase)
+        # Load S from TMEM. SM103: tcgen05.ld.red fuses the load with a
+        # per-x32-tile max in the TMEM controller (row max nearly free).
+        use_ldred = const_expr(
+            self.is_sm103
+            and self.score_mod is None
+            and os.getenv("FA4_LDRED_ROWMAX", "1") == "1"
+        )
         tSrS_t2r = cute.make_fragment(thr_tmem_load.partition_D(tScS).shape, self.qk_acc_dtype)
-        cute.copy(thr_tmem_load, tStS_t2r, tSrS_t2r)
+        if const_expr(use_ldred):
+            hw_max = sm100_utils.tmem_ld_red_max(tStS_t2r, tSrS_t2r)
+        else:
+            cute.copy(thr_tmem_load, tStS_t2r, tSrS_t2r)
         # tSrS_t2r = copy_utils.load_t2r(thr_tmem_load, tScS_shape, tStS_t2r)
         if cutlass.const_expr(self.score_mod is not None):
             self.apply_score_mod(
@@ -2279,7 +2290,13 @@ class FlashAttentionForwardSm100:
 
         if const_expr(mask_fn is not None):
             mask_fn(tSrS_t2r, n_block=n_block)
-        row_max, acc_scale = softmax.update_row_max(tSrS_t2r.load(), is_first)
+        # The hardware max is only valid when no masking modified the values
+        # (unmasked steps pass mask_fn=None here); masked iterations fall
+        # back to the software reduce over the post-mask values.
+        if const_expr(use_ldred and mask_fn is None):
+            row_max, acc_scale = softmax.update_row_max_precomputed(hw_max, is_first)
+        else:
+            row_max, acc_scale = softmax.update_row_max(tSrS_t2r.load(), is_first)
 
         if const_expr(not is_first):
             # tSrScale_r2t = cute.make_fragment(thr_tmem_store_scale.partition_S(tScScale).shape, Float32)

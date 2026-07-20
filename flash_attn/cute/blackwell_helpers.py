@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32, Boolean, const_expr, Float32
+from cutlass import Int32, Int64, Boolean, const_expr, Float32
 from cutlass.cutlass_dsl import T
 from cutlass.cute.nvgpu import tcgen05
 from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode
@@ -23,7 +23,9 @@ def _tcgen05_mma_kind(op: cute.nvgpu.tcgen05.mma.MmaOp) -> str:
         return "tf32"
     if isinstance(op, tcgen05.mma.MmaI8Op):
         return "i8"
-    if isinstance(op, tcgen05.mma.MmaFP8Op):
+    if isinstance(op, tcgen05.mma.MmaFP8Op) if hasattr(tcgen05.mma, 'MmaFP8Op') else False:
+        return "f8f6f4"
+    if hasattr(tcgen05.mma, 'MmaF8F6F4Op') and isinstance(op, tcgen05.mma.MmaF8F6F4Op):
         return "f8f6f4"
     if isinstance(op, tcgen05.mma.MmaMXF8Op):
         return "mxf8f6f4"
@@ -413,6 +415,11 @@ def gemm_ptx_partial(
     tA_addr: Optional[Int32] = None,
     cta_group: int = 1,
     pre_mbar_tiles: Optional[cutlass.Constexpr[int]] = None,
+    # (ts_addr_begin, ts_addr_end): addresses where %clock is stored right
+    # before / after the embedded mbarrier wait (pipeline tracing).
+    prof_ts_addrs: Optional[tuple] = None,
+    # When True the ts addresses are in shared memory: cvta.to.shared + st.shared.
+    prof_ts_smem: cutlass.Constexpr[bool] = False,
 ) -> None:
     # acc_tmem_addr += acc_offset
     is_ts = op.a_src == cute.nvgpu.tcgen05.OperandSource.TMEM
@@ -546,14 +553,47 @@ def gemm_ptx_partial(
                 split_arrive_idx = cute.size(tCrA.shape[2]) // 4 * 3
             input_args.append(mbar_ptr.toint().ir_value())
             input_args.append(Int32(mbar_phase).ir_value())
-            mbar_wait_str = (
-                ".reg .pred P1; \n\t"
-                "LAB_WAIT: \n\t"
-                "mbarrier.try_wait.parity.shared::cta.b64 P1, [$4], $5, 10000000; \n\t"
-                "@P1 bra DONE; \n\t"
-                "bra     LAB_WAIT; \n\t"
-                "DONE: \n\t"
-            )
+            if const_expr(prof_ts_addrs is not None):
+                # Store %clock around the wait so the trace shows the actual
+                # measured wait window instead of an estimate.
+                input_args.append(Int64(prof_ts_addrs[0]).ir_value())
+                input_args.append(Int64(prof_ts_addrs[1]).ir_value())
+                if const_expr(prof_ts_smem):
+                    _ts_store = (
+                        ".reg .u64 prof_sb; \n\t"
+                        ".reg .u64 prof_se; \n\t"
+                        "cvta.to.shared.u64 prof_sb, $6; \n\t"
+                        "cvta.to.shared.u64 prof_se, $7; \n\t"
+                    )
+                    _ts_b = "@leader_thread st.shared.u32 [prof_sb], prof_clk; \n\t"
+                    _ts_e = "@leader_thread st.shared.u32 [prof_se], prof_clk; \n\t"
+                else:
+                    _ts_store = ""
+                    _ts_b = "@leader_thread st.global.u32 [$6], prof_clk; \n\t"
+                    _ts_e = "@leader_thread st.global.u32 [$7], prof_clk; \n\t"
+                mbar_wait_str = (
+                    ".reg .pred P1; \n\t"
+                    ".reg .b32 prof_clk; \n\t"
+                    + _ts_store +
+                    "mov.u32 prof_clk, %clock; \n\t"
+                    + _ts_b +
+                    "LAB_WAIT: \n\t"
+                    "mbarrier.try_wait.parity.shared::cta.b64 P1, [$4], $5, 10000000; \n\t"
+                    "@P1 bra DONE; \n\t"
+                    "bra     LAB_WAIT; \n\t"
+                    "DONE: \n\t"
+                    "mov.u32 prof_clk, %clock; \n\t"
+                    + _ts_e
+                )
+            else:
+                mbar_wait_str = (
+                    ".reg .pred P1; \n\t"
+                    "LAB_WAIT: \n\t"
+                    "mbarrier.try_wait.parity.shared::cta.b64 P1, [$4], $5, 10000000; \n\t"
+                    "@P1 bra DONE; \n\t"
+                    "bra     LAB_WAIT; \n\t"
+                    "DONE: \n\t"
+                )
         else:
             mbar_wait_str = ""
         llvm.inline_asm(
@@ -613,7 +653,9 @@ def gemm_ptx_partial(
                 else ""
             )
             + "}\n",
-            "r,r,r,r" if const_expr(mbar_ptr is None) else "r,r,r,r,r,r",
+            "r,r,r,r"
+            if const_expr(mbar_ptr is None)
+            else ("r,r,r,r,r,r" if const_expr(prof_ts_addrs is None) else "r,r,r,r,r,r,l,l"),
             has_side_effects=True,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -1193,6 +1235,12 @@ def gemm_ptx_partial_fp4(
     zero_init: bool | Boolean = False,
     tA_addr: Optional[Int32] = None,
     pre_mbar_tiles: Optional[cutlass.Constexpr[int]] = None,
+    # (ts_addr_begin, ts_addr_end): addresses where %clock is stored right
+    # before / after the embedded mbarrier wait (pipeline tracing).
+    prof_ts_addrs: Optional[tuple] = None,
+    # When True the ts addresses are in shared memory: emit cvta.to.shared +
+    # st.shared instead of st.global (smem-buffered profiling).
+    prof_ts_smem: cutlass.Constexpr[bool] = False,
 ) -> None:
     is_ts = op.a_src == cute.nvgpu.tcgen05.OperandSource.TMEM
     if const_expr(not is_ts):
@@ -1375,14 +1423,49 @@ def gemm_ptx_partial_fp4(
             assert mbar_phase is not None, "mbar_phase must be provided when mbar_ptr is not None"
             input_args.append(mbar_ptr.toint().ir_value())
             input_args.append(Int32(mbar_phase).ir_value())
-            mbar_wait_str = (
-                ".reg .pred P1; \n\t"
-                "LAB_WAIT: \n\t"
-                "mbarrier.try_wait.parity.shared::cta.b64 P1, [$6], $7, 10000000; \n\t"
-                "@P1 bra DONE; \n\t"
-                "bra     LAB_WAIT; \n\t"
-                "DONE: \n\t"
-            )
+            if const_expr(prof_ts_addrs is not None):
+                # Store %clock around the wait so the trace shows the actual
+                # measured wait window instead of an estimate.
+                input_args.append(Int64(prof_ts_addrs[0]).ir_value())
+                input_args.append(Int64(prof_ts_addrs[1]).ir_value())
+                if const_expr(prof_ts_smem):
+                    # ts addresses are generic pointers into smem -> convert to
+                    # the shared window and store with st.shared.
+                    _ts_store = (
+                        ".reg .u64 prof_sb; \n\t"
+                        ".reg .u64 prof_se; \n\t"
+                        "cvta.to.shared.u64 prof_sb, $8; \n\t"
+                        "cvta.to.shared.u64 prof_se, $9; \n\t"
+                    )
+                    _ts_b = "@leader_thread st.shared.u32 [prof_sb], prof_clk; \n\t"
+                    _ts_e = "@leader_thread st.shared.u32 [prof_se], prof_clk; \n\t"
+                else:
+                    _ts_store = ""
+                    _ts_b = "@leader_thread st.global.u32 [$8], prof_clk; \n\t"
+                    _ts_e = "@leader_thread st.global.u32 [$9], prof_clk; \n\t"
+                mbar_wait_str = (
+                    ".reg .pred P1; \n\t"
+                    ".reg .b32 prof_clk; \n\t"
+                    + _ts_store +
+                    "mov.u32 prof_clk, %clock; \n\t"
+                    + _ts_b +
+                    "LAB_WAIT: \n\t"
+                    "mbarrier.try_wait.parity.shared::cta.b64 P1, [$6], $7, 10000000; \n\t"
+                    "@P1 bra DONE; \n\t"
+                    "bra     LAB_WAIT; \n\t"
+                    "DONE: \n\t"
+                    "mov.u32 prof_clk, %clock; \n\t"
+                    + _ts_e
+                )
+            else:
+                mbar_wait_str = (
+                    ".reg .pred P1; \n\t"
+                    "LAB_WAIT: \n\t"
+                    "mbarrier.try_wait.parity.shared::cta.b64 P1, [$6], $7, 10000000; \n\t"
+                    "@P1 bra DONE; \n\t"
+                    "bra     LAB_WAIT; \n\t"
+                    "DONE: \n\t"
+                )
         else:
             mbar_wait_str = ""
 
@@ -1462,7 +1545,9 @@ def gemm_ptx_partial_fp4(
                 else ""
             )
             + "}\n",
-            "r,r,r,r,r,r" if const_expr(mbar_ptr is None) else "r,r,r,r,r,r,r,r",
+            "r,r,r,r,r,r"
+            if const_expr(mbar_ptr is None)
+            else ("r,r,r,r,r,r,r,r" if const_expr(prof_ts_addrs is None) else "r,r,r,r,r,r,r,r,l,l"),
             has_side_effects=True,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -1484,6 +1569,8 @@ def gemm_ptx_partial_fp8(
     zero_init: bool | Boolean = False,
     tA_addr: Optional[Int32] = None,
     pre_mbar_tiles: Optional[cutlass.Constexpr[int]] = None,
+    prof_ts_addrs: Optional[tuple] = None,
+    prof_ts_smem: cutlass.Constexpr[bool] = False,
 ) -> None:
     return gemm_ptx_partial_fp4(
         op,
@@ -1499,6 +1586,8 @@ def gemm_ptx_partial_fp8(
         zero_init=zero_init,
         tA_addr=tA_addr,
         pre_mbar_tiles=pre_mbar_tiles,
+        prof_ts_addrs=prof_ts_addrs,
+        prof_ts_smem=prof_ts_smem,
     )
 
 
@@ -1682,3 +1771,103 @@ def make_smem_layout_sfb(
         smem_layout,
         cute.make_layout(num_stages, stride=cute.cosize(cute.filter_zeros(smem_layout))),
     )
+
+
+@cute.jit
+def tmem_ld_red_max(
+    tStS: cute.Tensor,
+    tSrS: cute.Tensor,
+    tile_maxes: Optional[cute.Tensor] = None,
+) -> cutlass.Float32:
+    """SM103: fused TMEM load + row-max via raw tcgen05.ld.red PTX.
+
+    Drop-in replacement for cute.copy(thr_tmem_load, src, dst) with a
+    Ld32x32bOp(Repetition(32)) atom that also returns the row max: each
+    x32 load returns its 32 values plus their max in a 33rd register,
+    computed in the TMEM controller at zero ALU cost.
+
+    If `tile_maxes` is given (size = number of x32 tiles), the per-tile
+    maxes are stored there too — for sf_vec_size=32 quantization (MXFP8 P)
+    each x32 tile max IS that scale-factor group's max.
+
+    Ported from LopezCastroRoberto/flash-attention perf/ld.red-upstream.
+    """
+    from cutlass._mlir import ir as _ir
+
+    # Group all modes after the value mode so the x32 tile index is a single
+    # mode regardless of the caller's partition rank (the FP4 kernel has
+    # tiles at mode 1 of a rank-4 shape; the BF16 kernel at mode 2 of rank 3).
+    tStS_g = cute.group_modes(tStS, 1, cute.rank(tStS.shape))
+    num_tiles = cute.size(tStS_g.shape[1])
+    assert cute.size(tSrS) == num_tiles * 32
+    f32_ty = _ir.F32Type.get()
+    struct_ty = llvm.StructType.get_literal([f32_ty] * 33)
+
+    asm_str = (
+        "tcgen05.ld.red.sync.aligned.32x32b.x32.f32.max"
+        " {" + ", ".join(f"${i}" for i in range(32)) + "}"
+        ", $32, [$33];\n"
+    )
+
+    row_max = cutlass.Float32(0.0)
+    for k in cutlass.range_constexpr(num_tiles):
+        result = llvm.inline_asm(
+            struct_ty,
+            [tStS_g[None, k].iterator.toint().ir_value()],
+            asm_str,
+            "=f," * 33 + "r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+        for i in cutlass.range_constexpr(32):
+            tSrS[k * 32 + i] = cutlass.Float32(llvm.extractvalue(f32_ty, result, [i]))
+        tile_max = cutlass.Float32(llvm.extractvalue(f32_ty, result, [32]))
+        if cutlass.const_expr(tile_maxes is not None):
+            tile_maxes[k] = tile_max
+        row_max = tile_max if cutlass.const_expr(k == 0) else cute.arch.fmax(row_max, tile_max)
+    return row_max
+
+
+@dsl_user_op
+def ceil_f32(a: Float32, *, loc=None, ip=None) -> Float32:
+    """Round up to an integer-valued float (cvt.rpi.f32.f32)."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Float32(a).ir_value(loc=loc, ip=ip)],
+            "cvt.rpi.f32.f32 $0, $1;",
+            "=f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def packed_float_to_ue8m0(
+    f0: Float32, f1: Float32, f2: Float32, f3: Float32, *, loc=None, ip=None
+) -> Int32:
+    """Convert 4 FP32 values (exact powers of two) to UE8M0 packed in uint32."""
+    out_uint32 = llvm.inline_asm(
+        T.i32(),
+        [
+            Float32(f0).ir_value(loc=loc, ip=ip),
+            Float32(f1).ir_value(loc=loc, ip=ip),
+            Float32(f2).ir_value(loc=loc, ip=ip),
+            Float32(f3).ir_value(loc=loc, ip=ip),
+        ],
+        "{\n\t"
+        ".reg .b16 lo;\n\t"
+        ".reg .b16 hi;\n\t"
+        "cvt.rz.satfinite.ue8m0x2.f32   lo, $2, $1;\n\t"
+        "cvt.rz.satfinite.ue8m0x2.f32   hi, $4, $3;\n\t"
+        "mov.b32 $0, {lo, hi};\n\t"
+        "}\n",
+        "=r,f,f,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return Int32(out_uint32)

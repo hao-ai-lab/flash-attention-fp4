@@ -69,6 +69,46 @@ All values in TFLOPS. Peak: **NVFP4+FP8 2031 TF**, **MXFP8+FP8 1960 TF**.
 
 Per-call precision: cosine similarity ≥ 0.99 (block-scaled QK vs BF16 reference).
 
+## Results — PV Quantization (GB300)
+
+All block-scaled QK × PV combinations (triton `do_bench`, GB300) — includes the
+SM103 ld.red row-max (incl. the BF16 ref), log-domain FP4 quant, the 3/4 FP8
+P-split, MXFP8 PV, and the block-scaled-PV SF-stepping fix:
+
+| Config | NVFP4+BF16 | NVFP4+FP8 | NVFP4+NVFP4 | NVFP4+MXFP8 | MXFP8+BF16 | MXFP8+FP8 | BF16 ref ² |
+|--------|----|----|----|----|----|----|----|
+| b=1 s=256 h=16 d=128 | 13 | 11 | 12 | 12 | 11 | 12 | **17** |
+| b=1 s=1024 h=16 d=128 | 232 | 203 | 200 | 209 | 221 | 242 | **289** |
+| b=4 s=4096 h=16 d=128 | 2227 | **2502** | 1524 | 1612 | 1849 | 2291 | 1508 |
+| b=1 s=32768 h=16 d=128 | 2337 | **2666** | 1720 | 1807 | 2072 | 2383 | 1585 |
+| b=4 s=4096 h=32 d=128 | 2196 | **2540** | 1544 | 1638 | 1879 | 2290 | 1475 |
+| b=1 s=4096 h=12 d=128 | 1458 | **1458** | 942 | 987 | 1227 | 1418 | 1017 |
+| b=1 s=32768 h=12 d=128 ¹ | 2276 | **2582** | 1646 | 1726 | 2021 | 2350 | 1584 |
+| b=1 s=4096 h=24 d=128 | 1949 | **2046** | 1291 | 1360 | 1611 | 1974 | 1322 |
+| b=1 s=32768 h=24 d=128 | 2235 | **2677** | 1725 | 1809 | 1974 | 2362 | 1533 |
+| b=1 s=32768 h=24 d=64 | 1209 | 1203 | — | — | — | — | **1221** |
+
+All values in TFLOPS (measured with a per-shape cooldown so no shape is
+throttled by a hot predecessor — default-on in `bench_fp4`). Peak:
+**NVFP4+FP8 2677 TF**, **MXFP8+FP8 2383 TF**, **NVFP4+BF16 2337 TF**,
+**MXFP8+BF16 2072 TF**, **NVFP4+MXFP8 1809 TF**, **NVFP4+NVFP4 1725 TF**.
+**—** = unsupported (d=64 needs head_dim ≥
+sf_vec_size × 4: NVFP4 PV and MXFP8 require 128). Small shapes (s ≤ 1024) are
+launch-latency dominated. MXFP8+x columns are MXFP8 QK (sf_vec 32, E8M0) with
+BF16/plain-FP8 PV; NVFP4+MXFP8 is NVFP4 QK with MXFP8 PV (E4M3 P/V, E8M0 SFs
+per 32) — slowest-but-most-accurate of the quantized-PV modes (mean_abs 0.0029
+vs FP8 PV's 0.0040, FP4 PV's 0.0039).
+
+¹ Matches [Wan2.1-T2V-1.3B](https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B-Diffusers) inference (480×832 video, 81 frames → latent seqlen 32760, nheads=12, headdim=128).
+
+² **BF16 ref** is the non-block-scaled SM100 reference kernel
+(`flash_fwd_sm100.py`), which also uses the SM103 ld.red fused S-load+row-max
+(`FA4_LDRED_ROWMAX`, default-on) — every column includes it.
+
+### Sequence-length sweep (GB300, h=24, d=128, non-causal)
+
+![GB300 h=24, d=128, non-causal](figures/gb300_tflops_h24.png)
+
 ## Results — QKV Quantization (quant_v)
 
 Additionally quantizes softmax output P and V to FP4. The PV GEMM uses block-scaled MMA with on-the-fly P quantization (`scale_groupwise`) and SFP R2S copy. **Currently slower than BF16** because the softmax warp is the pipeline bottleneck — P quantization adds to the critical path.

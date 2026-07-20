@@ -425,6 +425,22 @@ def create_blockscaled_attention_tensors(
             v_ref_kmajor, v_tensor, ab_dtype, is_dynamic_layout=True
         )
         # V is (batch, seqlen, nheads, headdim) with seqlen contiguous
+    elif pv_mode == "mxfp8":
+        # MXFP8 block-scaled V: E4M3 elements, K-major (seqlen contiguous),
+        # E8M0 scale factors per 32 created below.
+        v_ref_kmajor = v_ref.permute(0, 3, 2, 1).contiguous().permute(0, 3, 2, 1)
+        v_tensor, v_torch_underlying = cutlass_torch.cute_tensor_like(
+            v_ref_kmajor, cutlass.Float8E4M3FN, is_dynamic_layout=True, assumed_align=16
+        )
+        v_stride_order = tuple(v_ref_kmajor.dim_order())
+        v_tensor.mark_compact_shape_dynamic(
+            mode=1,
+            stride_order=v_stride_order,
+            divisibility=32,
+        )
+        v_tensor = cutlass_torch.convert_cute_tensor(
+            v_ref_kmajor, v_tensor, cutlass.Float8E4M3FN, is_dynamic_layout=True
+        )
     elif pv_mode == "fp8":
         v_tensor, v_torch_underlying = cutlass_torch.cute_tensor_like(
             v_ref, pv_fp8_dtype, is_dynamic_layout=True, assumed_align=16
@@ -482,16 +498,19 @@ def create_blockscaled_attention_tensors(
         sf_value=k_sf_value,
     )
 
-    # Create V scale factors only if V is block-scaled FP4.
-    if pv_mode == "fp4":
+    # Create V scale factors only if V is block-scaled (FP4 or MXFP8).
+    if pv_mode in ("fp4", "mxfp8"):
+        _v_sf_vec = sf_vec_size if pv_mode == "fp4" else 32
+        _v_sf_dtype = sf_dtype if pv_mode == "fp4" else cutlass.Float8E8M0FNU
+        _v_ab_dtype = ab_dtype if pv_mode == "fp4" else cutlass.Float8E4M3FN
         v_sf_ref, v_sf_tensor, v_sf_torch_underlying = create_scale_factor_tensor(
             batch,
             seqlen_k,
             nheads_kv,
             headdim_v,
-            sf_vec_size,
-            sf_dtype,
-            ab_dtype,
+            _v_sf_vec,
+            _v_sf_dtype,
+            _v_ab_dtype,
             device,
             debug=debug,
         )
@@ -580,14 +599,64 @@ def create_nvfp4_attention_tensors(
     q_fp4, q_sf = _quantize_and_reshape_sf(q_ref, batch, seqlen_q, nheads, headdim)
     k_fp4, k_sf = _quantize_and_reshape_sf(k_ref, batch, seqlen_k, nheads_kv, headdim)
 
-    if pv_mode == "fp8":
+    v_sf = None
+    if pv_mode == "fp4":
+        # K-major FP4 V: nvfp4_quantize on v.permute(0,2,3,1).reshape(b*h*d, s)
+        # produces (b*h*d, s/2) FP4 byte tensor. Reshape to (b, h, d, s/2).
+        v_bf16 = v_ref.to(dtype_gen)
+        v_km = v_bf16.permute(0, 2, 3, 1).contiguous().reshape(batch * nheads_kv * headdim_v, seqlen_k)
+        one = torch.ones(1, device=device, dtype=torch.float32)
+        v_fp4_data, v_sf_data = nvfp4_quantize(
+            v_km, one, sfLayout=SfLayout.layout_128x4, do_shuffle=False
+        )
+        v_tensor = (
+            v_fp4_data.reshape(batch, nheads_kv, headdim_v, seqlen_k // 2)
+            .view(torch.uint8)
+            .view(torch.float4_e2m1fn_x2)
+        )
+        # V SF layout: The kernel's mV_shape is (d, s, h, b) after transpose.
+        # tile_to_shape(atom, (d, s, h, b), (2,1,3,4)) produces:
+        #   (((32,4), d//128), ((16,4), s//64), h, b)
+        # which flattens to 7-dim: (32, 4, d//128, 4, s//64, h, b)
+        # The SF from nvfp4_quantize on (b*h*d, s) has shape (b*h*d, s//16).
+        # Reshape to match: split M=b*h*d into (b, h, d//128) and K=s//16 into s//64.
+        rest_m_v = headdim_v // tile_m  # d//128
+        rest_k_v = seqlen_k // (sf_vec_size * 4)  # s//64
+        v_sf = v_sf_data.reshape(
+            batch * nheads_kv * rest_m_v, rest_k_v, 32, 4, 4
+        ).reshape(
+            batch, nheads_kv, rest_m_v, rest_k_v, 32, 4, 4
+        ).permute(0, 1, 2, 3, 4, 5, 6).contiguous().permute(4, 5, 2, 6, 3, 1, 0)
+    elif pv_mode == "mxfp8":
+        # K-major MXFP8 V: mxfp8_quantize on v.permute(0,2,3,1).reshape(b*h*d, s)
+        # produces (b*h*d, s) E4M3 data + E8M0 SFs per 32 along seqlen.
+        from flashinfer.quantization import mxfp8_quantize
+        v_sf_vec = 32
+        v_bf16 = v_ref.to(dtype_gen)
+        v_km = v_bf16.permute(0, 2, 3, 1).contiguous().reshape(
+            batch * nheads_kv * headdim_v, seqlen_k
+        )
+        v_fp8_data, v_sf_data = mxfp8_quantize(v_km, sf_swizzle_layout=SfLayout.layout_128x4)
+        if v_fp8_data.dtype == torch.uint8:
+            v_fp8_data = v_fp8_data.view(torch.float8_e4m3fn)
+        # Logical (b, s, h, d) with seqlen contiguous (K-major for the PV MMA).
+        v_tensor = v_fp8_data.reshape(batch, nheads_kv, headdim_v, seqlen_k).permute(0, 3, 1, 2)
+        # Same swizzled SF reshape as the FP4 V path, with sf_vec 32.
+        rest_m_v = headdim_v // tile_m  # d//128
+        rest_k_v = seqlen_k // (v_sf_vec * 4)  # s//128
+        v_sf = v_sf_data.reshape(
+            batch * nheads_kv * rest_m_v, rest_k_v, 32, 4, 4
+        ).reshape(
+            batch, nheads_kv, rest_m_v, rest_k_v, 32, 4, 4
+        ).permute(0, 1, 2, 3, 4, 5, 6).contiguous().permute(4, 5, 2, 6, 3, 1, 0)
+    elif pv_mode == "fp8":
         _fp8 = pv_fp8_dtype or cutlass.Float8E4M3FN
         _torch_fp8 = torch.float8_e4m3fn if _fp8 == cutlass.Float8E4M3FN else torch.float8_e5m2
         v_tensor = v_ref.to(dtype_gen).to(_torch_fp8)
     else:
         v_tensor = v_ref.to(dtype_gen)
 
-    return q_fp4, k_fp4, v_tensor, q_sf, k_sf, None, q_ref, k_ref, v_ref
+    return q_fp4, k_fp4, v_tensor, q_sf, k_sf, v_sf, q_ref, k_ref, v_ref
 
 
 def create_mxfp8_attention_tensors(
@@ -687,7 +756,13 @@ def main(
 
     # Benchmark configurations: (batch, seqlen, nheads, headdim)
     # Covers bench_fp4 defaults, video-gen (Wan2.1-1.3B: nheads=12, hdim=128), and larger models
-    configs = [
+    import os as _os
+    if _os.environ.get("FA4_BENCH_SEQS"):
+        configs = [(1, int(s), 24, 128) for s in _os.environ["FA4_BENCH_SEQS"].split(",")]
+    elif _os.environ.get("FA4_BENCH_H24_SWEEP") == "1":
+        configs = [(1, s, 24, 128) for s in (1024, 2048, 4096, 8192, 16384, 32768)]
+    else:
+        configs = [
         # bench_fp4 defaults (nheads=16, headdim=128)
         (1, 256, 16, 128),
         (1, 1024, 16, 128),
@@ -701,7 +776,14 @@ def main(
         (1, 4096, 24, 128),
         (1, 32768, 24, 128),
     ]
-    if pv_mode != "fp4" and sf_vec_size * 4 <= 64:
+    # Settle the GPU to a consistent clock/boost state before each shape so a
+    # long/hot preceding shape doesn't throttle the next one (default-on — the
+    # no-cooldown back-to-back sweep under-reported late shapes by ~15-30%).
+    # 0.8s is just above the measured minimum: 0s throttles a short shape to
+    # ~86%, 0.5s already recovers to 100%, ≥1s plateaus — 0.8s sits safely in
+    # the plateau while keeping the sweep's total idle time negligible.
+    _cooldown = 0.8
+    if pv_mode not in ("fp4", "mxfp8") and sf_vec_size * 4 <= 64 and not _os.environ.get("FA4_BENCH_H24_SWEEP") and not _os.environ.get("FA4_BENCH_SEQS"):
         # headdim=64 requires head_dim >= sf_vec_size*4 (block-scaled MMA atom K constraint).
         # MXFP8 (sf_vec_size=32) needs headdim >= 128; NVFP4 (sf_vec_size=16) supports d=64.
         configs.append((1, 32768, 24, 64))
@@ -716,7 +798,7 @@ def main(
     print(f"QK sf_vec_size: {sf_vec_size}")
     print("=" * 80)
 
-    use_nvfp4 = ab_dtype == cutlass.Float4E2M1FN and pv_mode != "fp4"
+    use_nvfp4 = ab_dtype == cutlass.Float4E2M1FN
     use_mxfp8 = ab_dtype == cutlass.Float8E4M3FN and pv_mode != "fp4"
 
     for batch_size, seqlen, nheads, headdim in configs:
@@ -724,6 +806,11 @@ def main(
         headdim_v = headdim
         seqlen_q = seqlen
         window_size = (None, None)
+
+        if _cooldown > 0:
+            import time as _time
+            torch.cuda.synchronize()
+            _time.sleep(_cooldown)  # let the GPU return to a consistent thermal/clock state
 
         print(f"\n### Batch={batch_size}, SeqLen={seqlen}, Nheads={nheads}, Headdim={headdim} ###")
 
@@ -969,9 +1056,9 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--pv_mode",
-        choices=["bf16", "fp4", "fp8"],
+        choices=["bf16", "fp4", "fp8", "mxfp8"],
         default="bf16",
-        help="PV path: bf16 baseline V, fp4 block-scaled V, or pure fp8 V",
+        help="PV path: bf16 baseline V, fp4/mxfp8 block-scaled V, or pure fp8 V",
     )
     parser.add_argument(
         "--fp8_dtype",
