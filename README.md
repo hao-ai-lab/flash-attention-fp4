@@ -1,9 +1,13 @@
 # FlashAttention (FP4 Fork)
 
- ## <img src="https://em-content.zobj.net/source/apple/391/star-struck_1f929.png" width="32"> FP4 Flash Attention 4 on B200
+ ## <img src="https://em-content.zobj.net/source/apple/391/star-struck_1f929.png" width="32"> FP4 Flash Attention 4 on Blackwell (GB300 / B200)
 
 > [!NOTE]
-> **This is a fork of [flash-attention](https://github.com/Dao-AILab/flash-attention) with the addition of a CuTe DSL FP4/FP8 implementation of Flash Attention 4 on B200 for the [Attn-QAT](https://arxiv.org/abs/2603.00040) paper.** Supports NVFP4 and MXFP8 block-scaled QK with BF16 or FP8 PV, achieving up to **1.31x speedup** over BF16 FA4 (2018 vs 1545 TFLOPS). Peaks at **2018 TFLOPS** (NVFP4+FP8), **1948 TFLOPS** (MXFP8+FP8), and **1920 TFLOPS** (NVFP4+BF16) on B200. See **[flash_attn/cute/README.md](flash_attn/cute/README.md)** for results and usage.
+> **This is a fork of [flash-attention](https://github.com/Dao-AILab/flash-attention) with the addition of a CuTe DSL FP4/FP8 implementation of Flash Attention 4 on NVIDIA Blackwell for the [Attn-QAT](https://arxiv.org/abs/2603.00040) paper.** Supports NVFP4 and MXFP8 block-scaled QK with BF16, FP8, or block-scaled (NVFP4/MXFP8) PV.
+>
+> **On GB300 (SM103)** it peaks at **2677 TFLOPS** (NVFP4+FP8) — a **1.75x speedup** over the BF16 FA4 reference at the same shape (2677 vs 1533 TFLOPS) — with **2383 TFLOPS** (MXFP8+FP8), **2337 TFLOPS** (NVFP4+BF16), and **2072 TFLOPS** (MXFP8+BF16). **On B200 (SM100)** it peaks at **2018 TFLOPS** (NVFP4+FP8), **1948 TFLOPS** (MXFP8+FP8), and **1920 TFLOPS** (NVFP4+BF16). See **[flash_attn/cute/README.md](flash_attn/cute/README.md)** for the full results and usage.
+
+![GB300 sequence-length sweep (h=24, d=128, non-causal)](flash_attn/cute/figures/gb300_tflops_h24.png)
 
 ---
 
