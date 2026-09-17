@@ -73,25 +73,29 @@ Per-call precision: cosine similarity ≥ 0.99 (block-scaled QK vs BF16 referenc
 
 All block-scaled QK × PV combinations (triton `do_bench`, GB300) — includes the
 SM103 ld.red row-max (incl. the BF16 ref), log-domain FP4 quant, the 3/4 FP8
-P-split, MXFP8 PV, and the block-scaled-PV SF-stepping fix:
+P-split, MXFP8 PV, the block-scaled-PV SF-stepping fix, the SF-store fence
+fix and the September 2026 softmax-warp tuning (x16 ld.red group maxes,
+hoisted group biases, row-sum placement, MXFP8 P store chunking):
 
 | Config | NVFP4+BF16 | NVFP4+FP8 | NVFP4+NVFP4 | NVFP4+MXFP8 | MXFP8+BF16 | MXFP8+FP8 | BF16 ref ² |
 |--------|----|----|----|----|----|----|----|
-| b=1 s=256 h=16 d=128 | 13 | 11 | 12 | 12 | 11 | 12 | **17** |
-| b=1 s=1024 h=16 d=128 | 232 | 203 | 200 | 209 | 221 | 242 | **289** |
-| b=4 s=4096 h=16 d=128 | 2227 | **2502** | 1524 | 1612 | 1849 | 2291 | 1508 |
-| b=1 s=32768 h=16 d=128 | 2337 | **2666** | 1720 | 1807 | 2072 | 2383 | 1585 |
-| b=4 s=4096 h=32 d=128 | 2196 | **2540** | 1544 | 1638 | 1879 | 2290 | 1475 |
-| b=1 s=4096 h=12 d=128 | 1458 | **1458** | 942 | 987 | 1227 | 1418 | 1017 |
-| b=1 s=32768 h=12 d=128 ¹ | 2276 | **2582** | 1646 | 1726 | 2021 | 2350 | 1584 |
-| b=1 s=4096 h=24 d=128 | 1949 | **2046** | 1291 | 1360 | 1611 | 1974 | 1322 |
-| b=1 s=32768 h=24 d=128 | 2235 | **2677** | 1725 | 1809 | 1974 | 2362 | 1533 |
-| b=1 s=32768 h=24 d=64 | 1209 | 1203 | — | — | — | — | **1221** |
+| b=1 s=256 h=16 d=128 | 10 | 12 | 10 | 10 | 11 | 11 | **15** |
+| b=1 s=1024 h=16 d=128 | 183 | 211 | 202 | 188 | 228 | 218 | **262** |
+| b=4 s=4096 h=16 d=128 | 2219 | **2618** | 1657 | 1851 | 1858 | 2393 | 1509 |
+| b=1 s=32768 h=16 d=128 | 2350 | **2789** | 1845 | 2016 | 2096 | 2535 | 1573 |
+| b=4 s=4096 h=32 d=128 | 2198 | **2640** | 1683 | 1881 | 1874 | 2397 | 1528 |
+| b=1 s=4096 h=12 d=128 | 1444 | **1549** | 1017 | 1131 | 1208 | 1514 | 1008 |
+| b=1 s=32768 h=12 d=128 ¹ | 2280 | **2689** | 1764 | 1924 | 2064 | 2412 | 1572 |
+| b=1 s=4096 h=24 d=128 | 1959 | **2166** | 1398 | 1549 | 1611 | 2076 | 1318 |
+| b=1 s=32768 h=24 d=128 | 2302 | **2780** | 1849 | 2020 | 2010 | 2472 | 1567 |
+| b=1 s=32768 h=24 d=64 | 1208 | **1339** | — | — | — | — | 1191 |
 
 All values in TFLOPS (measured with a per-shape cooldown so no shape is
 throttled by a hot predecessor — default-on in `bench_fp4`). Peak:
-**NVFP4+FP8 2677 TF**, **MXFP8+FP8 2383 TF**, **NVFP4+BF16 2337 TF**,
-**MXFP8+BF16 2072 TF**, **NVFP4+MXFP8 1809 TF**, **NVFP4+NVFP4 1725 TF**.
+**NVFP4+FP8 2789 TF**, **MXFP8+FP8 2535 TF**, **NVFP4+BF16 2350 TF**,
+**MXFP8+BF16 2096 TF**, **NVFP4+MXFP8 2020 TF**, **NVFP4+NVFP4 1849 TF**
+(re-measured 2026-09-17 after the softmax-warp tuning — see
+`debug/b300_fp4_pv_analysis.md`, "September 2026 pass").
 **—** = unsupported (d=64 needs head_dim ≥
 sf_vec_size × 4: NVFP4 PV and MXFP8 require 128). Small shapes (s ≤ 1024) are
 launch-latency dominated. MXFP8+x columns are MXFP8 QK (sf_vec 32, E8M0) with
