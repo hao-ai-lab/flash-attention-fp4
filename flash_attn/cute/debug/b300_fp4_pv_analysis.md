@@ -1,7 +1,7 @@
 # B300 Block-Scaled Attention Performance Analysis
 
 **GPU**: NVIDIA GB300 SXM6 AC (SM 10.3, 2070 MHz max boost, 148 SMs, 1300W, unlocked clocks)
-**Branch**: fp4_B300 · **cutlass-dsl**: 4.5.2 · **Updated**: 2026-06-12
+**Branch**: fp4_B300 · **cutlass-dsl**: 4.5.2 · **Updated**: 2026-09-17
 
 ## Summary
 
@@ -549,6 +549,132 @@ nvcc -gencode arch=compute_103a,code=sm_103a -O3 -o bench_cvt agent_space/bench_
 # Theoretical pipeline model (roofline-based, no GPU run needed)
 python3 flash_attn/cute/debug/visualize_pipeline.py
 ```
+
+## Optimizations — September 2026 pass (GB300, all bitwise-identical)
+
+Goal: speed up every mixed-precision config with **zero precision regression**.
+Every change below produces outputs **bitwise identical** to the previous
+kernel (harness: `agent_space/opt0916/check_all.py` — 6 modes x 4 shapes x 5
+repeats with *saved* inputs; `check_extra.py` — causal / GQA / cross-length;
+`check_d64.py` — head_dim 64), so accuracy tables are unchanged by
+construction.
+
+| Config (s=32768 h=24 d=128) | before | after | gain |
+|---|---|---|---|
+| NVFP4 QK + FP8 PV   | 2669 | **2780** | +4% (+11% at d=64) |
+| MXFP8 QK + FP8 PV   | 2416 | **2472** | +2% (+6% at s=4096) |
+| NVFP4 QK + NVFP4 PV | 1726 (racy) | **1930** | +12%, deterministic |
+| NVFP4 QK + MXFP8 PV | 1809 | **2020** | +12% |
+| NVFP4 / MXFP8 QK + BF16 PV | 2240 / 1979 | unchanged | MMA-bound |
+
+### Correctness fix found on the way: NVFP4-PV scale-factor race
+
+The "pre-existing 1-in-20 nondeterminism" was a real race and much more
+frequent than thought: at (2,4096,24,128) and (1,16384,32,128) **5/5**
+repeat runs differed (|diff| up to 0.05 on a few adjacent row pairs). Cause:
+the softmax warps R2S-store the P scale factors (`st.shared`) and signal
+`P_full`; the MMA warp then reads them with an *async* TC copy
+(`tcgen05.cp` smem->tmem). The mbarrier orders the warps but does not make
+the stores visible to the async.shared proxy. Fix: producer-side
+`fence_proxy("async.shared", space="cta")` right after the store
+(`FA4_FP4_PV_SFP_FENCE=1`, default). 20/20 runs identical afterwards. A
+consumer-side fence does **not** fix it. Cost: -6.5% on NVFP4 PV (more than
+recovered below); MXFP8 PV (1 store instead of 2) never reproduced the race
+and is not slowed by the fence. Tried and rejected: storing the SFs straight
+to TMEM from the softmax warps (`tcgen05.st .x1`, Cake-style) — correct and
+deterministic but 3-4.5% *slower* than store+fence (collective TC stores
+from 8 warps cost more than the fence).
+
+### What worked
+
+1. **x16 `tcgen05.ld.red` for NVFP4 P (+14%)** — `.num` may be `.x16`, so
+   splitting each x32 S-load atom into two x16 ld.red instructions makes the
+   TMEM controller return all eight 16-element *group* maxes; the whole
+   software FMNMX group reduce disappears (as the x32 tile max already did
+   for MXFP8 P). Bitwise: `m_g = fma(max s_raw)`, and since fma is monotonic
+   this equals `max fma(s_raw)` of the old software reduce — *provided the
+   same packed-FMA form is used* (`FA4_FP4_PV_LDRED_X16`, default on).
+2. **Hoist the per-group bias / SF chains out of the group loop (+4-7% NVFP4
+   PV)** — compute all `bias_g`, `SF_g = exp2(bias_g)` and the SF pack up
+   front, then run the elementwise loop. Same values, different source
+   structure; ptxas's schedule improves because every group's elementwise
+   work is unblocked at once. (A fully phase-major loop order measured
+   identical — what matters is getting the scalar chains out of the way.)
+3. **MXFP8 P: 8 TMEM store chunks instead of 4 (+7.5%)** —
+   `FA4_FP4_PV_TMEM_STORE_REP` default 4 for sf_vec 32 (NVFP4 P stays at 8;
+   it is best with 2 chunks).
+4. **Row-sum placement for FP8 PV (+4-5%)** — the 64 FADD2 of
+   `update_row_sum` ran alone after the end-of-step `wait corr` barrier;
+   moved into the exp2/F2FP block (`FA4_ROWSUM_POS`, "auto" = `pre_store`
+   for pure-FP8 PV) they fill idle issue slots. Neutral for BF16 PV.
+5. **Experimental, opt-in (`FA4_DECOUPLE_SP=1`): decoupled S/P TMEM layout.**
+   One shared S region; P, SFQ (per stage), SFK/SFV (shared) get dedicated
+   slots in the freed S1 space, so SFQ is copied once per Q tile, SFK/SFV once
+   per K-step, and the MMA warp issues QK(k+1) before PV(k). +3-6% MXFP8+FP8,
+   +1-3% NVFP4+FP8, bitwise identical on 93 checks (incl. causal/GQA/edge),
+   but its edge/flake sweep was cut short, so it stays off by default.
+   Pitfall met on the way: a long gating expression inside the jit
+   `__call__` made the DSL preprocessor take >25 min (looked like a GPU hang);
+   moved into a plain helper it compiles in 13 s.
+
+### How the bound was found without NCU
+
+NCU is still blocked on this box (`ERR_NVGPUCTRPERM`, needs root to clear
+`RmProfilingAdminOnly`). Substitute: **ablation probes** —
+`FA4_ABLATE=exp2,pack,scale,rowsum` deletes one class of softmax work
+(outputs become wrong; only the timing sensitivity is read). NVFP4+FP8,
+s=32768 h=24, baseline 2660 TF:
+
+| deleted | TF | delta |
+|---|---|---|
+| E4M3 pack (64 F2FP/row) | 3185 | +20% |
+| exp2 (128 EX2/row) | 2894 | +9% |
+| row_sum (64 FADD2/row) | 2892 | +9% |
+| all softmax compute | 4364 | +64% (= the TC-bound floor) |
+
+So these kernels are **softmax-warp bound**, not tensor-core bound: the PV/QK
+GEMMs fit in ~60% of a K-step. Post-`ptxas -O3` SASS shows the step is already
+tight (the ~620 PTX `mov`s per step are all coalesced away): per row-step
+128 EX2 + 64 FFMA2 + 64 F2FP(pack+merge) + 64 FADD2 for FP8 PV; NVFP4/MXFP8
+PV add 64 FADD2 (ptxas lowers the `fma(x,1,-bias)` pass to adds) plus the SF
+work. ~8 warps x 330 instr per ~1900-cycle K-step ~= 1.4 warp-instr/clk against
+an SM-wide issue ceiling of ~2/clk (the "64 lanes/clk" limit seen in the cvt
+microbenchmarks).
+
+Two non-obvious properties, both measured:
+- **Counts are not everything — chain heads matter.** Folding
+  `scale_subtract_rowmax` into the per-group bias FMA removes 64 FADD2/step
+  (verified in SASS, no spills) yet runs **12% slower**: the group FMAs then
+  wait on each group's scalar bias chain, whereas the 2-pass form starts its
+  first FMA pass right after the load. Deleting the bias pass, the group
+  row-sums or the SF store via ablation makes NVFP4 PV *slower* too
+  (1930 -> 1481 / 1382 / 1679). Throughput lands on discrete levels, i.e. it
+  depends on how ptxas interleaves the unit mix, not on a smooth cost model.
+- **The PV->QK->softmax ping-pong is not the bound by itself.** Baseline parks
+  P_i inside S_i's TMEM region, so each softmax WG idles ~50% (trace: wait
+  corr 20% + wait S 12%) while the TC runs PV_i then QK_i. A decoupled
+  schedule (QK_i(k+1) issued before PV_i(k)) with everything else equal
+  measured exactly 0% — the two WGs then contend for the same SM issue slots.
+
+### Tried, no gain (kept out of the kernel)
+
+- 2CTA MMA instructions: **0%** on GB300 even for the BF16 reference kernel
+  (`FA_DISABLE_2CTA=1`: 1592 vs 1577 TF) — not worth porting to the FP4 kernel.
+- exp2 emulation (`FA4_FORCE_E2E=1`): -8% (freq 16) / -16% (freq 8) on FP8 PV.
+- P-handoff split / store-rep / KV-stage-cap sweeps for FP8 PV and NVFP4 PV:
+  existing defaults are at the knee. `FA4_BF16_PV_TMEM_STORE_REP` (new knob):
+  8 neutral, 32 -12%.
+- x4 conversions (`cvt ... e4m3x4 / e2m1x4`) exist only with stochastic
+  rounding (`.rs`) — not bit-exact. Packed `ex2` exists only for bf16/f16.
+- Row-sum from the tensor core (extra all-ones V column => sum of the
+  *quantized* P): torch emulation shows it is NOT uniformly more accurate
+  (max_diff worse at long seqlen; mean error 0.0057 -> 0.0084 for peaky
+  attention) — rejected on the zero-regression rule before building it.
+- SF store placements (after the P stores, early before the elementwise
+  work), lighter `fence_view_async_shared`, `sub` instead of `fma(x,1,-b)`:
+  all identical speed.
+- Small shapes (s<=1024) are **host-bound** (GPU 0.006-0.012 ms vs ~0.07 ms
+  Python/FFI enqueue; the FP4 kernel is faster than the BF16 ref on-GPU).
 
 ## Results — PV Quantization (GB300)
 

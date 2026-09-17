@@ -1778,6 +1778,7 @@ def tmem_ld_red_max(
     tStS: cute.Tensor,
     tSrS: cute.Tensor,
     tile_maxes: Optional[cute.Tensor] = None,
+    red_tile: cutlass.Constexpr[int] = 32,
 ) -> cutlass.Float32:
     """SM103: fused TMEM load + row-max via raw tcgen05.ld.red PTX.
 
@@ -1786,9 +1787,11 @@ def tmem_ld_red_max(
     x32 load returns its 32 values plus their max in a 33rd register,
     computed in the TMEM controller at zero ALU cost.
 
-    If `tile_maxes` is given (size = number of x32 tiles), the per-tile
-    maxes are stored there too — for sf_vec_size=32 quantization (MXFP8 P)
-    each x32 tile max IS that scale-factor group's max.
+    If `tile_maxes` is given (size = number of reduction tiles), the per-tile
+    maxes are stored there too — when `red_tile` equals the P scale-factor
+    group size (32 for MXFP8 P, 16 for NVFP4 P) each tile max IS that
+    group's max. `red_tile` < 32 splits every x32 atom into 32/red_tile
+    ld.red instructions at consecutive column offsets.
 
     Ported from LopezCastroRoberto/flash-attention perf/ld.red-upstream.
     """
@@ -1800,32 +1803,42 @@ def tmem_ld_red_max(
     tStS_g = cute.group_modes(tStS, 1, cute.rank(tStS.shape))
     num_tiles = cute.size(tStS_g.shape[1])
     assert cute.size(tSrS) == num_tiles * 32
+    assert red_tile in (2, 4, 8, 16, 32)
+    sub = 32 // red_tile
     f32_ty = _ir.F32Type.get()
-    struct_ty = llvm.StructType.get_literal([f32_ty] * 33)
+    struct_ty = llvm.StructType.get_literal([f32_ty] * (red_tile + 1))
 
     asm_str = (
-        "tcgen05.ld.red.sync.aligned.32x32b.x32.f32.max"
-        " {" + ", ".join(f"${i}" for i in range(32)) + "}"
-        ", $32, [$33];\n"
+        f"tcgen05.ld.red.sync.aligned.32x32b.x{red_tile}.f32.max"
+        " {" + ", ".join(f"${i}" for i in range(red_tile)) + "}"
+        f", ${red_tile}, [${red_tile + 1}];\n"
     )
 
     row_max = cutlass.Float32(0.0)
     for k in cutlass.range_constexpr(num_tiles):
-        result = llvm.inline_asm(
-            struct_ty,
-            [tStS_g[None, k].iterator.toint().ir_value()],
-            asm_str,
-            "=f," * 33 + "r",
-            has_side_effects=True,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-        for i in cutlass.range_constexpr(32):
-            tSrS[k * 32 + i] = cutlass.Float32(llvm.extractvalue(f32_ty, result, [i]))
-        tile_max = cutlass.Float32(llvm.extractvalue(f32_ty, result, [32]))
-        if cutlass.const_expr(tile_maxes is not None):
-            tile_maxes[k] = tile_max
-        row_max = tile_max if cutlass.const_expr(k == 0) else cute.arch.fmax(row_max, tile_max)
+        base = tStS_g[None, k].iterator.toint()
+        for t in cutlass.range_constexpr(sub):
+            result = llvm.inline_asm(
+                struct_ty,
+                [(base + t * red_tile).ir_value()],
+                asm_str,
+                "=f," * (red_tile + 1) + "r",
+                has_side_effects=True,
+                is_align_stack=False,
+                asm_dialect=llvm.AsmDialect.AD_ATT,
+            )
+            for i in cutlass.range_constexpr(red_tile):
+                tSrS[k * 32 + t * red_tile + i] = cutlass.Float32(
+                    llvm.extractvalue(f32_ty, result, [i])
+                )
+            tile_max = cutlass.Float32(llvm.extractvalue(f32_ty, result, [red_tile]))
+            if cutlass.const_expr(tile_maxes is not None):
+                tile_maxes[k * sub + t] = tile_max
+            row_max = (
+                tile_max
+                if cutlass.const_expr(k == 0 and t == 0)
+                else cute.arch.fmax(row_max, tile_max)
+            )
     return row_max
 
 

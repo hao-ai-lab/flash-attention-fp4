@@ -328,16 +328,44 @@ class FlashAttentionForwardSm100:
         # +8-15% FP4 PV on GB300 (1388 -> 1595 TF at s=32768) at identical
         # measured accuracy vs the FP32 reference.
         self.fp4_pv_log2_quant = os.getenv("FA4_FP4_PV_LOG2_QUANT", "1") == "1"
+        # Where the non-quantized-PV row_sum reduce runs inside softmax_step
+        # (pure placement, bitwise identical): "end" = after the wait-corr
+        # barrier (original), "pre_corr" = after the P stores / P_full_2
+        # arrive, "pre_store" = right after exp2+pack, before the P stores.
+        # GB300: "pre_store" is +4-5% for pure-FP8 PV (NVFP4+FP8 2660 -> 2784,
+        # MXFP8+FP8 2359 -> 2486 TF at s=32768 h=24) — the 64 FADD2 fill idle
+        # issue slots inside the exp2/F2FP stream instead of running alone
+        # after the barrier; neutral for the MMA-bound BF16 PV ("auto" = that).
+        self.rowsum_pos = os.getenv("FA4_ROWSUM_POS", "auto")
+        # Decoupled S/P TMEM layout + schedule (resolved in __call__ once the
+        # dtypes are known).
+        self._decouple_sp_env = os.getenv("FA4_DECOUPLE_SP", "0") == "1"
+        self.decouple_sp = False
+        # EXPERIMENT: source-structure variants of the log-domain group quant
+        # (identical values). 0 = per group: bias, exp2, row-sum, pack.
+        # 1 = per group: bias, exp2, pack, row-sum. 2 = all group row-sums
+        # after all packs. 3 = all bias passes first, then per group.
+        self.fp4_pv_qvar = int(os.getenv("FA4_FP4_PV_QVAR", "0"))
+        assert self.rowsum_pos in ("auto", "end", "pre_corr", "pre_store")
+        # DEBUG ONLY (wrong outputs): delete one class of softmax-warp work to
+        # measure how sensitive end-to-end time is to it. Comma list of
+        # {exp2, pack, scale, rowsum}.
+        self.ablate = set(filter(None, os.getenv("FA4_ABLATE", "").split(",")))
+        # NVFP4 P (16-element groups): x16 ld.red so the TMEM controller also
+        # returns every SF group's max — removes the whole software FMNMX
+        # group reduce (the x32 tile max already did this for MXFP8 P).
+        # Bitwise identical (fma is monotonic, so fma(max s) == max fma(s));
+        # +14% NVFP4 PV on GB300 (1610 -> 1848 TF at s=32768 h=24).
+        self.fp4_pv_ldred_x16 = os.getenv("FA4_FP4_PV_LDRED_X16", "1") == "1"
         # Fence the async.shared proxy after the P scale-factor R2S store.
         # The MMA warp reads sSFP with an async TC copy (tcgen05.cp
-        # smem->tmem) right after P_full; the mbarrier orders the warps but
-        # does not make the producer's st.shared visible to that proxy, so the
-        # copy could read stale SF bytes: NVFP4 PV outputs differed run-to-run
-        # (5/5 runs at (2,4096,24,128), |diff| up to 0.05 on a few adjacent
-        # row pairs). Producer-side fence (right after the store) fixes it —
-        # 20/20 runs bitwise identical; a consumer-side fence in the MMA warp
-        # does NOT. 0 = off (debug only).
-        self.fp4_pv_sfp_fence = os.getenv("FA4_FP4_PV_SFP_FENCE", "1") == "1"
+        # smem->tmem) right after P_full; without the fence that copy can
+        # observe stale SF bytes — NVFP4 PV outputs differed run-to-run on
+        # 5/5 runs (|diff| up to 0.05 on a few adjacent row pairs). The fence
+        # must be on the producer side (1 = right after the store, 2 = right
+        # before the P_full arrive — same speed; a consumer-side fence in
+        # the MMA warp does NOT fix it). 0=off (debug only).
+        self.fp4_pv_sfp_fence = int(os.getenv("FA4_FP4_PV_SFP_FENCE", "1"))
         # SM103 tcgen05.ld.red: fused TMEM S load + per-x32-tile max — row max
         # nearly free for all PV modes (and free MXFP8 P group maxes).
         self.use_ldred_rowmax = os.getenv(
@@ -448,6 +476,48 @@ class FlashAttentionForwardSm100:
             else 0
         )
         assert self.uneven_kv_smem_offset % 1024 == 0
+
+    def _resolve_decouple_sp(self, no_block_sparsity: bool):
+        # Decoupled S/P pipeline. The baseline parks P_i (and the block scale
+        # factors) inside S_i's TMEM region, so QK_i(k+1) can only be issued
+        # after PV_i(k) consumed P_i(k), and every SF must be re-copied every
+        # K-step because S overwrites its slot. Here both stages share ONE S
+        # region (free as soon as the softmax WG has loaded it) and P / SFs get
+        # dedicated slots in the freed S1 space [128,256):
+        #   P0 | P1 | SFQ0 | SFQ1 | SFK (shared) | SFP0 | SFP1 | SFV (shared)
+        # so SFQ is copied once per Q tile, SFK/SFV once per K-step instead of
+        # once per stage, and the MMA warp issues QK_i(k+1) before PV_i(k).
+        self.decouple_sp = (
+            self._decouple_sp_env
+            and self.q_stage == 2
+            and self.quant_qk
+            and self.v_dtype.width <= 8
+            and self.n_block_size == 128
+            and self.m_block_size == 128
+            and self.head_dim_v_padded == 128
+            and self.head_dim_padded == 128
+            and not self.s0_s1_barrier
+            and no_block_sparsity
+            and self.sfqk_tmem_slot == "s"
+            and not self.fp4_pv_quant_store_pipeline
+        )
+        if self.decouple_sp:
+            _p_cols = self.n_block_size * self.v_dtype.width // 32  # P_i width in u32 columns
+            _sfqk_cols = (self.m_block_size // 32) * self.mma_inst_tile_k
+            _sf_base = self.n_block_size + 2 * _p_cols
+            self.tmem_s_offset = [0, 0]
+            self.tmem_vec_offset = self.tmem_s_offset
+            self.tmem_p_offset = [self.n_block_size, self.n_block_size + _p_cols]
+            self.tmem_sfq_offset = [_sf_base, _sf_base + _sfqk_cols]
+            self.tmem_sfk_offset = _sf_base + 2 * _sfqk_cols
+            _pv_sf_base = _sf_base + 3 * _sfqk_cols
+            # P/V scale factors: 8 columns per tensor for NVFP4 (2 K-tiles x 4),
+            # 4 for MXFP8 (the 4 K-tile SFs share one u32, selected by SF-ID).
+            _sfpv_cols = 8
+            self.tmem_sfp_offset = [_pv_sf_base, _pv_sf_base + _sfpv_cols]
+            self.tmem_sfv_offset = _pv_sf_base + 2 * _sfpv_cols
+            _tmem_end = _pv_sf_base + (3 * _sfpv_cols if self.quant_pv else 0)
+            assert _tmem_end <= 2 * self.n_block_size, f"decoupled TMEM layout overflows S1: {_tmem_end}"
 
     @cute.jit
     def __call__(
@@ -614,6 +684,7 @@ class FlashAttentionForwardSm100:
         ):
             raise TypeError(f"Type mismatch: {self.q_dtype} != {self.v_dtype} (V quantization requires matching dtype or MXFP8 PV)")
         self._setup_attributes()
+        self._resolve_decouple_sp(blocksparse_tensors is None)
         self.use_tma_O = self.arch >= 90 and mCuSeqlensQ is None and mSeqUsedQ is None
         # Apply FP8 PV tuning overrides when v_dtype is FP8
         if const_expr(not self.quant_pv and self.v_dtype.width == 8):
@@ -1630,6 +1701,10 @@ class FlashAttentionForwardSm100:
                 sfq_stage_order = tuple(
                     self.q_stage - 1 - stage for stage in range(self.q_stage)
                 )
+            if const_expr(self.decouple_sp):
+                # Dedicated per-stage SFQ slots (S is a single shared region).
+                sfq_base_offsets = self.tmem_sfq_offset
+                sfq_stage_order = tuple(range(self.q_stage))
             sfq_tmem_ptrs_f32 = [
                 cute.make_ptr(
                     Float32,
@@ -1663,6 +1738,17 @@ class FlashAttentionForwardSm100:
                 cute.recast_ptr(sfq_tmem_ptrs_f32[stage] + sfq_tmem_cols, dtype=self.sf_dtype)
                 for stage in range(self.q_stage)
             ]
+            if const_expr(self.decouple_sp):
+                # Both stages multiply against the same K block: one shared
+                # SFK slot, copied once per K-step.
+                sfk_tmem_ptrs = [
+                    cute.recast_ptr(
+                        cute.make_ptr(Float32, self.tmem_sfk_offset,
+                                      mem_space=cute.AddressSpace.tmem, assumed_align=align),
+                        dtype=self.sf_dtype,
+                    )
+                    for stage in range(self.q_stage)
+                ]
 
             # (MMA, MMA_N, MMA_K)
             tCtSFK_layout = blockscaled_utils.make_tmem_layout_sfb(
@@ -1679,7 +1765,8 @@ class FlashAttentionForwardSm100:
         tCtSFVs = [None] * self.q_stage
         if const_expr(self.quant_pv):
             sfp_tmem_ptrs = [cute.recast_ptr(
-                            cute.make_ptr(Float32, self.tmem_s_offset[stage],
+                            cute.make_ptr(Float32,
+                            self.tmem_sfp_offset[stage] if const_expr(self.decouple_sp) else self.tmem_s_offset[stage],
                             mem_space=cute.AddressSpace.tmem, assumed_align=align),
                             dtype=self.sf_dtype_pv) for stage in range(self.q_stage)]
             # (MMA, MMA_M, MMA_K) 
@@ -1699,6 +1786,17 @@ class FlashAttentionForwardSm100:
             sf_dtype_per_u32 = 32 // self.sf_dtype_pv.width
             sfp_offset = math.ceil(tcgen05.find_tmem_tensor_col_offset(tCtSFPs[0]) * sf_dtype_per_u32 / align) * align
             sfv_tmem_ptrs = [sfp_tmem_ptrs[stage] + sfp_offset for stage in range(self.q_stage)]
+            if const_expr(self.decouple_sp):
+                assert sfp_offset <= 8 * sf_dtype_per_u32, "SFP does not fit its decoupled TMEM slot"
+                # Both stages multiply against the same V block: shared SFV slot.
+                sfv_tmem_ptrs = [
+                    cute.recast_ptr(
+                        cute.make_ptr(Float32, self.tmem_sfv_offset,
+                                      mem_space=cute.AddressSpace.tmem, assumed_align=align),
+                        dtype=self.sf_dtype_pv,
+                    )
+                    for stage in range(self.q_stage)
+                ]
 
             # (MMA, MMA_N, MMA_K) for P*V operation (V is the B matrix)
             tCtSFV_layout = blockscaled_utils.make_tmem_layout_sfb(
@@ -2502,149 +2600,216 @@ class FlashAttentionForwardSm100:
                 block_loop_count = block_iter_count - 1
                 O_should_accumulate = False
                 for i in cutlass.range(block_loop_count, unroll=1):
-                    # GEMM_PV00 (P0 * V0 -> O0_partial), O0 needs to be accumulated in the seqlen_kv loop
-                    # 1. wait for V0
-                    if const_expr(prof is not None):
-                        prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_MMA_WAIT_KV, fa4_prof.EVENT_BEGIN, prof_pred)
-                    pipeline_kv.consumer_wait(mma_kv_consumer_state)
-                    if const_expr(prof is not None):
-                        prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_MMA_WAIT_KV, fa4_prof.EVENT_END, prof_pred)
-                    mma_kv_release_state = mma_kv_consumer_state.clone()
-                    Vi_index, Vi_phase = mma_kv_consumer_state.index, mma_kv_consumer_state.phase
-                    tOrVi = tOrV[None, None, None, Vi_index]
-                    for stage in cutlass.range_constexpr(self.q_stage):
-                        # 2. acquire corrected O0/O1_partial and P0 / P1
-                        # For the first iteration in this work tile, waiting for O0/O1_partial
-                        # means that the correction warps has finished reading tO during
-                        # the last iteration of the previous work tile has finished.
-                        if const_expr(prof is not None):
-                            prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_MMA_WAIT_P, fa4_prof.EVENT_BEGIN, prof_pred)
-                        cute.arch.mbarrier_wait(
-                            mbar_ptr + self.mbar_P_full_O_rescaled_offset + stage,
-                            P_full_O_rescaled_phase,
-                        )
-                        if const_expr(prof is not None):
-                            prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_MMA_WAIT_P, fa4_prof.EVENT_END, prof_pred)
-                        # 3. gemm
-                        # sm100_utils.gemm(tiled_mma_pv, tOtO0, tOrP0, tOrVi, zero_init=True)
-                        # gemm_Pi[stage](tCrB=tOrVi, sB=sV[None, None, None, Vi_index], zero_init=not O_should_accumulate)
-                        
-                        # No need for mbar.wait because it depends on the same Si as the prev qk mma
-                        if const_expr(self.quant_pv):
-                            # S2T copy SFP: sSFP (smem) -> tCtSFPs (tmem)
-                            _, _, tCtSFP_compact_s2t = tiled_copy_s2t_sfp_staged[stage]
-                            tCsSFP_compact_s2t_cur = tCsSFP_compact_s2t[None, None, None, None, stage]
-                            cute.copy(
-                                tiled_copy_s2t_sfp,
-                                tCsSFP_compact_s2t_cur,
-                                tCtSFP_compact_s2t,
-                            )
-                            # S2T copy SFV: sSFV (smem) -> tCtSFVs (tmem)
-                            _, _, tCtSFV_compact_s2t = tiled_copy_s2t_sfv_staged[stage]
-                            tCsSFV_compact_s2t_staged = tCsSFV_compact_s2t[None, None, None, None, Vi_index]
-                            cute.copy(
-                                tiled_copy_s2t_sfv,
-                                tCsSFV_compact_s2t_staged,
-                                tCtSFV_compact_s2t,
-                            )
-
-                        sV_cur = sV[None, None, None, Vi_index]
-                        if const_expr(self.uneven_kv_smem):
-                            sV_cur = self.offset_kv_smem(sV_cur, Vi_index, Vi_phase)
-
-                        if const_expr(prof is not None):
-                            prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_PV_GEMM, fa4_prof.EVENT_BEGIN, prof_pred)
-                            # The PV issue sequence embeds a wait for P's 2nd
-                            # half; the GEMM's PTX stores %clock around it
-                            # (st.shared when the buffer is in smem).
-                            prof_k, _pts_b, _pts_e = fa4_prof.prof_reserve_pair_ts(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_PV_WAIT_P2, prof_pred)
-                            gemm_Pi[stage](
-                                tCrB=tOrVi,
-                                sB=sV_cur,
-                                zero_init=not O_should_accumulate,
-                                mbar_ptr=mbar_ptr + self.mbar_P_full_2_offset + stage,
-                                mbar_phase=P_full_O_rescaled_phase,
-                                prof_ts_addrs=(_pts_b, _pts_e),
-                                prof_ts_smem=fa4_prof.is_smem_profiling(),
-                            )
-                            prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_PV_GEMM, fa4_prof.EVENT_END, prof_pred)
-                        else:
-                            gemm_Pi[stage](
-                                tCrB=tOrVi,
-                                sB=sV_cur,
-                                zero_init=not O_should_accumulate,
-                                mbar_ptr=mbar_ptr + self.mbar_P_full_2_offset + stage,
-                                mbar_phase=P_full_O_rescaled_phase,
-                            )
-
-                        # 4. release accumulated O0_partial / O1_partial
-                        # Don't need to signal O_full to the correction warps anymore since the
-                        # correction warps wait for the softmax warps anyway. By the time the softmax
-                        # warps finished, S_i for the next iteration must have been done, so O_i-1
-                        # must have been done as well.
-                        # with cute.arch.elect_one():
-                        #     tcgen05.commit(mbar_ptr + self.mbar_O_full_offset + stage)
-                        # 5. release V(i-1)
-                        if const_expr(stage == 1):
-                            pipeline_kv.consumer_release(mma_kv_release_state)
-                            mma_kv_release_state.advance()
-                        # End of GEMM_PV00 (P0 * V0 -> O0_partial)
-
-                        # GEMM_QK0i (Q0 * Ki -> S0)
-                        # 1. wait for Ki
-                        if const_expr(stage == 0):
-                            mma_kv_consumer_state.advance()
-                            pipeline_kv.consumer_wait(mma_kv_consumer_state)
+                    if const_expr(self.decouple_sp):
+                        # Decoupled schedule: QK_i(k+1) is issued BEFORE
+                        # PV_i(k). S is one shared region that is free once
+                        # the other stage's softmax WG has loaded it (the
+                        # sfqk_load barrier), and P_i has its own region, so
+                        # softmax_i finds S_i(k+1) ready when it finishes P_i(k).
+                        # 1. wait for V_k, then K_(k+1) (both stay acquired)
+                        pipeline_kv.consumer_wait(mma_kv_consumer_state)
+                        mma_kv_release_state = mma_kv_consumer_state.clone()
+                        Vi_index, Vi_phase = mma_kv_consumer_state.index, mma_kv_consumer_state.phase
+                        tOrVi = tOrV[None, None, None, Vi_index]
+                        mma_kv_consumer_state.advance()
+                        pipeline_kv.consumer_wait(mma_kv_consumer_state)
                         Ki_index, Ki_phase = mma_kv_consumer_state.index, mma_kv_consumer_state.phase
-                        # 2. gemm
-                        # Don't need to wait for the softmax warp to have finished reading the previous
-                        # Si, since this gemm is scheduled after the PV gemm, which guaranteed that Si
-                        # has been read and Pi has been written.
-                        # tiled_mma_qk = sm100_utils.gemm(tiled_mma_qk, tStSs[stage], tSrQs[stage], tSrK[None, None, None, Ki_index], zero_init=True)
-
-                        if const_expr(self.quant_qk):
-                            _, _, tCtSFQ_compact_s2t = tiled_copy_s2t_sfq_staged[stage]
-                            tCsSFQ_compact_s2t_staged = tCsSFQ_compact_s2t[None, None, None, None, stage]
+                        for stage in cutlass.range_constexpr(self.q_stage):
+                            # 2. QK_stage(k+1): needs the shared S region free,
+                            # i.e. softmax (1 - stage) has loaded its S. SFQ
+                            # already sits in its dedicated slot (prologue).
                             sm100_utils.tcgen05_after_thread_sync()
                             cute.arch.mbarrier_wait(mbar_ptr + self.mbar_sfqk_load_offset + stage, mma_sfqk_producer_phase)
-                            if const_expr(not self.debug_skip_sfq_s2t):
-                                cute.copy(
-                                    tiled_copy_s2t_sfq,
-                                    tCsSFQ_compact_s2t_staged,
-                                    tCtSFQ_compact_s2t,
-                                )
-                            _, _, tCtSFK_compact_s2t = tiled_copy_s2t_sfk_staged[stage]
-                            tCsSFK_compact_s2t_staged = tCsSFK_compact_s2t[None, None, None, None, mma_kv_consumer_state.index]
-                            if const_expr(not self.debug_skip_sfk_s2t):
-                                cute.copy(
-                                    tiled_copy_s2t_sfk,
-                                    tCsSFK_compact_s2t_staged,
-                                    tCtSFK_compact_s2t,
-                                )
-
-                        sK_cur = sK[None, None, None, Ki_index]
-                        if const_expr(self.uneven_kv_smem):
-                            sK_cur = self.offset_kv_smem(sK_cur, Ki_index, Ki_phase)
-
-                        if const_expr(prof is not None):
-                            prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_QK_GEMM, fa4_prof.EVENT_BEGIN, prof_pred)
-                        gemm_Si[stage](
-                            tCrB=tSrK[None, None, None, Ki_index],  # tCrB
-                            sB=sK_cur,  # sB
-                        )
-                        # 3. release S0
-                        with cute.arch.elect_one():
-                            tcgen05.commit(mbar_ptr + self.mbar_S_full_offset + stage)
-                        if const_expr(prof is not None):
-                            prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_QK_GEMM, fa4_prof.EVENT_END, prof_pred)
-                        # End of GEMM_QK0i (Q0 * Ki -> S0)
-                    # 4. release Ki
-                    pipeline_kv.consumer_release(mma_kv_consumer_state)
-                    mma_kv_consumer_state.advance()
-                    P_full_O_rescaled_phase ^= 1
-                    if const_expr(self.quant_qk):
+                            if const_expr(stage == 0):
+                                # Shared SFK slot: K_(k+1) serves both stages.
+                                _, _, tCtSFK_compact_s2t = tiled_copy_s2t_sfk_staged[stage]
+                                tCsSFK_compact_s2t_staged = tCsSFK_compact_s2t[None, None, None, None, Ki_index]
+                                cute.copy(tiled_copy_s2t_sfk, tCsSFK_compact_s2t_staged, tCtSFK_compact_s2t)
+                            gemm_Si[stage](
+                                tCrB=tSrK[None, None, None, Ki_index],
+                                sB=sK[None, None, None, Ki_index],
+                            )
+                            with cute.arch.elect_one():
+                                tcgen05.commit(mbar_ptr + self.mbar_S_full_offset + stage)
+                            # 3. PV_stage(k): wait for P_stage(k) and the O rescale
+                            cute.arch.mbarrier_wait(
+                                mbar_ptr + self.mbar_P_full_O_rescaled_offset + stage,
+                                P_full_O_rescaled_phase,
+                            )
+                            if const_expr(self.quant_pv):
+                                # SFP_stage (from the softmax WG, via smem) and
+                                # the shared SFV slot (V_k serves both stages).
+                                _, _, tCtSFP_compact_s2t = tiled_copy_s2t_sfp_staged[stage]
+                                tCsSFP_compact_s2t_cur = tCsSFP_compact_s2t[None, None, None, None, stage]
+                                cute.copy(tiled_copy_s2t_sfp, tCsSFP_compact_s2t_cur, tCtSFP_compact_s2t)
+                                if const_expr(stage == 0):
+                                    _, _, tCtSFV_compact_s2t = tiled_copy_s2t_sfv_staged[stage]
+                                    tCsSFV_compact_s2t_staged = tCsSFV_compact_s2t[None, None, None, None, Vi_index]
+                                    cute.copy(tiled_copy_s2t_sfv, tCsSFV_compact_s2t_staged, tCtSFV_compact_s2t)
+                            gemm_Pi[stage](
+                                tCrB=tOrVi,
+                                sB=sV[None, None, None, Vi_index],
+                                zero_init=not O_should_accumulate,
+                                mbar_ptr=mbar_ptr + self.mbar_P_full_2_offset + stage,
+                                mbar_phase=P_full_O_rescaled_phase,
+                            )
+                            # The correction warps may rescale O_stage for step
+                            # k+1 only after this accumulate has finished.
+                            with cute.arch.elect_one():
+                                tcgen05.commit(mbar_ptr + self.mbar_O_full_offset + stage)
+                        # 4. release V_k, then K_(k+1)
+                        pipeline_kv.consumer_release(mma_kv_release_state)
+                        mma_kv_release_state.advance()
+                        pipeline_kv.consumer_release(mma_kv_consumer_state)
+                        mma_kv_consumer_state.advance()
+                        P_full_O_rescaled_phase ^= 1
                         mma_sfqk_producer_phase ^= 1
-                    O_should_accumulate = True
+                        O_should_accumulate = True
+                    else:
+                        # GEMM_PV00 (P0 * V0 -> O0_partial), O0 needs to be accumulated in the seqlen_kv loop
+                        # 1. wait for V0
+                        if const_expr(prof is not None):
+                            prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_MMA_WAIT_KV, fa4_prof.EVENT_BEGIN, prof_pred)
+                        pipeline_kv.consumer_wait(mma_kv_consumer_state)
+                        if const_expr(prof is not None):
+                            prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_MMA_WAIT_KV, fa4_prof.EVENT_END, prof_pred)
+                        mma_kv_release_state = mma_kv_consumer_state.clone()
+                        Vi_index, Vi_phase = mma_kv_consumer_state.index, mma_kv_consumer_state.phase
+                        tOrVi = tOrV[None, None, None, Vi_index]
+                        for stage in cutlass.range_constexpr(self.q_stage):
+                            # 2. acquire corrected O0/O1_partial and P0 / P1
+                            # For the first iteration in this work tile, waiting for O0/O1_partial
+                            # means that the correction warps has finished reading tO during
+                            # the last iteration of the previous work tile has finished.
+                            if const_expr(prof is not None):
+                                prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_MMA_WAIT_P, fa4_prof.EVENT_BEGIN, prof_pred)
+                            cute.arch.mbarrier_wait(
+                                mbar_ptr + self.mbar_P_full_O_rescaled_offset + stage,
+                                P_full_O_rescaled_phase,
+                            )
+                            if const_expr(prof is not None):
+                                prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_MMA_WAIT_P, fa4_prof.EVENT_END, prof_pred)
+                            # 3. gemm
+                            # sm100_utils.gemm(tiled_mma_pv, tOtO0, tOrP0, tOrVi, zero_init=True)
+                            # gemm_Pi[stage](tCrB=tOrVi, sB=sV[None, None, None, Vi_index], zero_init=not O_should_accumulate)
+                        
+                            # No need for mbar.wait because it depends on the same Si as the prev qk mma
+                            if const_expr(self.quant_pv):
+                                # S2T copy SFP: sSFP (smem) -> tCtSFPs (tmem)
+                                _, _, tCtSFP_compact_s2t = tiled_copy_s2t_sfp_staged[stage]
+                                tCsSFP_compact_s2t_cur = tCsSFP_compact_s2t[None, None, None, None, stage]
+                                cute.copy(
+                                    tiled_copy_s2t_sfp,
+                                    tCsSFP_compact_s2t_cur,
+                                    tCtSFP_compact_s2t,
+                                )
+                                # S2T copy SFV: sSFV (smem) -> tCtSFVs (tmem)
+                                _, _, tCtSFV_compact_s2t = tiled_copy_s2t_sfv_staged[stage]
+                                tCsSFV_compact_s2t_staged = tCsSFV_compact_s2t[None, None, None, None, Vi_index]
+                                cute.copy(
+                                    tiled_copy_s2t_sfv,
+                                    tCsSFV_compact_s2t_staged,
+                                    tCtSFV_compact_s2t,
+                                )
+
+                            sV_cur = sV[None, None, None, Vi_index]
+                            if const_expr(self.uneven_kv_smem):
+                                sV_cur = self.offset_kv_smem(sV_cur, Vi_index, Vi_phase)
+
+                            if const_expr(prof is not None):
+                                prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_PV_GEMM, fa4_prof.EVENT_BEGIN, prof_pred)
+                                # The PV issue sequence embeds a wait for P's 2nd
+                                # half; the GEMM's PTX stores %clock around it
+                                # (st.shared when the buffer is in smem).
+                                prof_k, _pts_b, _pts_e = fa4_prof.prof_reserve_pair_ts(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_PV_WAIT_P2, prof_pred)
+                                gemm_Pi[stage](
+                                    tCrB=tOrVi,
+                                    sB=sV_cur,
+                                    zero_init=not O_should_accumulate,
+                                    mbar_ptr=mbar_ptr + self.mbar_P_full_2_offset + stage,
+                                    mbar_phase=P_full_O_rescaled_phase,
+                                    prof_ts_addrs=(_pts_b, _pts_e),
+                                    prof_ts_smem=fa4_prof.is_smem_profiling(),
+                                )
+                                prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_PV_GEMM, fa4_prof.EVENT_END, prof_pred)
+                            else:
+                                gemm_Pi[stage](
+                                    tCrB=tOrVi,
+                                    sB=sV_cur,
+                                    zero_init=not O_should_accumulate,
+                                    mbar_ptr=mbar_ptr + self.mbar_P_full_2_offset + stage,
+                                    mbar_phase=P_full_O_rescaled_phase,
+                                )
+
+                            # 4. release accumulated O0_partial / O1_partial
+                            # Don't need to signal O_full to the correction warps anymore since the
+                            # correction warps wait for the softmax warps anyway. By the time the softmax
+                            # warps finished, S_i for the next iteration must have been done, so O_i-1
+                            # must have been done as well.
+                            # with cute.arch.elect_one():
+                            #     tcgen05.commit(mbar_ptr + self.mbar_O_full_offset + stage)
+                            # 5. release V(i-1)
+                            if const_expr(stage == 1):
+                                pipeline_kv.consumer_release(mma_kv_release_state)
+                                mma_kv_release_state.advance()
+                            # End of GEMM_PV00 (P0 * V0 -> O0_partial)
+
+                            # GEMM_QK0i (Q0 * Ki -> S0)
+                            # 1. wait for Ki
+                            if const_expr(stage == 0):
+                                mma_kv_consumer_state.advance()
+                                pipeline_kv.consumer_wait(mma_kv_consumer_state)
+                            Ki_index, Ki_phase = mma_kv_consumer_state.index, mma_kv_consumer_state.phase
+                            # 2. gemm
+                            # Don't need to wait for the softmax warp to have finished reading the previous
+                            # Si, since this gemm is scheduled after the PV gemm, which guaranteed that Si
+                            # has been read and Pi has been written.
+                            # tiled_mma_qk = sm100_utils.gemm(tiled_mma_qk, tStSs[stage], tSrQs[stage], tSrK[None, None, None, Ki_index], zero_init=True)
+
+                            if const_expr(self.quant_qk):
+                                _, _, tCtSFQ_compact_s2t = tiled_copy_s2t_sfq_staged[stage]
+                                tCsSFQ_compact_s2t_staged = tCsSFQ_compact_s2t[None, None, None, None, stage]
+                                sm100_utils.tcgen05_after_thread_sync()
+                                cute.arch.mbarrier_wait(mbar_ptr + self.mbar_sfqk_load_offset + stage, mma_sfqk_producer_phase)
+                                if const_expr(not self.debug_skip_sfq_s2t):
+                                    cute.copy(
+                                        tiled_copy_s2t_sfq,
+                                        tCsSFQ_compact_s2t_staged,
+                                        tCtSFQ_compact_s2t,
+                                    )
+                                _, _, tCtSFK_compact_s2t = tiled_copy_s2t_sfk_staged[stage]
+                                tCsSFK_compact_s2t_staged = tCsSFK_compact_s2t[None, None, None, None, mma_kv_consumer_state.index]
+                                if const_expr(not self.debug_skip_sfk_s2t):
+                                    cute.copy(
+                                        tiled_copy_s2t_sfk,
+                                        tCsSFK_compact_s2t_staged,
+                                        tCtSFK_compact_s2t,
+                                    )
+
+                            sK_cur = sK[None, None, None, Ki_index]
+                            if const_expr(self.uneven_kv_smem):
+                                sK_cur = self.offset_kv_smem(sK_cur, Ki_index, Ki_phase)
+
+                            if const_expr(prof is not None):
+                                prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_QK_GEMM, fa4_prof.EVENT_BEGIN, prof_pred)
+                            gemm_Si[stage](
+                                tCrB=tSrK[None, None, None, Ki_index],  # tCrB
+                                sB=sK_cur,  # sB
+                            )
+                            # 3. release S0
+                            with cute.arch.elect_one():
+                                tcgen05.commit(mbar_ptr + self.mbar_S_full_offset + stage)
+                            if const_expr(prof is not None):
+                                prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_QK_GEMM, fa4_prof.EVENT_END, prof_pred)
+                            # End of GEMM_QK0i (Q0 * Ki -> S0)
+                        # 4. release Ki
+                        pipeline_kv.consumer_release(mma_kv_consumer_state)
+                        mma_kv_consumer_state.advance()
+                        P_full_O_rescaled_phase ^= 1
+                        if const_expr(self.quant_qk):
+                            mma_sfqk_producer_phase ^= 1
+                        O_should_accumulate = True
+
                 # End of seqlen_kv loop
 
                 # release Q0 & Q1
@@ -2782,7 +2947,11 @@ class FlashAttentionForwardSm100:
         tStP_layout = cute.composition(
             tStSi.layout, cute.make_layout((self.m_block_size, tilePlikeFP32))
         )
-        tStP = cute.make_tensor(tStSi.iterator + self.tmem_s_to_p_offset, tStP_layout)
+        if const_expr(self.decouple_sp):
+            _p_rel = self.tmem_p_offset[0] if stage == 0 else self.tmem_p_offset[1]
+            tStP = cute.make_tensor(tStSi.iterator + _p_rel, tStP_layout)
+        else:
+            tStP = cute.make_tensor(tStSi.iterator + self.tmem_s_to_p_offset, tStP_layout)
 
         tmem_load_atom = cute.make_copy_atom(
             tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)),
@@ -2801,7 +2970,12 @@ class FlashAttentionForwardSm100:
         fp8_pv_default_store_rep = 4 if self.head_dim_v_padded <= 64 else 8
         # FP4 PV: smaller rep = more P store chunks = finer-grained P handoff
         # to the PV MMA (combined with FA4_FP4_PV_P_SPLIT_NUM/DEN).
-        fp4_pv_store_rep = int(os.getenv("FA4_FP4_PV_TMEM_STORE_REP", "8"))
+        # GB300: MXFP8 P (E4M3, 32 u32/row) wants 8 store chunks (rep 4:
+        # 1876 -> 2018 TF); NVFP4 P (16 u32/row) is best at 2 chunks (rep 8).
+        fp4_pv_store_rep = int(os.getenv(
+            "FA4_FP4_PV_TMEM_STORE_REP", "4" if self.sf_vec_size_pv == 32 else "8"
+        ))
+        bf16_pv_store_rep = int(os.getenv("FA4_BF16_PV_TMEM_STORE_REP", "16"))
         tmem_store_atom = cute.make_copy_atom(
             tcgen05.copy.St32x32bOp(
                 tcgen05.copy.Repetition(
@@ -2810,7 +2984,7 @@ class FlashAttentionForwardSm100:
                     ) else
                     fp8_pv_default_store_rep if const_expr(not self.quant_pv and self.v_dtype.width == 8) else
                     fp4_pv_store_rep if const_expr(self.quant_pv) else
-                    16
+                    bf16_pv_store_rep
                 )
             ),
             Float32,
@@ -3178,6 +3352,61 @@ class FlashAttentionForwardSm100:
         return tSrPSF_f32, tSrPSF
 
     @cute.jit
+    def _q_bias_pass(self, acc_S_frag: cute.Tensor, g: cutlass.Constexpr[int], bias: Float32):
+        # exp2 argument with the group scale folded in: s_i - bias_g
+        for j in cutlass.range(0, self.sf_vec_size_pv, 2, unroll_full=True):
+            acc_S_frag[j, g], acc_S_frag[j + 1, g] = utils.fma_packed_f32x2(
+                (acc_S_frag[j, g], acc_S_frag[j + 1, g]),
+                (Float32(1.0), Float32(1.0)),
+                (-bias, -bias),
+            )
+
+    @cute.jit
+    def _q_exp2_pass(self, acc_S_frag: cute.Tensor, g: cutlass.Constexpr[int]):
+        for j in cutlass.range_constexpr(0, self.sf_vec_size_pv, 2):
+            acc_S_frag[j, g] = cute.arch.exp2(acc_S_frag[j, g])
+            acc_S_frag[j + 1, g] = cute.arch.exp2(acc_S_frag[j + 1, g])
+
+    @cute.jit
+    def _q_pack_pass(self, acc_S_frag: cute.Tensor, tSrP_frag: cute.Tensor, g: cutlass.Constexpr[int]):
+        # Quantize group g to the P dtype
+        tSrP_u32_view = cute.recast_tensor(tSrP_frag[None, g], cute.Int32)
+        for k in cutlass.range_constexpr(0, cute.size(tSrP_u32_view, mode=[0])):
+            if const_expr(self.v_dtype.width == 4):
+                tSrP_u32_view[k] = packed_float_to_e2m1(
+                    acc_S_frag[k * 8, g], acc_S_frag[k * 8 + 1, g],
+                    acc_S_frag[k * 8 + 2, g], acc_S_frag[k * 8 + 3, g],
+                    acc_S_frag[k * 8 + 4, g], acc_S_frag[k * 8 + 5, g],
+                    acc_S_frag[k * 8 + 6, g], acc_S_frag[k * 8 + 7, g],
+                )
+            else:
+                # MXFP8: E4M3 elements, 4 per u32
+                tSrP_u32_view[k] = packed_float_to_ue4m3(
+                    acc_S_frag[k * 4, g], acc_S_frag[k * 4 + 1, g],
+                    acc_S_frag[k * 4 + 2, g], acc_S_frag[k * 4 + 3, g],
+                )
+
+    @cute.jit
+    def _pack_p_scale_factors(self, tSrPSF_f32: cute.Tensor, tSrPSF: cute.Tensor):
+        """Pack FP32 P scale factors 4 per u32 (UE4M3 for NVFP4, UE8M0 for MXFP8)."""
+        tSrPSF_u32_view = cute.recast_tensor(tSrPSF, cute.Int32)
+        for i in cutlass.range_constexpr(0, max(1, cute.size(tSrPSF_f32) // 4)):
+            if const_expr(self.sf_dtype_pv == Float8E8M0FNU):
+                tSrPSF_u32_view[i] = sm100_utils.packed_float_to_ue8m0(
+                    tSrPSF_f32[i * 4],
+                    tSrPSF_f32[i * 4 + 1],
+                    tSrPSF_f32[i * 4 + 2],
+                    tSrPSF_f32[i * 4 + 3],
+                )
+            else:
+                tSrPSF_u32_view[i] = packed_float_to_ue4m3(
+                    tSrPSF_f32[i * 4],
+                    tSrPSF_f32[i * 4 + 1],
+                    tSrPSF_f32[i * 4 + 2],
+                    tSrPSF_f32[i * 4 + 3],
+                )
+
+    @cute.jit
     def _fused_log2_group_quant(
         self,
         softmax: SoftmaxSm100,
@@ -3218,17 +3447,31 @@ class FlashAttentionForwardSm100:
 
         if const_expr(hw_group_maxes is not None):
             assert cute.size(hw_group_maxes) == num_groups, (
-                "ld.red tile count must equal SF group count (sf_vec_size==32)"
+                "ld.red tile count must equal SF group count"
             )
-            # Transform raw-S tile maxes into post-scale_subtract group maxes.
+        if const_expr(hw_group_maxes is not None):
+            # Row-wise bias of scale_subtract_rowmax: transforms raw-S (group)
+            # maxes into post-scale_subtract values.
             hw_bias = softmax.max_offset - row_max * softmax.scale_log2
 
-        row_sum_acc = Float32(0.0)
+        biases = [None] * num_groups
+        sfs = [None] * num_groups
         for g in cutlass.range_constexpr(num_groups):
             # Group max in log space; clamp so fully-masked groups (all -inf)
             # don't produce NaN from (-inf) - (-inf) below.
-            if const_expr(hw_group_maxes is not None):
+            if const_expr(hw_group_maxes is not None and self.sf_vec_size_pv == 32):
                 m = hw_group_maxes[g] * softmax.scale_log2 + hw_bias
+            elif const_expr(hw_group_maxes is not None):
+                # x16 ld.red (NVFP4 P). fma is monotonic, so fma(max s_raw) ==
+                # max fma(s_raw): the same packed-FMA form as
+                # scale_subtract_rowmax keeps m bitwise identical to the
+                # software reduce over post-scale scores.
+                m_raw = hw_group_maxes[g]
+                m, _ = utils.fma_packed_f32x2(
+                    (m_raw, m_raw),
+                    (softmax.scale_log2, softmax.scale_log2),
+                    (hw_bias, hw_bias),
+                )
             else:
                 m = softmax._compute_row_max(acc_S_frag[None, g].load())
             bias = cute.arch.fmax(m, Float32(-100.0)) - LOG2_PMAX
@@ -3237,70 +3480,40 @@ class FlashAttentionForwardSm100:
                 # integer so P stays <= the dtype max. SF = 2^ceil(bias).
                 bias = sm100_utils.ceil_f32(bias)
 
-            # exp2 with the group scale folded into the argument
-            for j in cutlass.range(0, self.sf_vec_size_pv, 2, unroll_full=True):
-                acc_S_frag[j, g], acc_S_frag[j + 1, g] = utils.fma_packed_f32x2(
-                    (acc_S_frag[j, g], acc_S_frag[j + 1, g]),
-                    (Float32(1.0), Float32(1.0)),
-                    (-bias, -bias),
-                )
-            for j in cutlass.range_constexpr(0, self.sf_vec_size_pv, 2):
-                acc_S_frag[j, g] = cute.arch.exp2(acc_S_frag[j, g])
-                acc_S_frag[j + 1, g] = cute.arch.exp2(acc_S_frag[j + 1, g])
+            biases[g] = bias
+            sfs[g] = cute.arch.exp2(bias)
+            tSrPSF_f32[g] = sfs[g]
 
-            sf = cute.arch.exp2(bias)
-            tSrPSF_f32[g] = sf
-            # Reconstruct this group's contribution to row_sum from the
-            # scaled values weighted back by SF.
-            row_sum_acc += sf * softmax._compute_row_sum(acc_S_frag[None, g].load())
+        # All group biases / SFs are computed up front (they only need the
+        # group maxes): every group's elementwise work is unblocked at once.
+        # Bitwise identical to the interleaved form, +4-7% NVFP4 PV on GB300.
+        self._pack_p_scale_factors(tSrPSF_f32, tSrPSF)
 
-            # Quantize this group to the P dtype
-            tSrP_u32_view = cute.recast_tensor(tSrP_frag[None, g], cute.Int32)
-            if const_expr(self.v_dtype.width == 4):
-                for k in cutlass.range_constexpr(0, cute.size(tSrP_u32_view, mode=[0])):
-                    tSrP_u32_view[k] = packed_float_to_e2m1(
-                        acc_S_frag[k * 8, g],
-                        acc_S_frag[k * 8 + 1, g],
-                        acc_S_frag[k * 8 + 2, g],
-                        acc_S_frag[k * 8 + 3, g],
-                        acc_S_frag[k * 8 + 4, g],
-                        acc_S_frag[k * 8 + 5, g],
-                        acc_S_frag[k * 8 + 6, g],
-                        acc_S_frag[k * 8 + 7, g],
-                    )
-            else:
-                # MXFP8: E4M3 elements, 4 per u32
-                for k in cutlass.range_constexpr(0, cute.size(tSrP_u32_view, mode=[0])):
-                    tSrP_u32_view[k] = packed_float_to_ue4m3(
-                        acc_S_frag[k * 4, g],
-                        acc_S_frag[k * 4 + 1, g],
-                        acc_S_frag[k * 4 + 2, g],
-                        acc_S_frag[k * 4 + 3, g],
-                    )
+        # Reconstruct each group's contribution to row_sum from the scaled
+        # values weighted back by SF (always accumulated in group order).
+        row_sum_acc = Float32(0.0)
+        qvar = self.fp4_pv_qvar
+        if const_expr(qvar == 3):
+            for g in cutlass.range_constexpr(num_groups):
+                self._q_bias_pass(acc_S_frag, g, biases[g])
+        for g in cutlass.range_constexpr(num_groups):
+            if const_expr(qvar != 3):
+                self._q_bias_pass(acc_S_frag, g, biases[g])
+            self._q_exp2_pass(acc_S_frag, g)
+            if const_expr(qvar in (0, 3)):
+                row_sum_acc += sfs[g] * softmax._compute_row_sum(acc_S_frag[None, g].load())
+            self._q_pack_pass(acc_S_frag, tSrP_frag, g)
+            if const_expr(qvar == 1):
+                row_sum_acc += sfs[g] * softmax._compute_row_sum(acc_S_frag[None, g].load())
+        if const_expr(qvar == 2):
+            for g in cutlass.range_constexpr(num_groups):
+                row_sum_acc += sfs[g] * softmax._compute_row_sum(acc_S_frag[None, g].load())
 
         # row_sum update with the same rescale semantics as update_row_sum
         if const_expr(is_first):
             softmax.row_sum[0] = row_sum_acc
         else:
             softmax.row_sum[0] = softmax.row_sum[0] * acc_scale + row_sum_acc
-
-        # Pack SF values (UE4M3 for NVFP4, UE8M0 for MXFP8)
-        tSrPSF_u32_view = cute.recast_tensor(tSrPSF, cute.Int32)
-        for i in cutlass.range_constexpr(0, max(1, cute.size(tSrPSF_f32) // 4)):
-            if const_expr(is_e8m0_sf):
-                tSrPSF_u32_view[i] = sm100_utils.packed_float_to_ue8m0(
-                    tSrPSF_f32[i * 4],
-                    tSrPSF_f32[i * 4 + 1],
-                    tSrPSF_f32[i * 4 + 2],
-                    tSrPSF_f32[i * 4 + 3],
-                )
-            else:
-                tSrPSF_u32_view[i] = packed_float_to_ue4m3(
-                    tSrPSF_f32[i * 4],
-                    tSrPSF_f32[i * 4 + 1],
-                    tSrPSF_f32[i * 4 + 2],
-                    tSrPSF_f32[i * 4 + 3],
-                )
 
         return tSrPSF_f32, tSrPSF
 
@@ -3560,7 +3773,7 @@ class FlashAttentionForwardSm100:
         tSrPSF_2d = cute.logical_divide(tSrPSF, cute.make_layout(k_inner))
         cute.autovec_copy(tSrPSF_2d, sSFP_thread)
         # See fp4_pv_sfp_fence: the MMA warp's async S2T copy must observe these stores.
-        if const_expr(self.fp4_pv_sfp_fence):
+        if const_expr(self.fp4_pv_sfp_fence != 0):
             cute.arch.fence_proxy("async.shared", space="cta")
 
         # All P chunks are stored and all SFP is in smem: fire both signals.
@@ -3620,6 +3833,13 @@ class FlashAttentionForwardSm100:
         6. Coordinating pipeline synchronization between different processing stages
         """
         pure_fp8_pv = const_expr(not self.quant_pv and self.v_dtype.width == 8)
+        rowsum_pos = self.rowsum_pos
+        if const_expr(rowsum_pos == "auto"):
+            rowsum_pos = "pre_store" if const_expr(pure_fp8_pv) else "end"
+        if const_expr(self.fp8_pv_pack_store_pipeline and rowsum_pos == "pre_store"):
+            # The chunk-pipelined FP8 path applies exp2 inside its store loop,
+            # i.e. after the "pre_store" point: only "pre_corr"/"end" see P.
+            rowsum_pos = "pre_corr"
         tilePlikeFP32 = self.mma_tiler_qk[1] // Float32.width * self.v_dtype.width
         tScS = thr_mma_qk.partition_C(cute.make_identity_tensor(self.mma_tiler_qk[:2]))
         tScScale = cute.composition(tScS, cute.make_layout((self.m_block_size, 1)))
@@ -3645,13 +3865,24 @@ class FlashAttentionForwardSm100:
         tSrS_t2r = cute.make_fragment(thr_tmem_load.partition_D(tScS).shape, self.qk_acc_dtype)
         hw_tile_maxes = None
         if const_expr(use_ldred):
-            if const_expr(self.quant_pv and self.sf_vec_size_pv == 32 and self.fp4_pv_log2_quant):
-                # One x32 tile per ld.red instruction (tiles = total / atom).
-                _n_ldred_tiles = cute.size(tStS_t2r.shape) // cute.size(tStS_t2r.shape[0])
+            _red_tile = 32
+            if const_expr(
+                self.quant_pv
+                and self.fp4_pv_log2_quant
+                and (self.sf_vec_size_pv == 32 or self.fp4_pv_ldred_x16)
+            ):
+                # One reduction tile per SF group: x32 for MXFP8 P; x16 for
+                # NVFP4 P splits each x32 atom into two ld.red instructions.
+                _red_tile = self.sf_vec_size_pv
+                _n_ldred_tiles = (
+                    cute.size(tStS_t2r.shape) // cute.size(tStS_t2r.shape[0]) * (32 // _red_tile)
+                )
                 hw_tile_maxes = cute.make_rmem_tensor(
                     cute.make_layout(_n_ldred_tiles), Float32
                 )
-            hw_max = sm100_utils.tmem_ld_red_max(tStS_t2r, tSrS_t2r, hw_tile_maxes)
+            hw_max = sm100_utils.tmem_ld_red_max(
+                tStS_t2r, tSrS_t2r, hw_tile_maxes, red_tile=_red_tile
+            )
         else:
             cute.copy(thr_tmem_load, tStS_t2r, tSrS_t2r)
 
@@ -3697,7 +3928,8 @@ class FlashAttentionForwardSm100:
         # Notify correction wg that row_max is ready
         cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_softmax_corr_full_offset + stage)
 
-        softmax.scale_subtract_rowmax(tSrS_t2r, row_max)
+        if const_expr("scale" not in self.ablate):
+            softmax.scale_subtract_rowmax(tSrS_t2r, row_max)
         if const_expr(prof is not None and self.prof_detail):
             prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_SOFTMAX_ROWMAX, fa4_prof.EVENT_END, prof_pred)
         # Sequence barrier wait
@@ -3740,6 +3972,25 @@ class FlashAttentionForwardSm100:
             if const_expr(prof is not None and self.prof_detail):
                 prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_SOFTMAX_EXP, fa4_prof.EVENT_END, prof_pred)
                 prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_SOFTMAX_QUANT, fa4_prof.EVENT_BEGIN, prof_pred)
+            def _r2s_sfp(tSrPSF_):
+                # 2 (NVFP4) / 1 (MXFP8) vectorized 4-byte stores per thread.
+                thread_idx = thr_tmem_load.thr_idx
+                lane_id = thread_idx % 32
+                warp_id = thread_idx // 32
+                base_offset = lane_id * 16 + (warp_id % 4) * 4
+                # PV is (M=128, N=head_dim_v, K=n_block_size). SFP scales the
+                # P (=A) operand along the K dim, so per-row SF count is
+                # n_block_size // sf_vec_size.
+                k_groups_per_row = const_expr(self.mma_tiler_pv[2] // self.sf_vec_size_pv)
+                k_inner = const_expr(min(k_groups_per_row, 4))
+                k_outer = const_expr(k_groups_per_row // k_inner)
+                # cute.cosize of one atom = 512 bytes for both sf_vec sizes.
+                sfp_thread_layout = cute.make_layout((k_inner, k_outer), stride=(1, 512))
+                sSFP_stage_ptr = sSFP[None, None, None, stage].iterator
+                sSFP_thread = cute.make_tensor(sSFP_stage_ptr + base_offset, sfp_thread_layout)
+                tSrPSF_2d = cute.logical_divide(tSrPSF_, cute.make_layout(k_inner))
+                cute.autovec_copy(tSrPSF_2d, sSFP_thread)
+
             if const_expr(self.fp4_pv_quant_store_pipeline and sSFP is not None):
                 # Quant pipelined with the P TMEM stores; does the SFP smem
                 # copy and both P_full signals itself.
@@ -3768,26 +4019,11 @@ class FlashAttentionForwardSm100:
             #   sf_vec=16, K=128 → 8 SFs per row → 4 inner + 2 outer (rest_k stride 512)
             #   sf_vec=32, K=128 → 4 SFs per row → 4 inner + 1 outer (no rest_k)
             if const_expr(sSFP is not None and not self.fp4_pv_quant_store_pipeline):
-                thread_idx = thr_tmem_load.thr_idx
-                lane_id = thread_idx % 32
-                warp_id = thread_idx // 32
-                base_offset = lane_id * 16 + (warp_id % 4) * 4
-                # PV is (M=128, N=head_dim_v, K=n_block_size). SFP scales the
-                # P (=A) operand along the K dim, so per-row SF count is
-                # n_block_size // sf_vec_size.
-                k_groups_per_row = const_expr(self.mma_tiler_pv[2] // self.sf_vec_size_pv)
-                k_inner = const_expr(min(k_groups_per_row, 4))
-                k_outer = const_expr(k_groups_per_row // k_inner)
-                # cute.cosize of one atom = 512 bytes for both sf_vec sizes.
-                sfp_thread_layout = cute.make_layout((k_inner, k_outer), stride=(1, 512))
-                sSFP_stage_ptr = sSFP[None, None, None, stage].iterator
-                sSFP_thread = cute.make_tensor(sSFP_stage_ptr + base_offset, sfp_thread_layout)
-                tSrPSF_2d = cute.logical_divide(tSrPSF, cute.make_layout(k_inner))
-                cute.autovec_copy(tSrPSF_2d, sSFP_thread)
+                _r2s_sfp(tSrPSF)
                 # The MMA warp reads sSFP through an async TC copy
                 # (tcgen05.cp smem->tmem) right after P_full: fence the
                 # async.shared proxy so it observes these stores.
-                if const_expr(self.fp4_pv_sfp_fence):
+                if const_expr(self.fp4_pv_sfp_fence == 1):
                     cute.arch.fence_proxy("async.shared", space="cta")
             if const_expr(prof is not None):
                 prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_SOFTMAX_QUANT if self.prof_detail else fa4_prof.EVT_SOFTMAX_EXP, fa4_prof.EVENT_END, prof_pred)
@@ -3823,7 +4059,7 @@ class FlashAttentionForwardSm100:
                         self._exp2_pack_fp8_range(
                             tSrS_t2r, tSrP_r2t, self.fp8_pv_range_unroll
                         )
-                    elif const_expr(not fp8_pipe_active):
+                    elif const_expr(not fp8_pipe_active and "exp2" not in self.ablate):
                         softmax.apply_exp2_convert(
                             tSrS_t2r,
                             e2e=self.force_e2e,
@@ -3835,7 +4071,7 @@ class FlashAttentionForwardSm100:
                     if const_expr(prof is not None and self.prof_detail):
                         prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_SOFTMAX_EXP, fa4_prof.EVENT_END, prof_pred)
                         prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_SOFTMAX_QUANT, fa4_prof.EVENT_BEGIN, prof_pred)
-                    if const_expr(not fp8_pipe_active and not fp8_range_active):
+                    if const_expr(not fp8_pipe_active and not fp8_range_active and "pack" not in self.ablate):
                         self._pack_fp8(tSrS_t2r, tSrP_r2t)
             else:
                 # BF16 PV: exp2 and the bf16x2 pack are fused inside
@@ -3853,6 +4089,8 @@ class FlashAttentionForwardSm100:
                     prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_SOFTMAX_QUANT, fa4_prof.EVENT_BEGIN, prof_pred)
             if const_expr(prof is not None):
                 prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_SOFTMAX_QUANT if self.prof_detail else fa4_prof.EVT_SOFTMAX_EXP, fa4_prof.EVENT_END, prof_pred)
+        if const_expr(not self.quant_pv and "rowsum" not in self.ablate and rowsum_pos == "pre_store"):
+            softmax.update_row_sum(tSrS_t2r.load(), acc_scale, is_first)
         # Sequence barrier arrive
         if const_expr(self.s0_s1_barrier):
             cute.arch.mbarrier_arrive(mbar_ptr + mbar_s0_s1_sequence_offset + (1 - stage) * 4)
@@ -3879,6 +4117,8 @@ class FlashAttentionForwardSm100:
             for i in cutlass.range_constexpr(self.mbar_p_split(cute.size(tStP_r2t.shape[2]))):
                 cute.copy(thr_tmem_store, tSrP_r2t_f32[None, None, i], tStP_r2t[None, None, i])
             cute.arch.fence_view_async_tmem_store()
+            if const_expr(self.quant_pv and sSFP is not None and self.fp4_pv_sfp_fence == 2):
+                cute.arch.fence_proxy("async.shared", space="cta")
             # Notify mma warp that P is ready (and SFP is in SMEM)
             cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_O_rescaled_offset + stage)
             for i in cutlass.range_constexpr(self.mbar_p_split(cute.size(tStP_r2t.shape[2])), cute.size(tStP_r2t.shape[2])):
@@ -3889,13 +4129,15 @@ class FlashAttentionForwardSm100:
         if const_expr(prof is not None):
             prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_SOFTMAX_STORE_P, fa4_prof.EVENT_END, prof_pred)
             prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_SOFTMAX_WAIT_CORR, fa4_prof.EVENT_BEGIN, prof_pred)
+        if const_expr(not self.quant_pv and "rowsum" not in self.ablate and rowsum_pos == "pre_corr"):
+            softmax.update_row_sum(tSrS_t2r.load(), acc_scale, is_first)
         cute.arch.mbarrier_wait(
             mbar_ptr + self.mbar_softmax_corr_empty_offset + stage, si_corr_producer_phase
         )
         if const_expr(prof is not None):
             prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_SOFTMAX_WAIT_CORR, fa4_prof.EVENT_END, prof_pred)
 
-        if const_expr(not self.quant_pv):
+        if const_expr(not self.quant_pv and "rowsum" not in self.ablate and rowsum_pos == "end"):
             softmax.update_row_sum(tSrS_t2r.load(), acc_scale, is_first)
         # acc_scale = cute.arch.exp2(acc_scale_)
         return mma_si_consumer_phase ^ 1, si_corr_producer_phase ^ 1, s0_s1_sequence_phase ^ 1
@@ -4009,6 +4251,13 @@ class FlashAttentionForwardSm100:
                         # Don't need O_full anymore, since by the time softmax has signaled the correction
                         # warps, S_i must have been done, so O_i-1 must have been done as well.
                         # cute.arch.mbarrier_wait(mbar_ptr + self.mbar_O_full_offset + stage, o_corr_consumer_phase)
+                        if const_expr(self.decouple_sp):
+                            # Decoupled schedule: S_i(k+1) exists before
+                            # PV_i(k) has run, so the invariant above no
+                            # longer holds — wait for the accumulate.
+                            cute.arch.mbarrier_wait(
+                                mbar_ptr + self.mbar_O_full_offset + stage, o_corr_consumer_phase
+                            )
                         if should_rescale:
                             self.correction_rescale(
                                 thr_mma_pv, tOtOs[stage if self.q_stage == 2 else 0], tidx, scale
@@ -4018,7 +4267,8 @@ class FlashAttentionForwardSm100:
                             mbar_ptr + self.mbar_softmax_corr_empty_offset + (1 - stage)
                         )
                     softmax_corr_consumer_phase ^= 1
-                    # o_corr_consumer_phase ^= 1
+                    if const_expr(self.decouple_sp):
+                        o_corr_consumer_phase ^= 1
                 cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_softmax_corr_empty_offset + 1)
                 # End of seqlen_corr_loop_steps
 
