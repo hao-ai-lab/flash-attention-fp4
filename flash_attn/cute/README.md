@@ -107,7 +107,7 @@ vs FP8 PV's 0.0040, FP4 PV's 0.0039).
 
 ### Sequence-length sweep (GB300, h=24, d=128, non-causal)
 
-![GB300 h=24, d=128, non-causal](figures/gb300_tflops_h24.png)
+![GB300 h=24, d=128, non-causal](figures/gb300_tflops_h24.png?v=20260917)
 
 ## Results — QKV Quantization (quant_v)
 
