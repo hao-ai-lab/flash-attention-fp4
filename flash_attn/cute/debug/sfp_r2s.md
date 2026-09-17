@@ -152,8 +152,20 @@ cute.autovec_copy(tSrPSF_2d, sSFP_thread)
 ```
 
 - 2 vectorized 4-byte stores, no bank conflicts (32 threads → 32 unique banks)
-- `autovec_copy` is synchronous SIMT — no `fence_proxy(async_shared)` needed
-- mbarrier arrive/wait sufficient for SMEM→TMEM visibility
+- ~~`autovec_copy` is synchronous SIMT — no `fence_proxy(async_shared)` needed~~
+  ~~mbarrier arrive/wait sufficient for SMEM→TMEM visibility~~
+  **WRONG (fixed 2026-09-16).** The MMA warp consumes sSFP with an *async* TC
+  copy (`tcgen05.cp` smem→tmem) right after `P_full`; the mbarrier only orders
+  the warps, it does not make the producer's `st.shared` visible to the
+  async.shared proxy. Without a producer-side
+  `fence_proxy("async.shared", space="cta")` after the store, the copy can read
+  stale SF bytes: NVFP4 PV outputs differed run-to-run (5/5 runs at
+  (2,4096,24,128) and (1,16384,32,128), |diff| up to 0.05 on a few adjacent
+  row pairs — the "1-in-20 nondeterminism" noted in b300_fp4_pv_analysis.md).
+  A consumer-side fence in the MMA warp does NOT fix it. Now default-on via
+  `FA4_FP4_PV_SFP_FENCE=1`; 20/20 runs bitwise identical afterwards. MXFP8 PV
+  takes the same path (1 store instead of 2) and never reproduced the race,
+  but gets the fence too.
 
 ### `_quant_fp4` indexing fix
 

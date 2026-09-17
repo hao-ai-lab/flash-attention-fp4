@@ -328,6 +328,16 @@ class FlashAttentionForwardSm100:
         # +8-15% FP4 PV on GB300 (1388 -> 1595 TF at s=32768) at identical
         # measured accuracy vs the FP32 reference.
         self.fp4_pv_log2_quant = os.getenv("FA4_FP4_PV_LOG2_QUANT", "1") == "1"
+        # Fence the async.shared proxy after the P scale-factor R2S store.
+        # The MMA warp reads sSFP with an async TC copy (tcgen05.cp
+        # smem->tmem) right after P_full; the mbarrier orders the warps but
+        # does not make the producer's st.shared visible to that proxy, so the
+        # copy could read stale SF bytes: NVFP4 PV outputs differed run-to-run
+        # (5/5 runs at (2,4096,24,128), |diff| up to 0.05 on a few adjacent
+        # row pairs). Producer-side fence (right after the store) fixes it —
+        # 20/20 runs bitwise identical; a consumer-side fence in the MMA warp
+        # does NOT. 0 = off (debug only).
+        self.fp4_pv_sfp_fence = os.getenv("FA4_FP4_PV_SFP_FENCE", "1") == "1"
         # SM103 tcgen05.ld.red: fused TMEM S load + per-x32-tile max — row max
         # nearly free for all PV modes (and free MXFP8 P group maxes).
         self.use_ldred_rowmax = os.getenv(
@@ -3549,6 +3559,9 @@ class FlashAttentionForwardSm100:
         sSFP_thread = cute.make_tensor(sSFP_stage_ptr + base_offset, sfp_thread_layout)
         tSrPSF_2d = cute.logical_divide(tSrPSF, cute.make_layout(k_inner))
         cute.autovec_copy(tSrPSF_2d, sSFP_thread)
+        # See fp4_pv_sfp_fence: the MMA warp's async S2T copy must observe these stores.
+        if const_expr(self.fp4_pv_sfp_fence):
+            cute.arch.fence_proxy("async.shared", space="cta")
 
         # All P chunks are stored and all SFP is in smem: fire both signals.
         cute.arch.fence_view_async_tmem_store()
@@ -3771,6 +3784,11 @@ class FlashAttentionForwardSm100:
                 sSFP_thread = cute.make_tensor(sSFP_stage_ptr + base_offset, sfp_thread_layout)
                 tSrPSF_2d = cute.logical_divide(tSrPSF, cute.make_layout(k_inner))
                 cute.autovec_copy(tSrPSF_2d, sSFP_thread)
+                # The MMA warp reads sSFP through an async TC copy
+                # (tcgen05.cp smem->tmem) right after P_full: fence the
+                # async.shared proxy so it observes these stores.
+                if const_expr(self.fp4_pv_sfp_fence):
+                    cute.arch.fence_proxy("async.shared", space="cta")
             if const_expr(prof is not None):
                 prof_k = fa4_prof.prof_record(prof_buf, prof_bg, prof_stride, prof_tag, prof_k, fa4_prof.EVT_SOFTMAX_QUANT if self.prof_detail else fa4_prof.EVT_SOFTMAX_EXP, fa4_prof.EVENT_END, prof_pred)
         else:
