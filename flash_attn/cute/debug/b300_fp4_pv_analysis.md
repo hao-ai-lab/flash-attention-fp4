@@ -561,10 +561,10 @@ construction.
 
 | Config (s=32768 h=24 d=128) | before | after | gain |
 |---|---|---|---|
-| NVFP4 QK + FP8 PV   | 2669 | **2780** | +4% (+11% at d=64) |
-| MXFP8 QK + FP8 PV   | 2416 | **2472** | +2% (+6% at s=4096) |
-| NVFP4 QK + NVFP4 PV | 1726 (racy) | **1930** | +12%, deterministic |
-| NVFP4 QK + MXFP8 PV | 1809 | **2020** | +12% |
+| NVFP4 QK + FP8 PV   | 2669 | **2879** | +8% (+11% at d=64) |
+| MXFP8 QK + FP8 PV   | 2416 | **2592** | +7% |
+| NVFP4 QK + NVFP4 PV | 1726 (racy) | **2153** | +25%, deterministic |
+| NVFP4 QK + MXFP8 PV | 1809 | **2243** | +24% |
 | NVFP4 / MXFP8 QK + BF16 PV | 2240 / 1979 | unchanged | MMA-bound |
 
 ### Correctness fix found on the way: NVFP4-PV scale-factor race
@@ -607,15 +607,55 @@ from 8 warps cost more than the fence).
    `update_row_sum` ran alone after the end-of-step `wait corr` barrier;
    moved into the exp2/F2FP block (`FA4_ROWSUM_POS`, "auto" = `pre_store`
    for pure-FP8 PV) they fill idle issue slots. Neutral for BF16 PV.
-5. **Experimental, opt-in (`FA4_DECOUPLE_SP=1`): decoupled S/P TMEM layout.**
-   One shared S region; P, SFQ (per stage), SFK/SFV (shared) get dedicated
-   slots in the freed S1 space, so SFQ is copied once per Q tile, SFK/SFV once
-   per K-step, and the MMA warp issues QK(k+1) before PV(k). +3-6% MXFP8+FP8,
-   +1-3% NVFP4+FP8, bitwise identical on 93 checks (incl. causal/GQA/edge),
-   but its edge/flake sweep was cut short, so it stays off by default.
-   Pitfall met on the way: a long gating expression inside the jit
-   `__call__` made the DSL preprocessor take >25 min (looked like a GPU hang);
-   moved into a plain helper it compiles in 13 s.
+5. **Decoupled S/P TMEM layout (`FA4_DECOUPLE_SP`, default on).** Baseline
+   parks P_i inside S_i's TMEM region and the SFQ/SFK slots inside the other
+   stage's S region, so QK_i(k+1) can only be issued after PV_i(k) consumed
+   P_i(k) and every scale factor is re-copied (tcgen05.cp) every K-step.
+   Now both stages share ONE S region (free once the softmax WG has loaded
+   it — the existing `sfqk_load` barrier) and P0/P1, SFQ0/SFQ1, SFK, SFP0/SFP1,
+   SFV get dedicated slots in the freed S1 space [128,256): SFQ is copied
+   once per Q tile, SFV once per K-step, the MMA warp issues QK_i(k+1) before
+   PV_i(k), and the correction warps wait `O_full` before rescaling (S(k+1)
+   can now exist before PV(k) finished). Decoupling alone measured 0% — the
+   gain is the removed SF copies (the `FA4_DEBUG_SKIP_SFQ_S2T` probe put the
+   SFQ copy at ~3.8%). Per mode (s=32768 h=24): NVFP4+NVFP4 1928 -> 2153,
+   NVFP4+MXFP8 2018 -> 2243, NVFP4+FP8 2747 -> 2879, MXFP8+FP8 2497 -> 2592.
+   The SFK slot is shared between stages only for MXFP8 QK
+   (`FA4_DECOUPLE_SHARED_SFK=auto`): sharing it costs NVFP4 QK -10%
+   (2854 -> 2573) for reasons not yet understood. 106 bitwise checks
+   (incl. causal/GQA/single-block/cross-length edge cases) and 100/100 flake
+   runs. Gated to q_stage 2, block-scaled QK, 8-bit-or-narrower V, 128x128
+   tiles, no block sparsity; other configs keep the old layout.
+   Pitfall met on the way: a 12-term gating expression inside the jit
+   `__call__` made the DSL preprocessor take >25 min (looked like a GPU
+   hang); moved into a plain helper it compiles in 13 s.
+
+### tcgen05.mma issue/overlap microbenchmark (GB300)
+
+`agent_space/opt0916/mma_overlap.cu` (single CTA, one issuing thread,
+`kind::f16` bf16 M128 K16, operands in smem, `%clock64` around issue +
+`tcgen05.commit` + mbarrier wait, 50 reps, fully unrolled compile-time
+sequences so issue overhead is a few instructions):
+
+| sequence | cycles | per instruction |
+|---|---|---|
+| 32 x N=256 | 4301 | 134 (~3900 MAC/clk: TC-bound, matches dense BF16 spec) |
+| 32 x N=128 | 2293 | 72 |
+| 32 x N=64 | 1739 | 54 |
+| 32 x N=32 / N=16 / N=8 | ~1600 | **~50 regardless of N** |
+| 32 large then 32 small | 5549 | = A + B (0.94x, the 6% is the two commit/wait tails) |
+| interleaved L,S,L,S | 5651 | 0.97-1.02x of blocked across 6 configs = noise |
+| small into the SAME accumulator as large | +-0.3% | dependencies change nothing |
+
+Conclusions: (1) the tensor core executes `tcgen05.mma` strictly in issue
+order — no overlap between instructions of different sizes, and reordering
+(by hand or by the compiler, which cannot reorder the volatile asm anyway)
+buys nothing; a mixed sequence costs the sum of its parts. (2) Every
+`tcgen05.mma` has an **issue floor of ~50 cycles** from one issuing thread,
+so tiles with N <= 64 cost the same as N=8; only N >= 128 is TC-bound. Small
+TC-queue ops are therefore far from free — consistent with the per-step
+scale-factor `tcgen05.cp` copies showing up at ~2-4% each in the ablation,
+and it rules out "cheap" extra narrow MMAs (e.g. an N=16 row-sum GEMM).
 
 ### How the bound was found without NCU
 
@@ -650,7 +690,7 @@ Two non-obvious properties, both measured:
   row-sums or the SF store via ablation makes NVFP4 PV *slower* too
   (1930 -> 1481 / 1382 / 1679). Throughput lands on discrete levels, i.e. it
   depends on how ptxas interleaves the unit mix, not on a smooth cost model.
-- **The PV->QK->softmax ping-pong is not the bound by itself.** Baseline parks
+- **The PV->QK->softmax ping-pong is not the bound by itself.** Baseline parked
   P_i inside S_i's TMEM region, so each softmax WG idles ~50% (trace: wait
   corr 20% + wait S 12%) while the TC runs PV_i then QK_i. A decoupled
   schedule (QK_i(k+1) issued before PV_i(k)) with everything else equal
