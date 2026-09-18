@@ -613,12 +613,19 @@ from 8 warps cost more than the fence).
    P_i(k) and every scale factor is re-copied (tcgen05.cp) every K-step.
    Now both stages share ONE S region (free once the softmax WG has loaded
    it — the existing `sfqk_load` barrier) and P0/P1, SFQ0/SFQ1, SFK, SFP0/SFP1,
-   SFV get dedicated slots in the freed S1 space [128,256): SFQ is copied
-   once per Q tile, SFV once per K-step, the MMA warp issues QK_i(k+1) before
+   SFV0/SFV1 get dedicated slots in the freed S1 space [128,256): SFQ is
+   copied once per Q tile, the MMA warp issues QK_i(k+1) before
    PV_i(k), and the correction warps wait `O_full` before rescaling (S(k+1)
-   can now exist before PV(k) finished). Decoupling alone measured 0% — the
-   gain is the removed SF copies (the `FA4_DEBUG_SKIP_SFQ_S2T` probe put the
-   SFQ copy at ~3.8%). Per mode (s=32768 h=24): NVFP4+NVFP4 1928 -> 2153,
+   can now exist before PV(k) finished). Where the gain comes from (measured
+   by re-copying SFQ every K-step inside the decoupled layout): the
+   once-per-tile SFQ copy is worth only ~0.5-0.7%; essentially all of it is
+   the schedule — QK_s(k+1) is issued right after softmax_s's t2r instead of
+   after PV_s(k), so S_s(k+1) is ready when the softmax WG finishes P_s(k).
+   (An earlier "decoupling alone = 0%" reading was taken before the
+   row-sum/hoisting changes shortened the softmax step; once it got shorter
+   the PV->QK serialization became exposed.) The second stage's QK still
+   waits for the first stage's t2r (`sfqk_load`) — the baseline had the same
+   wait for its SF slots. Per mode (s=32768 h=24): NVFP4+NVFP4 1928 -> 2153,
    NVFP4+MXFP8 2018 -> 2243, NVFP4+FP8 2747 -> 2879, MXFP8+FP8 2497 -> 2592.
    The SFK slot is shared between stages only for MXFP8 QK
    (`FA4_DECOUPLE_SHARED_SFK=auto`): sharing it costs NVFP4 QK -10%
@@ -647,15 +654,26 @@ sequences so issue overhead is a few instructions):
 | interleaved L,S,L,S | 5651 | 0.97-1.02x of blocked across 6 configs = noise |
 | small into the SAME accumulator as large | +-0.3% | dependencies change nothing |
 
-Conclusions: (1) the tensor core executes `tcgen05.mma` strictly in issue
-order — no overlap between instructions of different sizes, and reordering
-(by hand or by the compiler, which cannot reorder the volatile asm anyway)
-buys nothing; a mixed sequence costs the sum of its parts. (2) Every
-`tcgen05.mma` has an **issue floor of ~50 cycles** from one issuing thread,
-so tiles with N <= 64 cost the same as N=8; only N >= 128 is TC-bound. Small
-TC-queue ops are therefore far from free — consistent with the per-step
-scale-factor `tcgen05.cp` copies showing up at ~2-4% each in the ablation,
-and it rules out "cheap" extra narrow MMAs (e.g. an N=16 row-sum GEMM).
+Conclusions: (1) **Observed, not guaranteed:** the PTX spec (9.7.16.6.2 /
+9.7.18.6.2 in newer revisions) says asynchronous tcgen05 operations *may
+execute and complete out of issue order*; only listed pairs from the same
+warp are pipelined — e.g. `mma (A/metadata reads) -> mma (D writes)`,
+`mma (A/metadata reads) -> cp (writes)`, `cp -> mma (A/metadata reads)`
+(same cta_group), and `mma (D) -> mma (C/D)` only for the same accumulator
+and shape; `tcgen05.commit` tracks completion of *all* prior async tcgen05
+ops of the thread. On GB300 the hardware nevertheless ran these mixed-shape,
+separate-accumulator sequences in order: no overlap, and interleaving buys
+nothing (0.97-1.02x). Build correctness only on the pipelined pairs and
+commits: the baseline's P-inside-S layout is covered by `mma A-reads ->
+mma D-writes`, its "S_i(k+1) done => PV_i(k) done" correction invariant by
+the commit semantics, and the decoupled layout's SF slots by `mma metadata
+reads -> cp writes` plus the added O_full wait (its S_full commit precedes
+PV(k)). (2) Every `tcgen05.mma` has an **issue floor of ~50
+cycles** from one issuing thread, so tiles with N <= 64 cost the same as
+N=8; only N >= 128 is TC-bound. Small TC-queue ops are therefore far from
+free — consistent with the per-step scale-factor `tcgen05.cp` copies showing
+up at ~2-4% each in the ablation, and it rules out "cheap" extra narrow
+MMAs (e.g. an N=16 row-sum GEMM).
 
 ### How the bound was found without NCU
 

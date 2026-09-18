@@ -488,9 +488,10 @@ class FlashAttentionForwardSm100:
         # K-step because S overwrites its slot. Here both stages share ONE S
         # region (free as soon as the softmax WG has loaded it) and P / SFs get
         # dedicated slots in the freed S1 space [128,256):
-        #   P0 | P1 | SFQ0 | SFQ1 | SFK (shared) | SFP0 | SFP1 | SFV (shared)
-        # so SFQ is copied once per Q tile, SFK/SFV once per K-step instead of
-        # once per stage, and the MMA warp issues QK_i(k+1) before PV_i(k).
+        #   P0 | P1 | SFQ0 | SFQ1 | SFK0 | SFK1 | SFP0 | SFP1 | SFV0 | SFV1
+        # so SFQ is copied once per Q tile (SFK once per K-step for MXFP8 QK,
+        # whose slot can be shared) and the MMA warp issues QK_i(k+1) before
+        # PV_i(k).
         self.decouple_sp = (
             self._decouple_sp_env
             and self.q_stage == 2
@@ -519,8 +520,12 @@ class FlashAttentionForwardSm100:
             # 4 for MXFP8 (the 4 K-tile SFs share one u32, selected by SF-ID).
             _sfpv_cols = 8
             self.tmem_sfp_offset = [_pv_sf_base, _pv_sf_base + _sfpv_cols]
-            self.tmem_sfv_offset = _pv_sf_base + 2 * _sfpv_cols
-            _tmem_end = _pv_sf_base + (3 * _sfpv_cols if self.quant_pv else 0)
+            # SFV slot per stage: its last reader PV_s(k) is ordered before the
+            # next copy through O_full[s] -> P_full_O_rescaled[s](k+1). A slot
+            # shared by both stages would be re-written after PV_1(k) with no
+            # ordering (mma -> cp is not a pipelined tcgen05 pair).
+            self.tmem_sfv_offset = [_pv_sf_base + 2 * _sfpv_cols, _pv_sf_base + 3 * _sfpv_cols]
+            _tmem_end = _pv_sf_base + (4 * _sfpv_cols if self.quant_pv else 0)
             assert _tmem_end <= 2 * self.n_block_size, f"decoupled TMEM layout overflows S1: {_tmem_end}"
 
     @cute.jit
@@ -1793,10 +1798,9 @@ class FlashAttentionForwardSm100:
             sfv_tmem_ptrs = [sfp_tmem_ptrs[stage] + sfp_offset for stage in range(self.q_stage)]
             if const_expr(self.decouple_sp):
                 assert sfp_offset <= 8 * sf_dtype_per_u32, "SFP does not fit its decoupled TMEM slot"
-                # Both stages multiply against the same V block: shared SFV slot.
                 sfv_tmem_ptrs = [
                     cute.recast_ptr(
-                        cute.make_ptr(Float32, self.tmem_sfv_offset,
+                        cute.make_ptr(Float32, self.tmem_sfv_offset[stage],
                                       mem_space=cute.AddressSpace.tmem, assumed_align=align),
                         dtype=self.sf_dtype_pv,
                     )
@@ -2643,14 +2647,15 @@ class FlashAttentionForwardSm100:
                             )
                             if const_expr(self.quant_pv):
                                 # SFP_stage (from the softmax WG, via smem) and
-                                # the shared SFV slot (V_k serves both stages).
+                                # SFV_stage; both slots' last reader is PV_stage(k),
+                                # ordered before these copies by the
+                                # P_full_O_rescaled wait above.
                                 _, _, tCtSFP_compact_s2t = tiled_copy_s2t_sfp_staged[stage]
                                 tCsSFP_compact_s2t_cur = tCsSFP_compact_s2t[None, None, None, None, stage]
                                 cute.copy(tiled_copy_s2t_sfp, tCsSFP_compact_s2t_cur, tCtSFP_compact_s2t)
-                                if const_expr(stage == 0):
-                                    _, _, tCtSFV_compact_s2t = tiled_copy_s2t_sfv_staged[stage]
-                                    tCsSFV_compact_s2t_staged = tCsSFV_compact_s2t[None, None, None, None, Vi_index]
-                                    cute.copy(tiled_copy_s2t_sfv, tCsSFV_compact_s2t_staged, tCtSFV_compact_s2t)
+                                _, _, tCtSFV_compact_s2t = tiled_copy_s2t_sfv_staged[stage]
+                                tCsSFV_compact_s2t_staged = tCsSFV_compact_s2t[None, None, None, None, Vi_index]
+                                cute.copy(tiled_copy_s2t_sfv, tCsSFV_compact_s2t_staged, tCtSFV_compact_s2t)
                             gemm_Pi[stage](
                                 tCrB=tOrVi,
                                 sB=sV[None, None, None, Vi_index],
