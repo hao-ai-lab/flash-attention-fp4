@@ -338,14 +338,18 @@ class FlashAttentionForwardSm100:
         # after the barrier; neutral for the MMA-bound BF16 PV ("auto" = that).
         self.rowsum_pos = os.getenv("FA4_ROWSUM_POS", "auto")
         # Decoupled S/P TMEM layout + schedule (resolved in __call__ once the
-        # dtypes are known).
-        self._decouple_sp_env = os.getenv("FA4_DECOUPLE_SP", "0") == "1"
+        # dtypes are known; see _resolve_decouple_sp). GB300, bitwise
+        # identical: NVFP4+NVFP4 1928 -> 2157, NVFP4+MXFP8 2018 -> 2257,
+        # NVFP4+FP8 2747 -> 2854, MXFP8+FP8 2497 -> 2569 TF (s=32768 h=24).
+        self._decouple_sp_env = os.getenv("FA4_DECOUPLE_SP", "1") == "1"
         self.decouple_sp = False
-        # EXPERIMENT: source-structure variants of the log-domain group quant
-        # (identical values). 0 = per group: bias, exp2, row-sum, pack.
-        # 1 = per group: bias, exp2, pack, row-sum. 2 = all group row-sums
-        # after all packs. 3 = all bias passes first, then per group.
-        self.fp4_pv_qvar = int(os.getenv("FA4_FP4_PV_QVAR", "0"))
+        # Decoupled layout: one SFK slot shared by both stages (copied once
+        # per K-step) vs a slot + copy per stage. Shared costs NVFP4 QK -10%
+        # (2854 -> 2573) but is neutral/+2% for MXFP8 QK: "auto" = MXFP8 only.
+        _shared_sfk = os.getenv("FA4_DECOUPLE_SHARED_SFK", "auto")
+        self.decouple_shared_sfk = (
+            self.sf_vec_size == 32 if _shared_sfk == "auto" else _shared_sfk == "1"
+        )
         assert self.rowsum_pos in ("auto", "end", "pre_corr", "pre_store")
         # DEBUG ONLY (wrong outputs): delete one class of softmax-warp work to
         # measure how sensitive end-to-end time is to it. Comma list of
@@ -509,8 +513,8 @@ class FlashAttentionForwardSm100:
             self.tmem_vec_offset = self.tmem_s_offset
             self.tmem_p_offset = [self.n_block_size, self.n_block_size + _p_cols]
             self.tmem_sfq_offset = [_sf_base, _sf_base + _sfqk_cols]
-            self.tmem_sfk_offset = _sf_base + 2 * _sfqk_cols
-            _pv_sf_base = _sf_base + 3 * _sfqk_cols
+            self.tmem_sfk_offset = [_sf_base + 2 * _sfqk_cols, _sf_base + 3 * _sfqk_cols]
+            _pv_sf_base = _sf_base + 4 * _sfqk_cols
             # P/V scale factors: 8 columns per tensor for NVFP4 (2 K-tiles x 4),
             # 4 for MXFP8 (the 4 K-tile SFs share one u32, selected by SF-ID).
             _sfpv_cols = 8
@@ -1743,7 +1747,8 @@ class FlashAttentionForwardSm100:
                 # SFK slot, copied once per K-step.
                 sfk_tmem_ptrs = [
                     cute.recast_ptr(
-                        cute.make_ptr(Float32, self.tmem_sfk_offset,
+                        cute.make_ptr(Float32,
+                                      self.tmem_sfk_offset[0 if self.decouple_shared_sfk else stage],
                                       mem_space=cute.AddressSpace.tmem, assumed_align=align),
                         dtype=self.sf_dtype,
                     )
@@ -2620,7 +2625,7 @@ class FlashAttentionForwardSm100:
                             # already sits in its dedicated slot (prologue).
                             sm100_utils.tcgen05_after_thread_sync()
                             cute.arch.mbarrier_wait(mbar_ptr + self.mbar_sfqk_load_offset + stage, mma_sfqk_producer_phase)
-                            if const_expr(stage == 0):
+                            if const_expr(stage == 0 or not self.decouple_shared_sfk):
                                 # Shared SFK slot: K_(k+1) serves both stages.
                                 _, _, tCtSFK_compact_s2t = tiled_copy_s2t_sfk_staged[stage]
                                 tCsSFK_compact_s2t_staged = tCsSFK_compact_s2t[None, None, None, None, Ki_index]
@@ -3492,22 +3497,11 @@ class FlashAttentionForwardSm100:
         # Reconstruct each group's contribution to row_sum from the scaled
         # values weighted back by SF (always accumulated in group order).
         row_sum_acc = Float32(0.0)
-        qvar = self.fp4_pv_qvar
-        if const_expr(qvar == 3):
-            for g in cutlass.range_constexpr(num_groups):
-                self._q_bias_pass(acc_S_frag, g, biases[g])
         for g in cutlass.range_constexpr(num_groups):
-            if const_expr(qvar != 3):
-                self._q_bias_pass(acc_S_frag, g, biases[g])
+            self._q_bias_pass(acc_S_frag, g, biases[g])
             self._q_exp2_pass(acc_S_frag, g)
-            if const_expr(qvar in (0, 3)):
-                row_sum_acc += sfs[g] * softmax._compute_row_sum(acc_S_frag[None, g].load())
+            row_sum_acc += sfs[g] * softmax._compute_row_sum(acc_S_frag[None, g].load())
             self._q_pack_pass(acc_S_frag, tSrP_frag, g)
-            if const_expr(qvar == 1):
-                row_sum_acc += sfs[g] * softmax._compute_row_sum(acc_S_frag[None, g].load())
-        if const_expr(qvar == 2):
-            for g in cutlass.range_constexpr(num_groups):
-                row_sum_acc += sfs[g] * softmax._compute_row_sum(acc_S_frag[None, g].load())
 
         # row_sum update with the same rescale semantics as update_row_sum
         if const_expr(is_first):

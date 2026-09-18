@@ -11,16 +11,16 @@ Block-scaled QK attention with BF16 or FP8 PV (triton `do_bench`, B200):
 
 | Config | NVFP4+BF16 | NVFP4+FP8 | MXFP8+FP8 | BF16 ref |
 |--------|-----------|----------|----------|---------|
-| b=1 s=256 h=16 d=128 | 34 | 39 | **40** | 35 |
-| b=1 s=1024 h=16 d=128 | **418** | 416 | 414 | 380 |
-| b=4 s=4096 h=16 d=128 | 1789 | **1875** | 1801 | 1479 |
-| b=1 s=32768 h=16 d=128 | 1920 | **2016** | 1942 | 1543 |
-| b=4 s=4096 h=32 d=128 | 1826 | **1920** | 1851 | 1471 |
-| b=1 s=4096 h=12 d=128 | 1081 | **1118** | 1070 | 940 |
-| b=1 s=32768 h=12 d=128 ¹ | 1823 | **1913** | 1846 | 1508 |
-| b=1 s=4096 h=24 d=128 | 1482 | **1548** | 1480 | 1274 |
-| b=1 s=32768 h=24 d=128 | 1887 | **2018** | 1948 | 1545 |
-| b=1 s=32768 h=24 d=64 | 919 | **986** | — | 949 |
+| b=1 s=256 h=16 d=128 | 12 | 12 | 10 | 11 | 10 | 12 | **14** |
+| b=1 s=1024 h=16 d=128 | 217 | 231 | 177 | 190 | 220 | 231 | **266** |
+| b=4 s=4096 h=16 d=128 | 2231 | **2694** | 1943 | 2018 | 1862 | 2481 | 1516 |
+| b=1 s=32768 h=16 d=128 | 2337 | **2887** | 2151 | 2253 | 2016 | 2591 | 1600 |
+| b=4 s=4096 h=32 d=128 | 2201 | **2718** | 1975 | 2049 | 1889 | 2484 | 1533 |
+| b=1 s=4096 h=12 d=128 | 1444 | **1598** | 1184 | 1214 | 1213 | 1571 | 1011 |
+| b=1 s=32768 h=12 d=128 ¹ | 2289 | **2775** | 2058 | 2152 | 2070 | 2579 | 1590 |
+| b=1 s=4096 h=24 d=128 | 1959 | **2218** | 1624 | 1682 | 1619 | 2165 | 1323 |
+| b=1 s=32768 h=24 d=128 | 2244 | **2879** | 2153 | 2243 | 2036 | 2592 | 1582 |
+| b=1 s=32768 h=24 d=64 | 1208 | **1339** | — | — | — | — | 1205 |
 
 All values in TFLOPS. Peak: **NVFP4+FP8 2031 TF**, **MXFP8+FP8 1960 TF**.
 **—** = unsupported. MXFP8 (sf_vec_size=32) requires headdim ≥ 128 because the block-scaled MMA hardware atom tiles 4 instruction K-tiles per scale factor, giving a minimum K dimension of `sf_vec_size × 4 = 128`. NVFP4 (sf_vec_size=16) supports headdim ≥ 64.
@@ -75,7 +75,8 @@ All block-scaled QK × PV combinations (triton `do_bench`, GB300) — includes t
 SM103 ld.red row-max (incl. the BF16 ref), log-domain FP4 quant, the 3/4 FP8
 P-split, MXFP8 PV, the block-scaled-PV SF-stepping fix, the SF-store fence
 fix and the September 2026 softmax-warp tuning (x16 ld.red group maxes,
-hoisted group biases, row-sum placement, MXFP8 P store chunking):
+hoisted group biases, row-sum placement, MXFP8 P store chunking, and the
+decoupled S/P TMEM layout):
 
 | Config | NVFP4+BF16 | NVFP4+FP8 | NVFP4+NVFP4 | NVFP4+MXFP8 | MXFP8+BF16 | MXFP8+FP8 | BF16 ref ² |
 |--------|----|----|----|----|----|----|----|
@@ -92,9 +93,9 @@ hoisted group biases, row-sum placement, MXFP8 P store chunking):
 
 All values in TFLOPS (measured with a per-shape cooldown so no shape is
 throttled by a hot predecessor — default-on in `bench_fp4`). Peak:
-**NVFP4+FP8 2789 TF**, **MXFP8+FP8 2535 TF**, **NVFP4+BF16 2350 TF**,
-**MXFP8+BF16 2096 TF**, **NVFP4+MXFP8 2020 TF**, **NVFP4+NVFP4 1849 TF**
-(re-measured 2026-09-17 after the softmax-warp tuning — see
+**NVFP4+FP8 2887 TF**, **MXFP8+FP8 2592 TF**, **NVFP4+BF16 2337 TF**,
+**MXFP8+BF16 2070 TF**, **NVFP4+MXFP8 2253 TF**, **NVFP4+NVFP4 2153 TF**
+(re-measured 2026-09-18 after the softmax-warp tuning — see
 `debug/b300_fp4_pv_analysis.md`, "September 2026 pass").
 **—** = unsupported (d=64 needs head_dim ≥
 sf_vec_size × 4: NVFP4 PV and MXFP8 require 128). Small shapes (s ≤ 1024) are
@@ -111,7 +112,7 @@ vs FP8 PV's 0.0040, FP4 PV's 0.0039).
 
 ### Sequence-length sweep (GB300, h=24, d=128, non-causal)
 
-![GB300 h=24, d=128, non-causal](figures/gb300_tflops_h24.png?v=20260917)
+![GB300 h=24, d=128, non-causal](figures/gb300_tflops_h24.png?v=20260918)
 
 ## Results — QKV Quantization (quant_v)
 

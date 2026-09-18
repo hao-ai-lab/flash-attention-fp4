@@ -5,9 +5,9 @@
 > [!NOTE]
 > **This is a fork of [flash-attention](https://github.com/Dao-AILab/flash-attention) with the addition of a CuTe DSL FP4/FP8 implementation of Flash Attention 4 on NVIDIA Blackwell for the [Attn-QAT](https://arxiv.org/abs/2603.00040) paper.** Supports NVFP4 and MXFP8 block-scaled QK with BF16, FP8, or block-scaled (NVFP4/MXFP8) PV.
 >
-> **On GB300 (SM103)** it peaks at **2789 TFLOPS** (NVFP4+FP8) — a **1.77x speedup** over the BF16 FA4 reference at the same shape (2789 vs 1573 TFLOPS) — with **2535 TFLOPS** (MXFP8+FP8), **2350 TFLOPS** (NVFP4+BF16), and **2096 TFLOPS** (MXFP8+BF16); the NVFP4+MXFP8 and NVFP4+NVFP4 PV modes reach **2020** and **1930 TFLOPS**. **On B200 (SM100)** it peaks at **2018 TFLOPS** (NVFP4+FP8), **1948 TFLOPS** (MXFP8+FP8), and **1920 TFLOPS** (NVFP4+BF16). See **[flash_attn/cute/README.md](flash_attn/cute/README.md)** for the full results and usage.
+> **On GB300 (SM103)** it peaks at **2887 TFLOPS** (NVFP4+FP8) — a **1.80x speedup** over the BF16 FA4 reference at the same shape (2887 vs 1600 TFLOPS) — with **2592 TFLOPS** (MXFP8+FP8), **2337 TFLOPS** (NVFP4+BF16), and **2070 TFLOPS** (MXFP8+BF16); the NVFP4+MXFP8 and NVFP4+NVFP4 PV modes reach **2253** and **2153 TFLOPS**. **On B200 (SM100)** it peaks at **2018 TFLOPS** (NVFP4+FP8), **1948 TFLOPS** (MXFP8+FP8), and **1920 TFLOPS** (NVFP4+BF16). See **[flash_attn/cute/README.md](flash_attn/cute/README.md)** for the full results and usage.
 
-![GB300 sequence-length sweep (h=24, d=128, non-causal)](flash_attn/cute/figures/gb300_tflops_h24.png?v=20260917)
+![GB300 sequence-length sweep (h=24, d=128, non-causal)](flash_attn/cute/figures/gb300_tflops_h24.png?v=20260918)
 
 ---
 
