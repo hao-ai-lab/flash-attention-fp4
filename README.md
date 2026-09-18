@@ -7,7 +7,7 @@
 >
 > **On GB300 (SM103)** it peaks at **2887 TFLOPS** (NVFP4+FP8) — a **1.80x speedup** over the BF16 FA4 reference at the same shape (2887 vs 1600 TFLOPS) — with **2592 TFLOPS** (MXFP8+FP8), **2337 TFLOPS** (NVFP4+BF16), and **2070 TFLOPS** (MXFP8+BF16); the NVFP4+MXFP8 and NVFP4+NVFP4 PV modes reach **2253** and **2153 TFLOPS**. **On B200 (SM100)** it peaks at **2018 TFLOPS** (NVFP4+FP8), **1948 TFLOPS** (MXFP8+FP8), and **1920 TFLOPS** (NVFP4+BF16). See **[flash_attn/cute/README.md](flash_attn/cute/README.md)** for the full results and usage.
 
-![GB300 sequence-length sweep (h=24, d=128, non-causal)](flash_attn/cute/figures/gb300_tflops_h24.png?v=20260918c)
+![GB300 sequence-length sweep (h=24, d=128, non-causal)](flash_attn/cute/figures/gb300_tflops_h24.png?v=20260918d)
 
 ---
 
