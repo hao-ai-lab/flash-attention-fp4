@@ -668,7 +668,20 @@ commits: the baseline's P-inside-S layout is covered by `mma A-reads ->
 mma D-writes`, its "S_i(k+1) done => PV_i(k) done" correction invariant by
 the commit semantics, and the decoupled layout's SF slots by `mma metadata
 reads -> cp writes` plus the added O_full wait (its S_full commit precedes
-PV(k)). (2) Every `tcgen05.mma` has an **issue floor of ~50
+PV(k)). Two follow-ups: (a) **two issuing warps** (`mma_overlap2.cu`: warp 0 issues
+32 x N=256, warp 1 issues 32 x N=32/64/128 into other tmem columns, own
+commit/mbarrier each, wall time = max of both ends): concurrent = 0.93-0.96x
+of the sum of the two streams alone, nowhere near max(L, S) — the tensor
+core serializes them regardless of issuing thread; the small stream still
+adds ~42 cycles per N=32 instruction even with its issue hidden behind the
+other warp, so the ~50-cycle floor is mostly tensor-core-side. (b) **In the
+real BF16 FA4 kernel** (`FA4_DEBUG_MMA_N` experiment, tile N shrunk to 64
+for the PV GEMM; wrong outputs, timing only; s=32768 h=24): every K-tile
++18% (1629 -> 1925), every other K-tile +10% (1799) — i.e. additive, no
+overlap benefit from mixing sizes; N=32 gives +29%, so cost is not
+proportional to N (matches the 134/72/54/50-cycle ladder). Shrinking the
+QK GEMM instead gives 0% — BF16 FA4 is bound by the PV GEMM's tensor-core
+time; QK's is hidden under softmax. (2) Every `tcgen05.mma` has an **issue floor of ~50
 cycles** from one issuing thread, so tiles with N <= 64 cost the same as
 N=8; only N >= 128 is TC-bound. Small TC-queue ops are therefore far from
 free — consistent with the per-step scale-factor `tcgen05.cp` copies showing
