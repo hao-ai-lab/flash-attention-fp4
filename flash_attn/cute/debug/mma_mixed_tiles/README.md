@@ -166,3 +166,53 @@ interleaving unlike tiles). The exploitable knobs are per-tile cost, not
 overlap: use `.ws` for M<=64 tiles at large N (1.5x cheaper), keep N >= 128
 to amortize the ~56-cycle floor, group tiles of one datapath mode, and let
 A come from TMEM where the layout allows.
+
+## 5. Why `.ws` helps, and whether it applies to the MLA kernel (`mma_cg2.cu`)
+
+The datapath is 4 quadrants x 32 lanes. Non-.ws maps a tile's M rows onto
+lanes: M=128 fills all 4 quadrants, M=64 fills 2 ("1/2 datapath utilized"),
+so M=64 costs the same as M=128. `.ws` reorganizes the mapping (M=32 "1x4",
+M=64 "2x3"): N is spread across quadrants, so all four stay busy at small M.
+Cost drops to ~90 cycles at N=256 but not to 35: the B operand (N x K =
+256 x 16 bf16 = 8 KB per instruction, independent of M) streams from smem at
+~128 B/clk (~64 cycles) — which is why ws M=32 and M=64 cost the same and
+why ws N<=128 sits on the ~58-cycle floor. (The `.collector::bN` qualifiers
+exist to skip that B re-read when B is reused; attention does not reuse B
+within a tile.)
+
+The MLA kernel (`flash_fwd_mla_sm100.py`) already solves small M another
+way: `cta_tile_m = 64` with `cta_group::2` — the CTA pair issues one M=128
+MMA (`cluster_tile_m`) where each SM contributes 64 Q rows and holds N/2
+accumulator columns (Layout B, "2x2"), so every SM runs 128 rows x N/2 at
+full datapath. Measured per-instruction cost (leader clock, per SM):
+
+| cta_group::2, kind::f16 K16 | N=64 | N=128 | N=256 |
+|---|---|---|---|
+| M=128 (each SM: 128 rows x N/2) | 52 | 52 | **70** |
+| M=256 (each SM: 128 rows x N/2) | 52 | 70 | 134 |
+
+For the kernel's shapes (QK N=tile_n=128 -> 52 cycles; PV N=hdimv/2=256 ->
+70 cycles) that is 128x128 MAC-rows per SM per 70 cycles = 234 row-cols/
+cycle, vs 177 for `.ws` M=64 N=256 (64x256 / 92.7) — **1.3x better than .ws,
+and each K/V tile is loaded once per pair instead of once per SM.** So `.ws`
+would be a regression for MLA whenever the 128-row cluster tile is full
+(heads x q_len >= 128 per KV head: 128-head models at q_len 1, or 64 heads
+with MTP q_len 2).
+
+The case where `.ws` could win is a half-empty cluster tile — 64 valid rows
+total (e.g. 64 heads per GPU at q_len 1): per-SM valid throughput drops to
+117 row-cols/cycle and a 1-CTA `.ws` M=64 kernel would be 1.5x better on
+the tensor core (at 2x the K/V smem traffic per SM). That only matters if
+such decode is TC-bound, which it is not at long context: per 128-key tile,
+K/V bytes = 128 x 576 x 2 B = 147 KB -> ~2.7 us from HBM per SM at
+8 TB/s / 148 SMs vs ~2.5k cycles (~1.2 us) of QK+PV MMA time at M=64 —
+memory-bound by ~2x, so the TC waste is hidden. The DSL also exposes no
+`.ws` MmaOp (only MmaF16BF16Op/F8F6F4/MXF4NVF4/...), so it would need inline
+PTX for the MMAs and Layout E/G-aware TMEM ld/st — not worth it for MLA.
+
+Status note: with cutlass-dsl 4.5.2 the MLA kernel currently does not run
+in this repo: its benchmark/test passes no CUDA stream (`.launch` rejects
+the None with `assert isinstance(arg, ir.Value)`), and with an explicit
+stream it compiles but faults on the device (illegal access) for every
+shape tried (dense and topk-gather). Pre-existing on the fp4 branch since
+the upstream rebase; measured numbers above are from the microbenchmarks.
