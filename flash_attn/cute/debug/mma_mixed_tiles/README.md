@@ -1,5 +1,7 @@
 # Mixed tcgen05.mma tile sizes: is there anything to exploit? (GB300, sm_103a)
 
+> The consolidated write-up is **[MIXED_TILES.md](MIXED_TILES.md)**; this file is the running lab log.
+
 Question: within one kernel (e.g. prefill + decode tiles co-scheduled), can
 mixing large and small `tcgen05.mma` tiles be exploited through scheduling,
 load balancing or overlap? Microbenchmark `mma_mixed.cu` (single CTA, one or
