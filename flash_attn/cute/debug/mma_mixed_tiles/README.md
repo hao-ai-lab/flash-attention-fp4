@@ -95,3 +95,74 @@ bandwidth, not the tensor core.
   not the tile N; ordering across different tile shapes is only promised
   for A/metadata-read -> D-write / cp-write pairs, so none of the above is
   guaranteed by the ISA — it is GB300 behaviour.
+
+## 4. Hardware mechanisms that could pair/pipeline tiles (`mma_mixed2.cu`)
+
+Follow-up: instead of ordering/ratio, test the mechanisms the ISA exposes
+that could let the tensor core run two tiles at once. Build/run:
+`nvcc -gencode arch=compute_103a,code=sm_103a -O2 -o mma_mixed2 mma_mixed2.cu && ./mma_mixed2 all`
+(32 instructions per sequence, N=256 K16 kind::f16 unless noted, cycles).
+
+**a. Lane pairing of M=64 tiles.** The layout table says non-.ws M=64 uses
+"1/2 datapath, lane alignment 0 or 16", so two M=64 MMAs at lane 0 and lane
+16 could in principle occupy both halves.
+
+| sequence | cycles |
+|---|---|
+| 32 x M128 (full datapath) | 4486 |
+| 32 x M64, all at lane 0 | 4426 |
+| 32 x M64, alternating lane 0 / lane 16 | 4480 |
+| 16 at lane 0 then 16 at lane 16 | 4479 |
+| 32 x M64 alternating column halves | 4449 |
+| two warps, 16 each: lane 0 \| lane 16 | 4053 |
+| two warps, 16 each: lane 0 \| lane 0 | 4053 |
+
+No pairing: M=64 at complementary lanes costs exactly M=64 at the same
+lanes (= M=128). The two-warp 9% is issue hiding (identical with both
+warps at lane 0).
+
+**b. Weight-stationary `tcgen05.mma.ws`** (M in {32,64,128}, N in
+{64,128,256}; M=32 is "1x4", M=64 "2x3" datapath organization):
+
+| ws, per instruction | N=64 | N=128 | N=256 |
+|---|---|---|---|
+| M=32 | 57.9 | 58.7 | **89.5** |
+| M=64 | 57.4 | 64.0 | **92.7** |
+| M=128 | 63.2 | 85.5 | 149.3 |
+
+This is the one real lever for small-M (decode) tiles: `.ws` M=32/64 at
+N=256 costs ~90 cycles vs 140 for the non-ws M=64/M=128 tile — 1.5x
+cheaper (still not proportional to M: 4x fewer rows for 1.5x less time).
+`.ws` M=128 is slightly slower than non-ws (149 vs 141), and `.ws` M=32 must
+sit at lane alignment 0 (lane offsets 16/32/48 fault: "misaligned address").
+
+**c. `.ws` small tiles mixed with normal large tiles:** 16 x M128N256
+(non-ws) + 16 x ws M32N256: blocked 3785 (1.03x additive), interleaved
+4187 (**1.14x**) — alternating datapath organizations costs ~11%; keep
+same-mode tiles grouped.
+
+**d. Mixed kinds** (16 x f16 M128N256 + 16 x f8f6f4 M128N64): blocked 1.02x,
+interleaved 0.98x of additive — nothing.
+
+**e. Mixed A source** (large A-from-smem + small A-from-tmem, as QK vs PV in
+FA4): the A-from-tmem small tile is ~10% cheaper per instruction (1833 vs
+2037 for 32 x M128N64); mixed blocked 0.94x / interleaved 1.00x of
+additive — at most a few % from operand-path diversity.
+
+**f. Two co-resident CTAs per SM** (one large-tile, one small-tile,
+`__launch_bounds__(128,2)`, 256 TMEM cols each, 152 SMs, kernel wall time):
+1 CTA/SM large 0.449 ms, small(N32) 0.164 ms; 2 CTA/SM large+large 0.841
+(1.87x), small+small 0.283 (1.73x), large+small (by blockIdx parity) 0.842.
+Inconclusive for TC concurrency: CTA-to-SM placement is not controllable, so
+the wall time is the worst SM (two large CTAs). The per-SM TC queue is the
+same one the two-warp tests exercise, which showed no concurrency.
+
+### Bottom line for mixed tiles
+
+Nothing pairs or pipelines on the tensor core: every schedule, issuer
+split, kind mix, operand-path mix and lane placement lands on the additive
+model (best case a few % of issue hiding, worst case -11..-14% for
+interleaving unlike tiles). The exploitable knobs are per-tile cost, not
+overlap: use `.ws` for M<=64 tiles at large N (1.5x cheaper), keep N >= 128
+to amortize the ~56-cycle floor, group tiles of one datapath mode, and let
+A come from TMEM where the layout allows.
