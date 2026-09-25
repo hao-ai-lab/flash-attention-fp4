@@ -240,7 +240,50 @@ but faults on the device (illegal access) for every shape tried (dense and
 top-k gather, 64/128 heads, q_len 1..4096). Pre-existing since the upstream rebase;
 MLA numbers here are derived from the microbenchmarks, not the kernel.
 
-## 8. Takeaways
+## 8. Can `mma.sync` harvest the idle half?
+
+Section 2 shows a non-ws `M=64` tile costs the same as `M=128`, so half the tensor
+core looks idle; section 3 shows nothing on the `tcgen05` path can use it. The
+remaining idea: issue warp-level `mma.sync` (the legacy HMMA path, register
+operands) from warps that are already resident — e.g. softmax warps with spare
+registers — when the incoming tile is small. That only pays if `mma.sync` reaches a
+*different* datapath.
+
+`mma_sync_overlap.cu`: warp 0 drives 32 x `tcgen05.mma`, warps 4..4+W-1 run
+register-resident `mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32` chains with
+NACC independent accumulators (no memory traffic in the loop). Timed alone and
+together (started from the same `__syncthreads`). Independent paths would give
+wall ~= max(alone); a shared tensor core gives wall ~= sum(alone).
+
+| tcgen05 tile | tcgen05 alone | mma.sync alone (W=4, NACC=4) | both wall | vs max | vs sum |
+|---|---|---|---|---|---|
+| M128 N256 | 4250 cy (3948 MAC/cy) | 2306 cy (909 MAC/cy) | 6632 cy | 1.56x | **1.01x** |
+| M64 N128 | 2186 cy (1919 MAC/cy) | 2306 cy (909 MAC/cy) | 4411 cy | 1.91x | **0.98x** |
+
+wall/sum stays at 0.98-1.01x across every configuration tried (W = 1, 2, 4, 8;
+NACC = 4, 8; both tcgen05 tiles): **`mma.sync` and `tcgen05.mma` fully serialize —
+they are the same tensor core.** `mma.sync` alone is latency-bound, not
+TC-saturated (its time is flat at 2306 cy while throughput scales 227 -> 455 -> 909
+-> 1819 MAC/cy for W = 1..8), yet it never overlaps a single cycle of the
+`tcgen05` stream.
+
+Worse, `mma.sync` is a less efficient way to reach that tensor core. Best measured
+peak (W=8, NACC=8): **1927 MAC/cy vs 3948 MAC/cy** for `tcgen05.mma` M128 N256 —
+about half. So every MAC moved to `mma.sync` costs ~2x more tensor-core time than
+issuing it as part of a `tcgen05` tile.
+
+The M=64 case makes the verdict concrete: the "idle half" is not recoverable.
+Adding the `mma.sync` stream to the M64 N128 tcgen05 stream yields an aggregate
+1426 MAC/cy, *below* the 1919 MAC/cy of that tcgen05 stream on its own (0.74x) —
+the extra work costs more TC time than it contributes.
+
+Verdict: no. Spare registers in the softmax warps are not the scarce resource; the
+tensor core is, and `mma.sync` contends for it at half efficiency (while also
+consuming softmax-warp issue slots, which are the bound in the block-scaled FA4
+kernels — see `b300_fp4_pv_analysis.md`). The fix for a small M stays the one in
+sections 6-7: pack rows to M=128, use `cta_group::2` with 64 rows per CTA, or `.ws`.
+
+## 9. Takeaways
 
 1. The tensor core serializes MMAs of different shapes: by order, by ratio, by
    issuing warp, by kind, by A-source and by lane placement, total time is additive
@@ -252,8 +295,11 @@ MLA numbers here are derived from the microbenchmarks, not the kernel.
    - keep N >= 128 to amortize the ~56-cycle floor (N <= 64 tiles are pure floor);
    - group tiles by datapath mode (ws vs non-ws);
    - prefer A from TMEM where the layout allows (~10% cheaper small tiles).
-3. For decode/prefill co-scheduling, TC time is simply the sum of the tiles' costs;
+3. `mma.sync` shares the same tensor core (wall = 1.01x sum, never max) and reaches
+   it at ~half the throughput (1927 vs 3948 MAC/cy), so it cannot harvest the idle
+   half of an M=64 tile — it makes that case 0.74x worse.
+4. For decode/prefill co-scheduling, TC time is simply the sum of the tiles' costs;
    co-scheduling can only help by filling otherwise idle SIMT/issue capacity (e.g.
    decode softmax under prefill MMAs), not by overlapping tensor-core work.
-4. None of the in-order behaviour is guaranteed by the ISA; correctness must rest
+5. None of the in-order behaviour is guaranteed by the ISA; correctness must rest
    on the pipelined pairs and `tcgen05.commit`.
